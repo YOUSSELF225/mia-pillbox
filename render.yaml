@@ -1,21 +1,25 @@
 services:
   - type: web
-    name: mia-pillbox
-    runtime: node
-    repo: https://github.com/ton-compte/mia-pillbox
-    plan: free
+    name: mia-san-pedro
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
     envVars:
+      - key: NODE_ENV
+        value: production
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL
         value: llama3-70b-8192
       - key: SUPPORT_PHONE
-        value: 2250102030404
+        sync: false
       - key: GOOGLE_DRIVE_FOLDER_ID
-        value: 1cTI4haEQuYCC6fyBV5q518Qyz1HasSMs
-      - key: NODE_ENV
-        value: production
-      - key: PORT
-        value: 10000
-    buildCommand: npm install
-    startCommand: node index.js
+        sync: false
+      - key: GOOGLE_CREDENTIALS
+        sync: false

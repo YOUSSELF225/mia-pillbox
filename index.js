@@ -288,7 +288,7 @@ class OptimizedDataStore {
             const searchTerms = medicament.toLowerCase().split(' ');
 
             // Rechercher le fichier des médicaments
-            const workbook = await this.loadExcelFromDrive('MUGEFCI-Liste-des-medicaments-remboursables-Edition-Decembre-2024-03122024.xlsx');
+            const workbook = await this.loadExcelFromDrive('pillbox_stock.xlsx');
             
             if (!workbook) {
                 return [];

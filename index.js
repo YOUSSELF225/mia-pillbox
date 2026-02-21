@@ -56,9 +56,9 @@ const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250708091011';
 
 // URLs des fichiers sur Cloudinary (fournies)
 const CLOUDINARY_FILES = {
-    pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771626176/Pharmacies_San_Pedro_n1rvcs.xlsx',
-    livreurs: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771626176/livreurs_pillbox_c7emb2.xlsx',
-    medicaments: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771626176/pillbox_stock_cxn5aw.xlsx'
+    pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639219/Pharmacies_San_Pedro_wnabnk.xlsx',
+    livreurs: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639222/livreurs_pillbox_lmtjl9.xlsx',
+    medicaments: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639221/pillbox_stock_k7tzot.xlsx'
 };
 
 // ============ CACHES OPTIMISÉS ============

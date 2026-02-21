@@ -19,6 +19,7 @@ const path = require('path');
 require('dotenv').config();
 
 // ============ CLUSTERING AMÉLIORÉ AVEC CACHE PARTAGÉ ============
+// ============ CLUSTERING AMÉLIORÉ AVEC CACHE PARTAGÉ ============
 const numCPUs = os.cpus().length;
 const SHARED_CACHE_FILE = '/tmp/mia_shared_cache.json';
 
@@ -50,6 +51,16 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
         }, 5000);
     });
     
+    // Le maître n'a pas besoin de serveur HTTP
+    console.log(`📊 Maître PID ${process.pid} - Prêt, surveillance des workers`);
+    
+    return; // Le maître s'arrête ici
+}
+
+// ============ CONSTANTES ET CONFIGURATION (déplacées APRÈS le cluster) ============
+const PORT = process.env.PORT || 10000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
     // Serveur de monitoring pour le maître
     const masterApp = express();
     masterApp.get('/health', (req, res) => {
@@ -161,6 +172,7 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 // Support client
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250708091011';
+
 // URLs Cloudinary (fournies)
 const CLOUDINARY_FILES = {
     pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639219/Pharmacies_San_Pedro_wnabnk.xlsx',

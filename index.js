@@ -19,7 +19,7 @@ const path = require('path');
 require('dotenv').config();
 
 // ============ CONSTANTES ET CONFIGURATION ============
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT ? Math.min(parseInt(process.env.PORT), 65535) : 10000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
 
@@ -86,8 +86,10 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
             cache: fs.existsSync(SHARED_CACHE_FILE) ? 'present' : 'absent'
         });
     });
-    masterApp.listen(PORT + 1, '0.0.0.0', () => {
-        console.log(`📊 Maître en écoute sur le port ${PORT + 1} pour monitoring`);
+    // Utiliser un port valide pour le master
+    const masterPort = Math.min(PORT + 1, 65535);
+    masterApp.listen(masterPort, '0.0.0.0', () => {
+        console.log(`📊 Maître en écoute sur le port ${masterPort} pour monitoring`);
     });
 
     return; // Le maître s'arrête ici
@@ -1597,14 +1599,15 @@ app.use((err, req, res, next) => {
 });
 
 // ============ DÉMARRAGE ============
-const server = app.listen(PORT, '0.0.0.0', () => {
+const serverPort = Math.min(PORT, 65535);
+const server = app.listen(serverPort, '0.0.0.0', () => {
     console.log(`
     ╔═══════════════════════════════════════╗
     ║   MIA - San Pedro 🇨🇮                  ║
     ║   Version Production 5.0              ║
     ║   Worker PID: ${process.pid.toString().padEnd(24)}      ║
     ║   Environnement: ${NODE_ENV.padEnd(21)}      ║
-    ║   Port: ${PORT.toString().padEnd(28)}      ║
+    ║   Port: ${serverPort.toString().padEnd(28)}      ║
     ║   RAM: 512MB | CPU: 0.1               ║
     ║   Support: ${SUPPORT_PHONE}            ║
     ╚═══════════════════════════════════════╝

@@ -80,9 +80,9 @@ const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250708091011';
 
 // URLs Cloudinary (fournies)
 const CLOUDINARY_FILES = {
-    pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771626176/Pharmacies_San_Pedro_n1rvcs.xlsx',
-    livreurs: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771626176/livreurs_pillbox_c7emb2.xlsx',
-    medicaments: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771626176/pillbox_stock_cxn5aw.xlsx'
+    pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639198/Pharmacies_San_Pedro_e97b9l.xlsx',
+    livreurs: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639198/livreurs_pillbox_m4rfo1.xlsx',
+    medicaments: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639200/pillbox_stock_rpgb2a.xlsx'
 };
 
 // ============ CACHES HAUTES PERFORMANCES ============

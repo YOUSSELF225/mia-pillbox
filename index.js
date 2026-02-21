@@ -2,6 +2,7 @@
 // MIA - Assistant Santé San Pedro 🇨🇮
 // Version Production Finale - 100% Conversationnel
 // Optimisé pour des milliers de requêtes simultanées
+// AVEC CACHE PARTAGÉ ENTRE WORKERS
 // ===================================================
 
 const express = require('express');
@@ -13,25 +14,108 @@ const compression = require('compression');
 const crypto = require('crypto');
 const cluster = require('cluster');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
-// ============ CLUSTERING PUR CPU (MULTI-CŒURS) ============
+// ============ CLUSTERING AMÉLIORÉ AVEC CACHE PARTAGÉ ============
 const numCPUs = os.cpus().length;
+const SHARED_CACHE_FILE = '/tmp/mia_shared_cache.json';
+
 if (cluster.isMaster && process.env.NODE_ENV === 'production') {
     console.log(`🚀 Maître PID ${process.pid} - Lancement de ${numCPUs} workers...`);
     
-    // Lancer les workers
+    // Nettoyer l'ancien cache au démarrage
+    try {
+        if (fs.existsSync(SHARED_CACHE_FILE)) {
+            fs.unlinkSync(SHARED_CACHE_FILE);
+            console.log('🧹 Ancien cache partagé supprimé');
+        }
+    } catch (error) {
+        console.error('❌ Erreur nettoyage cache:', error.message);
+    }
+    
+    // Lancer les workers avec un délai pour éviter la surcharge
     for (let i = 0; i < numCPUs; i++) {
-        cluster.fork();
+        setTimeout(() => {
+            cluster.fork();
+        }, i * 2000); // 2 secondes entre chaque worker
     }
     
     // Redémarrer les workers qui meurent
     cluster.on('exit', (worker, code, signal) => {
-        console.log(`⚠️ Worker ${worker.process.pid} mort. Redémarrage...`);
-        cluster.fork();
+        console.log(`⚠️ Worker ${worker.process.pid} mort. Redémarrage dans 5 secondes...`);
+        setTimeout(() => {
+            cluster.fork();
+        }, 5000);
     });
     
-    return;
+    // Serveur de monitoring pour le maître
+    const masterApp = express();
+    masterApp.get('/health', (req, res) => {
+        res.json({ 
+            status: 'master', 
+            workers: Object.keys(cluster.workers).length,
+            pid: process.pid,
+            cache: fs.existsSync(SHARED_CACHE_FILE) ? 'present' : 'absent'
+        });
+    });
+    masterApp.listen(PORT + 1, '0.0.0.0', () => {
+        console.log(`📊 Maître en écoute sur le port ${PORT + 1} pour monitoring`);
+    });
+    
+    return; // Le maître s'arrête ici
+}
+
+// ============ CACHE PARTAGÉ (via fichier) ============
+class SharedCache {
+    constructor() {
+        this.cache = {};
+        this.lastSave = 0;
+        this.load();
+    }
+
+    load() {
+        try {
+            if (fs.existsSync(SHARED_CACHE_FILE)) {
+                const data = fs.readFileSync(SHARED_CACHE_FILE, 'utf8');
+                this.cache = JSON.parse(data);
+                console.log(`📦 Cache partagé chargé: ${Object.keys(this.cache).length} entrées`);
+            }
+        } catch (error) {
+            console.error('❌ Erreur chargement cache partagé:', error.message);
+        }
+    }
+
+    save() {
+        try {
+            // Sauvegarder seulement toutes les 10 secondes max
+            if (Date.now() - this.lastSave > 10000) {
+                fs.writeFileSync(SHARED_CACHE_FILE, JSON.stringify(this.cache, null, 0));
+                this.lastSave = Date.now();
+            }
+        } catch (error) {
+            console.error('❌ Erreur sauvegarde cache partagé:', error.message);
+        }
+    }
+
+    get(key) {
+        return this.cache[key];
+    }
+
+    set(key, value) {
+        this.cache[key] = value;
+        this.save();
+    }
+
+    has(key) {
+        return key in this.cache;
+    }
+
+    clear() {
+        this.cache = {};
+        this.save();
+    }
 }
 
 // ============ INITIALISATION EXPRESS ============
@@ -77,7 +161,6 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 // Support client
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250708091011';
-
 // URLs Cloudinary (fournies)
 const CLOUDINARY_FILES = {
     pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639219/Pharmacies_San_Pedro_wnabnk.xlsx',
@@ -130,28 +213,43 @@ const stats = {
     lastErrorTime: null
 };
 
-// ============ STOCKAGE CLOUDINARY ============
+// ============ STOCKAGE CLOUDINARY AVEC CACHE PARTAGÉ ============
 class CloudinaryStorage {
-    constructor() {
+    constructor(sharedCache) {
         this.files = CLOUDINARY_FILES;
         this.loadingPromises = new Map();
+        this.sharedCache = sharedCache;
     }
 
     async downloadFile(fileName, url) {
         try {
             const cacheKey = `file_${fileName}`;
+            
+            // 1. Vérifier le cache partagé (entre workers)
+            const sharedData = this.sharedCache.get(cacheKey);
+            if (sharedData) {
+                console.log(`📦 Cache partagé hit: ${fileName} (worker ${process.pid})`);
+                stats.cacheHits++;
+                
+                // Mettre aussi dans le cache local
+                fileCache.set(cacheKey, sharedData);
+                return sharedData;
+            }
+            
+            // 2. Vérifier le cache local (mémoire)
             const cached = fileCache.get(cacheKey);
             if (cached) {
                 stats.cacheHits++;
                 return cached;
             }
 
-            // Éviter les téléchargements parallèles du même fichier
+            // 3. Éviter les téléchargements parallèles du même fichier
             if (this.loadingPromises.has(fileName)) {
+                console.log(`⏳ Attente téléchargement en cours: ${fileName} (worker ${process.pid})`);
                 return this.loadingPromises.get(fileName);
             }
 
-            console.log(`📥 Téléchargement: ${fileName}`);
+            console.log(`📥 Téléchargement: ${fileName} (worker ${process.pid})`);
             stats.apiCalls++;
 
             const promise = axios.get(url, {
@@ -159,18 +257,21 @@ class CloudinaryStorage {
                 timeout: 30000,
                 headers: { 
                     'Accept-Encoding': 'gzip,deflate',
-                    'User-Agent': 'MIA-SanPedro/4.0'
+                    'User-Agent': 'MIA-SanPedro/5.0'
                 }
             }).then(async response => {
                 const workbook = XLSX.read(response.data, { type: 'buffer' });
                 const sheetName = workbook.SheetNames[0];
                 const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
                 
+                // Mettre dans les deux caches
                 fileCache.set(cacheKey, data);
+                this.sharedCache.set(cacheKey, data);
+                
                 this.loadingPromises.delete(fileName);
                 stats.cacheMisses++;
                 
-                console.log(`✅ ${fileName}: ${data.length} lignes`);
+                console.log(`✅ ${fileName}: ${data.length} lignes (worker ${process.pid})`);
                 return data;
             }).catch(error => {
                 this.loadingPromises.delete(fileName);
@@ -192,8 +293,9 @@ class CloudinaryStorage {
 
 // ============ STRUCTURES DE DONNÉES OPTIMISÉES ============
 class DataStore {
-    constructor(storage) {
+    constructor(storage, sharedCache) {
         this.storage = storage;
+        this.sharedCache = sharedCache;
         this.pharmacies = [];
         this.pharmaciesDeGarde = [];
         this.pharmaciesByQuartier = new Map();
@@ -209,15 +311,79 @@ class DataStore {
 
     async initialize() {
         if (this.initialized) return true;
+        
+        // Vérifier si un autre worker a déjà initialisé
+        const sharedInit = this.sharedCache.get('initialized');
+        if (sharedInit) {
+            console.log(`📦 Données déjà initialisées par un autre worker (worker ${process.pid})`);
+            await this.loadFromSharedCache();
+            this.initialized = true;
+            return true;
+        }
+        
+        // Vérifier si un chargement est en cours
+        const loadingLock = this.sharedCache.get('loading');
+        if (loadingLock) {
+            console.log(`⏳ Attente du chargement par un autre worker (worker ${process.pid})...`);
+            // Attendre que le chargement soit fini (max 30 secondes)
+            for (let i = 0; i < 30; i++) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                if (this.sharedCache.get('initialized')) {
+                    await this.loadFromSharedCache();
+                    this.initialized = true;
+                    return true;
+                }
+            }
+        }
+        
         if (this.initPromise) return this.initPromise;
 
         this.initPromise = this._doInitialize();
         return this.initPromise;
     }
 
+    async loadFromSharedCache() {
+        this.pharmacies = this.sharedCache.get('pharmacies') || [];
+        this.pharmaciesDeGarde = this.sharedCache.get('pharmaciesDeGarde') || [];
+        this.livreurs = this.sharedCache.get('livreurs') || [];
+        this.livreursDisponibles = this.sharedCache.get('livreursDisponibles') || [];
+        this.medicaments = this.sharedCache.get('medicaments') || [];
+        this.lastUpdate = this.sharedCache.get('lastUpdate') || Date.now();
+        
+        // Reconstruire les maps
+        this.pharmaciesByQuartier.clear();
+        for (const p of this.pharmacies) {
+            const quartier = p.QUARTIER || p.quartier || 'Non précisé';
+            if (!this.pharmaciesByQuartier.has(quartier)) {
+                this.pharmaciesByQuartier.set(quartier, []);
+            }
+            this.pharmaciesByQuartier.get(quartier).push(p);
+        }
+        
+        // Reconstruire l'index des médicaments
+        this.medicamentIndex.clear();
+        for (const med of this.medicaments) {
+            const nom = (med['NOM COMMERCIAL'] || med.nom || '').toLowerCase();
+            const dci = (med['DCI'] || med.dci || '').toLowerCase();
+            const mots = [...new Set([...nom.split(' '), ...dci.split(' ')])].filter(m => m.length > 2);
+            
+            mots.forEach(mot => {
+                if (!this.medicamentIndex.has(mot)) {
+                    this.medicamentIndex.set(mot, []);
+                }
+                this.medicamentIndex.get(mot).push(med);
+            });
+        }
+        
+        console.log(`📦 Données chargées depuis cache partagé: ${this.pharmacies.length} pharmacies, ${this.livreurs.length} livreurs, ${this.medicaments.length} médicaments`);
+    }
+
     async _doInitialize() {
         try {
-            console.log('📥 Chargement des données...');
+            console.log(`📥 Chargement des données (worker ${process.pid})...`);
+            
+            // Lock pour éviter que plusieurs workers chargent en même temps
+            this.sharedCache.set('loading', true);
             
             const [pharmaData, livreursData, medsData] = await Promise.all([
                 this.storage.downloadFile('pharmacies.xlsx', this.storage.files.pharmacies),
@@ -246,11 +412,17 @@ class DataStore {
                         this.pharmaciesDeGarde.push(p);
                     }
                 }
+                
+                // Sauvegarder dans le cache partagé
+                this.sharedCache.set('pharmacies', this.pharmacies);
+                this.sharedCache.set('pharmaciesDeGarde', this.pharmaciesDeGarde);
             }
 
             if (livreursData) {
                 this.livreurs = livreursData;
                 this.updateLivreursDisponibles();
+                this.sharedCache.set('livreurs', this.livreurs);
+                this.sharedCache.set('livreursDisponibles', this.livreursDisponibles);
             }
 
             if (medsData) {
@@ -269,12 +441,19 @@ class DataStore {
                         this.medicamentIndex.get(mot).push(med);
                     });
                 }
+                
+                this.sharedCache.set('medicaments', this.medicaments);
             }
 
             this.lastUpdate = Date.now();
             this.initialized = true;
             
-            console.log(`✅ Données: ${this.pharmacies.length} pharmacies, ${this.livreurs.length} livreurs, ${this.medicaments.length} médicaments`);
+            // Marquer comme initialisé et enlever le lock
+            this.sharedCache.set('initialized', true);
+            this.sharedCache.set('loading', false);
+            this.sharedCache.set('lastUpdate', this.lastUpdate);
+            
+            console.log(`✅ Données: ${this.pharmacies.length} pharmacies, ${this.livreurs.length} livreurs, ${this.medicaments.length} médicaments (worker ${process.pid})`);
             return true;
 
         } catch (error) {
@@ -282,6 +461,7 @@ class DataStore {
             stats.errors++;
             stats.lastError = error.message;
             stats.lastErrorTime = Date.now();
+            this.sharedCache.set('loading', false);
             this.initPromise = null;
             return false;
         }
@@ -887,23 +1067,45 @@ const functions = [
 ];
 
 // ============ INITIALISATION ============
-const storage = new CloudinaryStorage();
-const store = new DataStore(storage);
+const sharedCache = new SharedCache();
+const storage = new CloudinaryStorage(sharedCache);
+const store = new DataStore(storage, sharedCache);
 const orderManager = new OrderManager(store);
 const convManager = new ConversationManager();
 const orderFlow = new OrderFlowManager();
 const whatsapp = new WhatsAppService();
 const groq = new GroqService();
 
-// Charger les données
-store.initialize().then(success => {
-    if (success) {
-        console.log('🚀 Mia est prête !');
-    }
-});
+// Délai aléatoire pour éviter que tous les workers chargent en même temps
+const startupDelay = Math.floor(Math.random() * 5000); // 0-5 secondes
+console.log(`⏱️ Worker ${process.pid} démarre dans ${startupDelay}ms`);
 
-// Rafraîchir toutes les 30 minutes
-setInterval(() => store.initialize(), 30 * 60 * 1000);
+setTimeout(() => {
+    store.initialize().then(success => {
+        if (success) {
+            console.log(`🚀 Mia prête (worker ${process.pid})`);
+        } else {
+            console.error(`❌ Échec initialisation worker ${process.pid}`);
+        }
+    });
+}, startupDelay);
+
+// Rafraîchir toutes les 30 minutes (seulement si c'est le premier worker)
+setInterval(() => {
+    // Vérifier si c'est le worker avec le PID le plus bas
+    const shouldRefresh = !sharedCache.get('refreshing') && 
+                          (Date.now() - (sharedCache.get('lastRefresh') || 0) > 25 * 60 * 1000);
+    
+    if (shouldRefresh) {
+        sharedCache.set('refreshing', true);
+        store.initialize().then(() => {
+            sharedCache.set('lastRefresh', Date.now());
+            sharedCache.set('refreshing', false);
+        }).catch(() => {
+            sharedCache.set('refreshing', false);
+        });
+    }
+}, 5 * 60 * 1000); // Vérifier toutes les 5 minutes
 
 // ============ PROMPT SYSTÈME ULTIME ============
 function getSystemPrompt(userId) {

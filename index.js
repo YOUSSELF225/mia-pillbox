@@ -18,14 +18,39 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-// ============ CLUSTERING AMÉLIORÉ AVEC CACHE PARTAGÉ ============
+// ============ CONSTANTES ET CONFIGURATION ============
+const PORT = process.env.PORT || 10000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+
+// Configuration WhatsApp Cloud API
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
+
+// Configuration Groq AI
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+// Support client
+const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250708091011';
+
+// URLs Cloudinary (fournies)
+const CLOUDINARY_FILES = {
+    pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639219/Pharmacies_San_Pedro_wnabnk.xlsx',
+    livreurs: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639222/livreurs_pillbox_lmtjl9.xlsx',
+    medicaments: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639221/pillbox_stock_k7tzot.xlsx'
+};
+
 // ============ CLUSTERING AMÉLIORÉ AVEC CACHE PARTAGÉ ============
 const numCPUs = os.cpus().length;
 const SHARED_CACHE_FILE = '/tmp/mia_shared_cache.json';
 
 if (cluster.isMaster && process.env.NODE_ENV === 'production') {
     console.log(`🚀 Maître PID ${process.pid} - Lancement de ${numCPUs} workers...`);
-    
+
     // Nettoyer l'ancien cache au démarrage
     try {
         if (fs.existsSync(SHARED_CACHE_FILE)) {
@@ -35,14 +60,14 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
     } catch (error) {
         console.error('❌ Erreur nettoyage cache:', error.message);
     }
-    
+
     // Lancer les workers avec un délai pour éviter la surcharge
     for (let i = 0; i < numCPUs; i++) {
         setTimeout(() => {
             cluster.fork();
         }, i * 2000); // 2 secondes entre chaque worker
     }
-    
+
     // Redémarrer les workers qui meurent
     cluster.on('exit', (worker, code, signal) => {
         console.log(`⚠️ Worker ${worker.process.pid} mort. Redémarrage dans 5 secondes...`);
@@ -50,22 +75,12 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
             cluster.fork();
         }, 5000);
     });
-    
-    // Le maître n'a pas besoin de serveur HTTP
-    console.log(`📊 Maître PID ${process.pid} - Prêt, surveillance des workers`);
-    
-    return; // Le maître s'arrête ici
-}
 
-// ============ CONSTANTES ET CONFIGURATION (déplacées APRÈS le cluster) ============
-const PORT = process.env.PORT || 10000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const IS_PRODUCTION = NODE_ENV === 'production';
     // Serveur de monitoring pour le maître
     const masterApp = express();
     masterApp.get('/health', (req, res) => {
-        res.json({ 
-            status: 'master', 
+        res.json({
+            status: 'master',
             workers: Object.keys(cluster.workers).length,
             pid: process.pid,
             cache: fs.existsSync(SHARED_CACHE_FILE) ? 'present' : 'absent'
@@ -74,7 +89,7 @@ const IS_PRODUCTION = NODE_ENV === 'production';
     masterApp.listen(PORT + 1, '0.0.0.0', () => {
         console.log(`📊 Maître en écoute sur le port ${PORT + 1} pour monitoring`);
     });
-    
+
     return; // Le maître s'arrête ici
 }
 
@@ -154,32 +169,6 @@ const limiter = rateLimit({
 });
 app.use('/webhook', limiter);
 
-// ============ CONSTANTES ET CONFIGURATION ============
-const PORT = process.env.PORT || 10000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const IS_PRODUCTION = NODE_ENV === 'production';
-
-// Configuration WhatsApp Cloud API
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
-
-// Configuration Groq AI
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-
-// Support client
-const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250708091011';
-
-// URLs Cloudinary (fournies)
-const CLOUDINARY_FILES = {
-    pharmacies: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639219/Pharmacies_San_Pedro_wnabnk.xlsx',
-    livreurs: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639222/livreurs_pillbox_lmtjl9.xlsx',
-    medicaments: 'https://res.cloudinary.com/dwq4ituxr/raw/upload/v1771639221/pillbox_stock_k7tzot.xlsx'
-};
-
 // ============ CACHES HAUTES PERFORMANCES ============
 const cache = new NodeCache({
     stdTTL: 300, // 5 minutes
@@ -236,18 +225,18 @@ class CloudinaryStorage {
     async downloadFile(fileName, url) {
         try {
             const cacheKey = `file_${fileName}`;
-            
+
             // 1. Vérifier le cache partagé (entre workers)
             const sharedData = this.sharedCache.get(cacheKey);
             if (sharedData) {
                 console.log(`📦 Cache partagé hit: ${fileName} (worker ${process.pid})`);
                 stats.cacheHits++;
-                
+
                 // Mettre aussi dans le cache local
                 fileCache.set(cacheKey, sharedData);
                 return sharedData;
             }
-            
+
             // 2. Vérifier le cache local (mémoire)
             const cached = fileCache.get(cacheKey);
             if (cached) {
@@ -267,7 +256,7 @@ class CloudinaryStorage {
             const promise = axios.get(url, {
                 responseType: 'arraybuffer',
                 timeout: 30000,
-                headers: { 
+                headers: {
                     'Accept-Encoding': 'gzip,deflate',
                     'User-Agent': 'MIA-SanPedro/5.0'
                 }
@@ -275,14 +264,14 @@ class CloudinaryStorage {
                 const workbook = XLSX.read(response.data, { type: 'buffer' });
                 const sheetName = workbook.SheetNames[0];
                 const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
-                
+
                 // Mettre dans les deux caches
                 fileCache.set(cacheKey, data);
                 this.sharedCache.set(cacheKey, data);
-                
+
                 this.loadingPromises.delete(fileName);
                 stats.cacheMisses++;
-                
+
                 console.log(`✅ ${fileName}: ${data.length} lignes (worker ${process.pid})`);
                 return data;
             }).catch(error => {
@@ -323,7 +312,7 @@ class DataStore {
 
     async initialize() {
         if (this.initialized) return true;
-        
+
         // Vérifier si un autre worker a déjà initialisé
         const sharedInit = this.sharedCache.get('initialized');
         if (sharedInit) {
@@ -332,7 +321,7 @@ class DataStore {
             this.initialized = true;
             return true;
         }
-        
+
         // Vérifier si un chargement est en cours
         const loadingLock = this.sharedCache.get('loading');
         if (loadingLock) {
@@ -347,7 +336,7 @@ class DataStore {
                 }
             }
         }
-        
+
         if (this.initPromise) return this.initPromise;
 
         this.initPromise = this._doInitialize();
@@ -361,7 +350,7 @@ class DataStore {
         this.livreursDisponibles = this.sharedCache.get('livreursDisponibles') || [];
         this.medicaments = this.sharedCache.get('medicaments') || [];
         this.lastUpdate = this.sharedCache.get('lastUpdate') || Date.now();
-        
+
         // Reconstruire les maps
         this.pharmaciesByQuartier.clear();
         for (const p of this.pharmacies) {
@@ -371,14 +360,14 @@ class DataStore {
             }
             this.pharmaciesByQuartier.get(quartier).push(p);
         }
-        
+
         // Reconstruire l'index des médicaments
         this.medicamentIndex.clear();
         for (const med of this.medicaments) {
             const nom = (med['NOM COMMERCIAL'] || med.nom || '').toLowerCase();
             const dci = (med['DCI'] || med.dci || '').toLowerCase();
             const mots = [...new Set([...nom.split(' '), ...dci.split(' ')])].filter(m => m.length > 2);
-            
+
             mots.forEach(mot => {
                 if (!this.medicamentIndex.has(mot)) {
                     this.medicamentIndex.set(mot, []);
@@ -386,17 +375,17 @@ class DataStore {
                 this.medicamentIndex.get(mot).push(med);
             });
         }
-        
+
         console.log(`📦 Données chargées depuis cache partagé: ${this.pharmacies.length} pharmacies, ${this.livreurs.length} livreurs, ${this.medicaments.length} médicaments`);
     }
 
     async _doInitialize() {
         try {
             console.log(`📥 Chargement des données (worker ${process.pid})...`);
-            
+
             // Lock pour éviter que plusieurs workers chargent en même temps
             this.sharedCache.set('loading', true);
-            
+
             const [pharmaData, livreursData, medsData] = await Promise.all([
                 this.storage.downloadFile('pharmacies.xlsx', this.storage.files.pharmacies),
                 this.storage.downloadFile('livreurs.xlsx', this.storage.files.livreurs),
@@ -424,7 +413,7 @@ class DataStore {
                         this.pharmaciesDeGarde.push(p);
                     }
                 }
-                
+
                 // Sauvegarder dans le cache partagé
                 this.sharedCache.set('pharmacies', this.pharmacies);
                 this.sharedCache.set('pharmaciesDeGarde', this.pharmaciesDeGarde);
@@ -445,7 +434,7 @@ class DataStore {
                     const nom = (med['NOM COMMERCIAL'] || med.nom || '').toLowerCase();
                     const dci = (med['DCI'] || med.dci || '').toLowerCase();
                     const mots = [...new Set([...nom.split(' '), ...dci.split(' ')])].filter(m => m.length > 2);
-                    
+
                     mots.forEach(mot => {
                         if (!this.medicamentIndex.has(mot)) {
                             this.medicamentIndex.set(mot, []);
@@ -453,18 +442,18 @@ class DataStore {
                         this.medicamentIndex.get(mot).push(med);
                     });
                 }
-                
+
                 this.sharedCache.set('medicaments', this.medicaments);
             }
 
             this.lastUpdate = Date.now();
             this.initialized = true;
-            
+
             // Marquer comme initialisé et enlever le lock
             this.sharedCache.set('initialized', true);
             this.sharedCache.set('loading', false);
             this.sharedCache.set('lastUpdate', this.lastUpdate);
-            
+
             console.log(`✅ Données: ${this.pharmacies.length} pharmacies, ${this.livreurs.length} livreurs, ${this.medicaments.length} médicaments (worker ${process.pid})`);
             return true;
 
@@ -489,7 +478,7 @@ class DataStore {
 
     async searchMedicine(term) {
         if (!term || term.length < 2) return [];
-        
+
         const cacheKey = `search_${term.toLowerCase()}`;
         const cached = cache.get(cacheKey);
         if (cached) {
@@ -499,9 +488,9 @@ class DataStore {
 
         const searchTerm = term.toLowerCase();
         const mots = searchTerm.split(' ').filter(m => m.length > 2);
-        
+
         const resultMap = new Map();
-        
+
         mots.forEach(mot => {
             const meds = this.medicamentIndex.get(mot) || [];
             meds.forEach(med => {
@@ -525,10 +514,10 @@ class DataStore {
         }
 
         const results = Array.from(resultMap.values()).slice(0, 10);
-        
+
         cache.set(cacheKey, results, 600); // 10 minutes
         stats.cacheMisses++;
-        
+
         return results;
     }
 
@@ -648,7 +637,7 @@ class ConversationManager {
     getConversation(userId) {
         const key = `conv_${userId}`;
         let conv = conversationCache.get(key);
-        
+
         if (!conv) {
             conv = {
                 id: userId,
@@ -660,7 +649,7 @@ class ConversationManager {
             };
             conversationCache.set(key, conv);
         }
-        
+
         conv.lastActivity = Date.now();
         conv.messageCount++;
         return conv;
@@ -673,11 +662,11 @@ class ConversationManager {
             content,
             timestamp: Date.now()
         });
-        
+
         if (conv.messages.length > 20) {
             conv.messages = conv.messages.slice(-20);
         }
-        
+
         conversationCache.set(`conv_${userId}`, conv);
     }
 
@@ -857,11 +846,11 @@ class WhatsAppService {
 
         // Ajouter à la queue
         this.queue.push({ to, text });
-        
+
         if (!this.processing) {
             this.processQueue();
         }
-        
+
         return true;
     }
 
@@ -946,7 +935,7 @@ class GroqService {
     async generateResponse(messages, functions = null) {
         return new Promise((resolve) => {
             this.queue.push({ messages, functions, resolve });
-            
+
             if (!this.processing) {
                 this.processQueue();
             }
@@ -1105,9 +1094,9 @@ setTimeout(() => {
 // Rafraîchir toutes les 30 minutes (seulement si c'est le premier worker)
 setInterval(() => {
     // Vérifier si c'est le worker avec le PID le plus bas
-    const shouldRefresh = !sharedCache.get('refreshing') && 
+    const shouldRefresh = !sharedCache.get('refreshing') &&
                           (Date.now() - (sharedCache.get('lastRefresh') || 0) > 25 * 60 * 1000);
-    
+
     if (shouldRefresh) {
         sharedCache.set('refreshing', true);
         store.initialize().then(() => {
@@ -1122,7 +1111,7 @@ setInterval(() => {
 // ============ PROMPT SYSTÈME ULTIME ============
 function getSystemPrompt(userId) {
     const context = store.getContext();
-    
+
     return `Tu es MIA, l'assistant santé officiel de San Pedro, Côte d'Ivoire. 🇨🇮
 
 CONTEXTE ACTUEL:
@@ -1333,7 +1322,7 @@ async function handleOrderFlow(userId, message) {
     if (step === 'confirm') {
         if (lowerMsg === 'oui' || lowerMsg === 'o' || lowerMsg === 'yes') {
             const allData = orderFlow.getData(userId);
-            
+
             const result = await executeFunction('create_order', {
                 client_nom: allData.nom,
                 client_whatsapp: allData.telephone,
@@ -1344,7 +1333,7 @@ async function handleOrderFlow(userId, message) {
 
             if (result.success) {
                 const order = result.data;
-                await whatsapp.sendMessage(userId, 
+                await whatsapp.sendMessage(userId,
                     `✅ *COMMANDE CONFIRMÉE !*\n\n` +
                     `📋 Numéro: ${order.order_id}\n` +
                     `🚚 Statut: ${order.status}\n` +
@@ -1354,7 +1343,7 @@ async function handleOrderFlow(userId, message) {
             } else {
                 await whatsapp.sendMessage(userId, "❌ Erreur lors de la création. Contactez le support.");
             }
-            
+
             orderFlow.reset(userId);
         } else if (lowerMsg === 'non' || lowerMsg === 'n') {
             orderFlow.reset(userId);
@@ -1413,15 +1402,15 @@ async function processWithLLM(userId, userMessage) {
             // Cas spécial: search_medicine - démarrer le flow
             if (name === 'search_medicine' && result.success && result.data.length > 0) {
                 const meds = result.data;
-                
+
                 if (meds.length === 1) {
                     // Un seul résultat, demander si l'utilisateur veut commander
                     const med = meds[0];
                     const msg = `💊 *${med.nom}*\n💰 ${med.prix || '?'} FCFA\n\nVoulez-vous commander ce médicament ? (oui/non)`;
-                    
+
                     convManager.setContext(userId, 'pendingMed', med);
                     await whatsapp.sendMessage(userId, msg);
-                    
+
                 } else {
                     // Plusieurs résultats
                     let medList = `💊 *Plusieurs options trouvées:*\n\n`;
@@ -1429,11 +1418,11 @@ async function processWithLLM(userId, userMessage) {
                         medList += `${i+1}. *${med.nom}*\n   💰 ${med.prix || '?'} FCFA\n`;
                     });
                     medList += `\nChoisissez un numéro (1-${Math.min(5, meds.length)}) pour commander, ou envoyez le nom exact.`;
-                    
+
                     convManager.setContext(userId, 'searchResults', meds);
                     await whatsapp.sendMessage(userId, medList);
                 }
-                
+
                 convManager.addMessage(userId, 'assistant', response.content || 'Voici les résultats.');
                 return;
             }
@@ -1641,5 +1630,3 @@ process.on('unhandledRejection', (err) => {
     stats.lastError = err.message;
     stats.lastErrorTime = Date.now();
 });
-
-// ============ FIN ============

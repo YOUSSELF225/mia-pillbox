@@ -527,7 +527,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
     class NLPService {
         constructor() {
             this.manager = null;
-            this.modelPath = __dirname + '/model.nlp';
+            this.modelPath = path.join(__dirname, 'model.nlp');
             this.ready = false;
         }
 
@@ -535,9 +535,17 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             try {
                 log('INFO', 'Chargement du modèle NLP...');
                 this.manager = new NlpManager({ languages: ['fr'] });
-                this.manager.load(this.modelPath);
-                this.ready = true;
-                log('SUCCESS', 'Modèle NLP chargé avec succès');
+                
+                // Vérifier si le fichier existe avant de charger
+                const fs = require('fs');
+                if (fs.existsSync(this.modelPath)) {
+                    this.manager.load(this.modelPath);
+                    this.ready = true;
+                    log('SUCCESS', 'Modèle NLP chargé avec succès');
+                } else {
+                    log('WARN', 'Fichier modèle NLP non trouvé, utilisation du mode fallback');
+                    this.ready = false;
+                }
                 return true;
             } catch (error) {
                 log('ERROR', 'Erreur chargement modèle NLP:', error);
@@ -559,6 +567,12 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
             try {
                 stats.nlpCalls++;
+                
+                if (!this.ready || !this.manager) {
+                    // Fallback simple basé sur des mots-clés
+                    return this.fallbackParse(message);
+                }
+                
                 const result = await this.manager.process('fr', message);
 
                 const formattedResult = {
@@ -567,9 +581,11 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                     entities: {}
                 };
 
-                result.entities.forEach(entity => {
-                    formattedResult.entities[entity.entity] = entity.option || entity.sourceText;
-                });
+                if (result.entities) {
+                    result.entities.forEach(entity => {
+                        formattedResult.entities[entity.entity] = entity.option || entity.sourceText;
+                    });
+                }
 
                 cache.set(cacheKey, formattedResult, 300);
                 stats.cacheMisses++;
@@ -579,19 +595,53 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
             } catch (error) {
                 log('ERROR', 'Erreur analyse NLP:', error);
-                return { intent: 'nlu_fallback', confidence: 0, entities: {} };
+                return this.fallbackParse(message);
             }
+        }
+
+        fallbackParse(message) {
+            const msg = message.toLowerCase();
+            
+            // Détection simple par mots-clés
+            if (msg.includes('bonjour') || msg.includes('salut') || msg.includes('hello')) {
+                return { intent: 'saluer', confidence: 70, entities: {} };
+            }
+            if (msg.includes('prix') || msg.includes('combien')) {
+                return { intent: 'prix_medicament', confidence: 60, entities: {} };
+            }
+            if (msg.includes('pharmacie') && (msg.includes('garde') || msg.includes('ouverte'))) {
+                return { intent: 'pharmacie_garde', confidence: 80, entities: {} };
+            }
+            if (msg.includes('commander') || msg.includes('acheter') || msg.includes('panier')) {
+                return { intent: 'commander', confidence: 70, entities: {} };
+            }
+            if (msg.includes('rdv') || msg.includes('rendez-vous')) {
+                return { intent: 'prendre_rdv', confidence: 80, entities: {} };
+            }
+            if (msg.includes('livraison') || msg.includes('livrer')) {
+                return { intent: 'infos_livraison', confidence: 70, entities: {} };
+            }
+            if (msg.includes('aide') || msg.includes('help') || msg.includes('?')) {
+                return { intent: 'aide', confidence: 90, entities: {} };
+            }
+            
+            // Par défaut, on suppose que c'est une recherche de médicament
+            return { intent: 'rechercher_medicament', confidence: 50, entities: {} };
         }
     }
 
     // Groq Service
     class GroqService {
         constructor() {
-            this.client = new Groq({ apiKey: GROQ_API_KEY, timeout: 8000, maxRetries: 2 });
+            this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY, timeout: 8000, maxRetries: 2 }) : null;
             this.model = GROQ_MODEL;
         }
 
         async generateResponse(messages, temperature = 0.7, maxTokens = 300) {
+            if (!this.client) {
+                return null;
+            }
+            
             try {
                 stats.groqCalls++;
                 const chatCompletion = await this.client.chat.completions.create({
@@ -1175,7 +1225,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
     // Moteur de conversation principal
     class ConversationEngine {
-        constructor(nlp, groq, searchService, clinicService, orderService, convManager, whatsapp, livreurService) {
+        constructor(nlp, groq, searchService, clinicService, orderService, convManager, whatsapp, livreurService, pharmacyScraper) {
             this.nlp = nlp;
             this.groq = groq;
             this.searchService = searchService;
@@ -1184,6 +1234,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             this.convManager = convManager;
             this.whatsapp = whatsapp;
             this.livreurService = livreurService;
+            this.pharmacyScraper = pharmacyScraper;
             this.states = ConversationStates;
         }
 
@@ -1651,7 +1702,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         async handleWaitingRdvConfirmation(phone, message, conv) {
             const confirmation = message.toLowerCase();
 
-            if (confirmation === 'oui' || confirmation === 'o' || confirmation === 'confirmer') {
+            if (confirmation === 'oui' || confirmation === 'o' || confirmation === 'confirmer' || message === '✅ Confirmer') {
                 try {
                     const medecins = await this.clinicService.getMedecinsBySpecialite(
                         conv.context.selected_specialite, 
@@ -1685,7 +1736,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                     log('ERROR', 'Erreur création rendez-vous:', error);
                     return "Erreur lors de la confirmation. Réessayez plus tard. 😔";
                 }
-            } else if (confirmation === 'modifier') {
+            } else if (confirmation === 'modifier' || message === '✏️ Modifier') {
                 return await this.handleIntentPrendreRdv(conv);
             } else {
                 await this.convManager.updateState(phone, this.states.IDLE, { context: {} });
@@ -1984,7 +2035,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
     const conversationEngine = new ConversationEngine(
         nlpService, groqService, searchEngine, clinicService, 
-        orderService, convManager, whatsappService, livreurService
+        orderService, convManager, whatsappService, livreurService, pharmacyScraper
     );
 
     const timeoutManager = new TimeoutManager(convManager, whatsappService);

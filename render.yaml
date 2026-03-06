@@ -1,0 +1,12 @@
+# render.yaml
+services:
+  - type: web
+    name: mia-pillbox
+    env: node
+    buildCommand: npm install && npm rebuild
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

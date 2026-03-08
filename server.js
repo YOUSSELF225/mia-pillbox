@@ -12,9 +12,8 @@ const { NlpManager } = require('node-nlp');
 const Groq = require('groq-sdk');
 const Fuse = require('fuse.js');
 const rateLimitPkg = require('express-rate-limit');
-const { ipKeyGenerator } = rateLimitPkg;
 
-// Constantes de productions
+// ==================== CONSTANTES ====================
 const PORT = process.env.PORT || 10000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
@@ -24,19 +23,20 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 
-// Groq API
+// Groq API - UNIQUEMENT pour générer des réponses naturelles
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-// Configuration de recherche simplifiée (Fuse.js uniquement)
+// Configuration de recherche Fuse.js
 const SEARCH_CONFIG = {
     MIN_TERM_LENGTH: 2,
     MAX_RESULTS: 20,
-    FUSE_THRESHOLD: 0.4,  // Tolérance aux fautes
-    FUSE_DISTANCE: 100
+    FUSE_THRESHOLD: 0.3,        // Très tolérant aux fautes
+    FUSE_DISTANCE: 200,          // Distance pour fautes de frappe
+    MIN_MATCH_CHARS: 2           // Commence à chercher dès 2 caractères
 };
 
-// Sources de données scraping
+// Sources de données
 const SOURCES = {
     PHARMACIES_GARDE: {
         url: process.env.PHARMACIES_URL || 'https://annuaireci.com/pharmacies-de-garde/',
@@ -44,7 +44,7 @@ const SOURCES = {
     }
 };
 
-// Tarifs livraison
+// Tarifs livraison (sans gratuité)
 const DELIVERY_PRICES = {
     NIGHT: { startHour: 0, endHour: 7, price: 600 },
     DAY: { startHour: 8, endHour: 23, price: 400 }
@@ -54,7 +54,7 @@ const DELIVERY_PRICES = {
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 const CLINIC_NOTIFICATION_PHONE = process.env.CLINIC_NOTIFICATION_PHONE || '2250701406880';
 
-// Clustering
+// ==================== CLUSTERING ====================
 const numCPUs = Math.min(os.cpus().length, 2);
 if (cluster.isPrimary && NODE_ENV === 'production') {
     console.log(`Master PID ${process.pid} - Lancement de ${numCPUs} workers...`);
@@ -64,7 +64,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         cluster.fork();
     });
 } else {
-    // Express
+    // ==================== EXPRESS ====================
     const app = express();
     app.use(compression());
     app.use(express.json({ limit: '1mb' }));
@@ -76,16 +76,16 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
     const limiter = rateLimitPkg({
         windowMs: 60000,
         max: 200,
-        keyGenerator: (req) => ipKeyGenerator(req.ip || req.connection.remoteAddress),
+        keyGenerator: (req) => req.ip || req.connection.remoteAddress,
         skip: (req) => req.ip === '::1' || req.ip === '127.0.0.1'
     });
     app.use('/webhook', limiter);
 
-    // Caches
+    // ==================== CACHES ====================
     const cache = new NodeCache({ stdTTL: 300 });
     const processedMessages = new NodeCache({ stdTTL: 300 });
 
-    // Statistiques
+    // ==================== STATISTIQUES ====================
     const stats = {
         messagesProcessed: 0,
         cacheHits: 0,
@@ -100,7 +100,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         activeUsers: new Set()
     };
 
-    // Pool PostgreSQL
+    // ==================== BASE DE DONNÉES ====================
     const pool = new Pool({
         connectionString: process.env.DATABASE_URL,
         ssl: { rejectUnauthorized: false },
@@ -114,29 +114,36 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         stats.errors++;
     });
 
-    // Logging
+    // ==================== LOGGING ====================
     function log(level, message, data = null) {
-        const icons = { INFO: '📘', SUCCESS: '✅', ERROR: '❌', USER: '👤', BOT: '🤖', 
-                       NLP: '🧠', GROQ: '🔥', SCRAPE: '🕷️', WEBHOOK: '📨', CACHE: '📦',
-                       DB: '💾', ORDER: '📦', APPT: '📅', SEARCH: '🔍', LIVREUR: '🛵' };
+        const icons = { 
+            INFO: '📘', SUCCESS: '✅', ERROR: '❌', USER: '👤', BOT: '🤖', 
+            NLP: '🧠', GROQ: '🔥', SCRAPE: '🕷️', WEBHOOK: '📨', CACHE: '📦',
+            DB: '💾', ORDER: '📦', APPT: '📅', SEARCH: '🔍', LIVREUR: '🛵' 
+        };
         const timestamp = new Date().toISOString();
         console.log(`[${timestamp}] ${icons[level] || '📌'} ${message}`);
         if (data && NODE_ENV !== 'production') console.log('   📎 Data:', JSON.stringify(data, null, 2));
     }
 
-    // États de conversation
+    // ==================== ÉTATS DE CONVERSATION ====================
     const ConversationStates = {
         IDLE: 'IDLE',
         GREETED: 'GREETED',
         SEARCHING: 'SEARCHING',
         WAITING_MEDICINE: 'WAITING_MEDICINE',
+        WAITING_QUANTITY: 'WAITING_QUANTITY',
         WAITING_QUARTIER: 'WAITING_QUARTIER',
         WAITING_NAME: 'WAITING_NAME',
         WAITING_PHONE: 'WAITING_PHONE',
+        WAITING_INDICATIONS: 'WAITING_INDICATIONS',
         WAITING_CONFIRMATION: 'WAITING_CONFIRMATION',
         ORDER_COMPLETED: 'ORDER_COMPLETED',
         WAITING_CLINIC: 'WAITING_CLINIC',
+        WAITING_CLINIC_SELECTION: 'WAITING_CLINIC_SELECTION',
         WAITING_SPECIALITE: 'WAITING_SPECIALITE',
+        WAITING_SPECIALITE_SELECTION: 'WAITING_SPECIALITE_SELECTION',
+        WAITING_PATIENT_INFO: 'WAITING_PATIENT_INFO',
         WAITING_DATE: 'WAITING_DATE',
         WAITING_HEURE: 'WAITING_HEURE',
         WAITING_RDV_CONFIRMATION: 'WAITING_RDV_CONFIRMATION',
@@ -148,16 +155,22 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         WAITING_LIVREUR_CODE: 'WAITING_LIVREUR_CODE'
     };
 
-    // Utilitaires
+    // ==================== UTILITAIRES ====================
     class Utils {
         static cleanText(text) {
             if (!text) return '';
             return text.replace(/\s+/g, ' ').trim();
         }
 
-        static normalizeLocation(location) {
-            if (!location) return '';
-            return location.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').trim();
+        static normalizeText(text) {
+            if (!text) return '';
+            return text
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-z0-9\s-]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
         }
 
         static extractPrice(priceText) {
@@ -201,138 +214,467 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             }
             return null;
         }
+
+        static formatDate(dateStr) {
+            try {
+                const [day, month, year] = dateStr.split('/');
+                return `${day}/${month}/${year}`;
+            } catch {
+                return dateStr;
+            }
+        }
+
+        static formatTime(timeStr) {
+            try {
+                const [hours, minutes] = timeStr.split(':');
+                return `${hours}h${minutes !== '00' ? minutes : ''}`;
+            } catch {
+                return timeStr;
+            }
+        }
+
+        static formatPhoneNumber(phone) {
+            return phone.replace(/\D/g, '');
+        }
+
+        static calculateAge(birthDate) {
+            const today = new Date();
+            const birth = new Date(birthDate.split('/').reverse().join('-'));
+            let age = today.getFullYear() - birth.getFullYear();
+            const m = today.getMonth() - birth.getMonth();
+            if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) {
+                age--;
+            }
+            return age;
+        }
+
+        static formatCart(cart) {
+            const subtotal = cart.reduce((sum, i) => sum + (i.prix * (i.quantite || 1)), 0);
+            const delivery = this.getCurrentDeliveryPrice();
+            const deliveryPrice = delivery.price;
+            
+            const items = cart.map((i, idx) => 
+                `${idx+1} x ${i.nom_commercial} - ${i.prix * (i.quantite || 1)} FCFA`
+            ).join('\n');
+            
+            return {
+                items,
+                subtotal,
+                deliveryPrice,
+                total: subtotal + deliveryPrice,
+                formatted: `${items}\n\nSous-total : ${subtotal} FCFA\nFrais de livraison : ${deliveryPrice} FCFA\nPrix Total : ${subtotal + deliveryPrice} FCFA`
+            };
+        }
     }
 
-    // Moteur de recherche simplifié avec Fuse.js
-    class SimpleSearchEngine {
+    // ==================== MOTEUR DE RECHERCHE FUSE.js OPTIMISÉ ====================
+    class SearchEngine {
         constructor(pool) {
             this.pool = pool;
             this.fuse = null;
             this.medicaments = [];
+            this.indexReady = false;
+            
             this.fuseOptions = {
                 includeScore: true,
                 threshold: SEARCH_CONFIG.FUSE_THRESHOLD,
                 distance: SEARCH_CONFIG.FUSE_DISTANCE,
-                minMatchCharLength: 2,
+                minMatchCharLength: SEARCH_CONFIG.MIN_MATCH_CHARS,
+                findAllMatches: true,
+                ignoreLocation: true,
+                shouldSort: true,
+                tokenize: true,
+                matchAllTokens: false,
                 keys: [
-                    { name: 'nom_commercial', weight: 2 },
-                    { name: 'dci', weight: 1 },
-                    { name: 'categorie', weight: 0.5 }
-                ]
+                    { name: 'nom_commercial', weight: 3 },
+                    { name: 'nom_sans_espace', weight: 3 },
+                    { name: 'dci', weight: 1.5 },
+                    { name: 'categorie', weight: 1 },
+                    { name: 'code_produit', weight: 1 }
+                ],
+                getFn: (obj, path) => {
+                    const value = this._getValue(obj, path);
+                    return value ? Utils.normalizeText(value) : '';
+                }
             };
+        }
+
+        _getValue(obj, path) {
+            return path.split('.').reduce((current, key) => current && current[key], obj) || '';
         }
 
         async buildIndex() {
             try {
-                log('INFO', 'Construction index Fuse.js...');
+                log('INFO', 'Construction index de recherche Fuse.js...');
+                
                 const result = await this.pool.query(`
-                    SELECT code_produit, nom_commercial, dci, prix, categorie
-                    FROM medicaments_cache
+                    SELECT 
+                        code_produit,
+                        nom_commercial,
+                        REPLACE(LOWER(nom_commercial), ' ', '') as nom_sans_espace,
+                        dci,
+                        prix,
+                        categorie
+                    FROM medicaments
                     WHERE nom_commercial IS NOT NULL
                 `);
                 
                 this.medicaments = result.rows;
                 this.fuse = new Fuse(this.medicaments, this.fuseOptions);
-                log('SUCCESS', `Index Fuse.js créé avec ${this.medicaments.length} médicaments`);
+                this.indexReady = true;
+                
+                log('SUCCESS', `Index créé avec ${this.medicaments.length} médicaments`);
+                return true;
             } catch (error) {
                 log('ERROR', 'Erreur construction index:', error);
+                return false;
             }
         }
 
         async search(query, limit = 10) {
-            if (!this.fuse || !query || query.length < 2) {
+            if (!this.indexReady || !query || query.length < 2) {
                 return { results: [], suggestions: [] };
             }
 
-            const fuseResults = this.fuse.search(query);
+            const start = Date.now();
+            const normalized = Utils.normalizeText(query);
             
-            const results = fuseResults.slice(0, limit).map(result => ({
-                doc: result.item,
-                score: 1 - (result.score || 0)
+            // Recherche exacte en priorité
+            const exactMatches = this.medicaments
+                .filter(m => Utils.normalizeText(m.nom_commercial).includes(normalized))
+                .map(m => ({ item: m, score: 1, type: 'exact' }));
+            
+            // Recherche floue avec Fuse
+            const fuseResults = this.fuse.search(query).map(r => ({
+                item: r.item,
+                score: 1 - (r.score || 0),
+                type: 'fuzzy'
             }));
+            
+            // Fusion et déduplication
+            const seen = new Set();
+            const results = [];
+            
+            [...exactMatches, ...fuseResults].forEach(r => {
+                if (!seen.has(r.item.code_produit)) {
+                    seen.add(r.item.code_produit);
+                    results.push(r);
+                }
+            });
+            
+            const time = Date.now() - start;
+            log('SEARCH', `Recherche "${query}" : ${results.length} résultats en ${time}ms`);
+            
+            return {
+                results: results.slice(0, limit),
+                suggestions: this._getSuggestions(query, results),
+                total: results.length,
+                time
+            };
+        }
 
-            const suggestions = this.medicaments
-                .filter(m => m.nom_commercial.toLowerCase().startsWith(query.toLowerCase()))
-                .slice(0, 5)
-                .map(m => m.nom_commercial);
+        _getSuggestions(query, results) {
+            const suggestions = new Set();
+            const normalized = Utils.normalizeText(query);
+            
+            results.slice(0, 5).forEach(r => suggestions.add(r.item.nom_commercial));
+            
+            this.medicaments
+                .filter(m => Utils.normalizeText(m.nom_commercial).startsWith(normalized))
+                .slice(0, 3)
+                .forEach(m => suggestions.add(m.nom_commercial));
+            
+            return Array.from(suggestions).slice(0, 5);
+        }
 
-            return { results, suggestions: [...new Set(suggestions)], total: results.length };
+        async getMedicineByName(name) {
+            const results = await this.search(name, 1);
+            return results.results.length > 0 ? results.results[0].item : null;
         }
     }
 
-    // Scraper pharmacies simplifié
-    class SimplePharmacyScraper {
+    // ==================== SCRAPER PHARMACIES OPTIMISÉ ====================
+    class PharmacyScraper {
         constructor() {
-            this.config = SOURCES.PHARMACIES_GARDE;
-            this.timeout = 10000;
+            this.baseUrl = SOURCES.PHARMACIES_GARDE.url;
+            this.timeout = 8000;
+            this.cachePrefix = 'pharmacies';
+            this.userAgents = [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ];
         }
 
-        async fetch() {
-            const cacheKey = 'scrape_pharmacies';
+        async fetchWeek(weekId = null) {
+            const cacheKey = weekId ? `${this.cachePrefix}_${weekId}` : `${this.cachePrefix}_current`;
+            
             const cached = cache.get(cacheKey);
-            if (cached) {
+            if (cached && !this._isWeekExpired(cached.week_info)) {
                 stats.cacheHits++;
                 return cached;
             }
 
             try {
-                log('SCRAPE', 'Récupération des pharmacies de garde...');
-                stats.scrapes++;
-
-                const response = await axios.get(this.config.url, {
-                    headers: { 'User-Agent': 'Mozilla/5.0' },
+                const url = weekId ? `${this.baseUrl}?schedule=${weekId}` : this.baseUrl;
+                log('SCRAPE', `Récupération semaine ${weekId || 'courante'}...`);
+                
+                const response = await axios.get(url, {
+                    headers: {
+                        'User-Agent': this.userAgents[Math.floor(Math.random() * this.userAgents.length)],
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'fr,fr-FR;q=0.8,en-US;q=0.5,en;q=0.3',
+                        'Cache-Control': 'no-cache'
+                    },
                     timeout: this.timeout
                 });
-                
+
                 const $ = cheerio.load(response.data);
-                const pharmacies = [];
+                
+                const [weekInfo, pharmacies, scheduleOptions] = await Promise.all([
+                    this._extractWeekInfo($),
+                    this._extractPharmacies($),
+                    this._extractScheduleOptions($)
+                ]);
 
-                $('.pharmacy-section, .pharmacy-card, .card').each((i, section) => {
-                    const nom = $(section).find('h4, h3, .title').first().text().trim();
-                    if (!nom) return;
+                const result = {
+                    week_info: weekInfo,
+                    pharmacies: pharmacies,
+                    schedule_options: scheduleOptions,
+                    total: pharmacies.length,
+                    scraped_at: new Date().toISOString()
+                };
 
-                    const localite = $(section).find('.location, .ville, .localite').first().text().trim() ||
-                                    $(section).find('p:contains("quartier")').text().replace('quartier:', '').trim();
-
-                    const adresse = $(section).find('.address, .adresse').first().text().trim() ||
-                                   $(section).find('p:contains("adresse")').text().replace('adresse:', '').trim();
-
-                    const telephone = $(section).find('a[href^="tel:"]').first().text().trim() ||
-                                     $(section).find('.phone, .tel').first().text().trim();
-
-                    pharmacies.push({
-                        nom,
-                        localite: localite || 'Abidjan',
-                        adresse: adresse || 'Non spécifiée',
-                        telephone: telephone || 'Non disponible'
-                    });
-                });
-
-                cache.set(cacheKey, pharmacies, 1800);
+                const ttl = this._calculateTTL(weekInfo);
+                cache.set(cacheKey, result, ttl);
+                
                 stats.cacheMisses++;
-                log('SUCCESS', `${pharmacies.length} pharmacies de garde scrapées`);
-                return pharmacies;
+                stats.scrapes++;
+                
+                log('SUCCESS', `${pharmacies.length} pharmacies (semaine ${weekInfo.weekId || 'courante'})`);
+                
+                return result;
 
             } catch (error) {
-                log('ERROR', 'Erreur scraping pharmacies:', error.message);
-                return [];
+                log('ERROR', `Scraping échoué: ${error.message}`);
+                const expired = cache.get(cacheKey);
+                if (expired) {
+                    log('WARN', 'Utilisation cache expiré');
+                    return { ...expired, from_expired_cache: true };
+                }
+                return this._getEmptyResult();
             }
         }
 
-        async searchByLocation(term) {
-            if (!term) return [];
-            const pharmacies = await this.fetch();
-            const searchTerm = term.toLowerCase();
+        async _extractPharmacies($) {
+            const pharmacies = [];
+            const sections = $('.pharmacy-section');
+            
+            sections.each((i, section) => {
+                const $section = $(section);
+                const localite = $section.find('h3').first().text().trim();
+                const cleanLocalite = localite.replace(/\(\d+\)$/, '').trim();
+                
+                $section.find('.pharmacy-card').each((j, card) => {
+                    const $card = $(card);
+                    
+                    pharmacies.push({
+                        nom: this._extractNom($card),
+                        localite: cleanLocalite,
+                        adresse: this._extractAdresse($card),
+                        telephone: this._extractTelephone($card),
+                        telephones: this._extractAllTelephones($card),
+                        url: this._extractUrl($card)
+                    });
+                });
+            });
+            
+            return pharmacies;
+        }
 
-            return pharmacies.filter(p =>
-                p.localite.toLowerCase().includes(searchTerm) ||
-                p.adresse.toLowerCase().includes(searchTerm) ||
-                p.nom.toLowerCase().includes(searchTerm)
-            ).slice(0, 5);
+        _extractNom($card) {
+            const nomLink = $card.find('h4 a').first();
+            if (nomLink.length) {
+                return nomLink.text().trim();
+            }
+            return $card.find('h4').first().text().trim() || 'Pharmacie sans nom';
+        }
+
+        _extractAdresse($card) {
+            const mapIcon = $card.find('i.fa-map-marker-alt').first();
+            if (mapIcon.length) {
+                const p = mapIcon.closest('p');
+                return p.find('span').first().text().trim() || p.text().replace(mapIcon.text(), '').trim();
+            }
+            
+            const p = $card.find('p').filter((_, el) => {
+                const text = $(el).text().toLowerCase();
+                return text.includes('rue') || text.includes('quartier') || 
+                       text.includes('carrefour') || text.includes('face');
+            }).first();
+            
+            return p.length ? p.text().trim() : 'Adresse non spécifiée';
+        }
+
+        _extractTelephone($card) {
+            const telLink = $card.find('a[href^="tel:"]').first();
+            if (telLink.length) {
+                return telLink.text().trim();
+            }
+            
+            const phoneIcon = $card.find('i.fa-phone-alt').first();
+            if (phoneIcon.length) {
+                const p = phoneIcon.closest('p');
+                const text = p.text().trim();
+                const match = text.match(/(\d{2}[\s-]?\d{2}[\s-]?\d{2}[\s-]?\d{2}[\s-]?\d{2})/);
+                return match ? match[0] : 'Non disponible';
+            }
+            
+            return 'Non disponible';
+        }
+
+        _extractAllTelephones($card) {
+            const telephones = [];
+            
+            $card.find('a[href^="tel:"]').each((_, link) => {
+                const tel = $(link).text().trim();
+                if (tel && !telephones.includes(tel)) telephones.push(tel);
+            });
+            
+            $card.find('i.fa-phone-alt').each((_, icon) => {
+                const p = $(icon).closest('p');
+                const text = p.text().trim();
+                const matches = text.match(/(\d{2}[\s-]?\d{2}[\s-]?\d{2}[\s-]?\d{2}[\s-]?\d{2})/g);
+                if (matches) {
+                    matches.forEach(m => {
+                        if (!telephones.includes(m)) telephones.push(m);
+                    });
+                }
+            });
+            
+            return telephones.length ? telephones : ['Non disponible'];
+        }
+
+        _extractUrl($card) {
+            const link = $card.find('h4 a').first();
+            if (link.length) {
+                let url = link.attr('href');
+                if (url && !url.startsWith('http')) {
+                    url = 'https://annuaireci.com' + url;
+                }
+                return url;
+            }
+            return null;
+        }
+
+        _extractWeekInfo($) {
+            const weekInfo = {
+                weekId: null,
+                startDate: null,
+                endDate: null,
+                currentWeek: false,
+                expiresAt: null
+            };
+            
+            const selected = $('.schedule-selector select option:selected');
+            if (selected.length) {
+                weekInfo.weekId = selected.val();
+                const text = selected.text().trim();
+                
+                const dateMatch = text.match(/Du (\d{2}\/\d{2}\/\d{4}) au (\d{2}\/\d{2}\/\d{4})/);
+                if (dateMatch) {
+                    weekInfo.startDate = dateMatch[1];
+                    weekInfo.endDate = dateMatch[2];
+                }
+                
+                weekInfo.currentWeek = text.includes('Semaine actuelle');
+            }
+            
+            if (weekInfo.endDate) {
+                const [day, month, year] = weekInfo.endDate.split('/');
+                const expiryDate = new Date(year, month - 1, parseInt(day) + 1);
+                weekInfo.expiresAt = expiryDate.toISOString();
+            }
+            
+            return weekInfo;
+        }
+
+        _extractScheduleOptions($) {
+            const options = [];
+            $('.schedule-selector select option').each((i, opt) => {
+                const $opt = $(opt);
+                options.push({
+                    id: $opt.val(),
+                    text: $opt.text().trim(),
+                    selected: $opt.is(':selected'),
+                    current: $opt.text().includes('Semaine actuelle')
+                });
+            });
+            return options;
+        }
+
+        _isWeekExpired(weekInfo) {
+            if (!weekInfo || !weekInfo.endDate) return true;
+            
+            const [day, month, year] = weekInfo.endDate.split('/');
+            const endDate = new Date(year, month - 1, day);
+            const now = new Date();
+            
+            return now > new Date(endDate.setDate(endDate.getDate() + 1));
+        }
+
+        _calculateTTL(weekInfo) {
+            if (!weekInfo || !weekInfo.endDate) return 3600;
+            
+            const [day, month, year] = weekInfo.endDate.split('/');
+            const expiryDate = new Date(year, month - 1, parseInt(day) + 1, 0, 0, 0);
+            const now = new Date();
+            
+            const ttlSeconds = Math.floor((expiryDate - now) / 1000);
+            return Math.max(300, Math.min(ttlSeconds, 7 * 24 * 3600));
+        }
+
+        _getEmptyResult() {
+            return {
+                week_info: { weekId: null, startDate: null, endDate: null, currentWeek: false },
+                pharmacies: [],
+                schedule_options: [],
+                total: 0,
+                error: true
+            };
+        }
+
+        async searchByLocation(term, weekId = null) {
+            if (!term || term.length < 2) return [];
+            
+            const data = await this.fetchWeek(weekId);
+            const pharmacies = data.pharmacies;
+            const searchTerm = Utils.normalizeText(term);
+            
+            return pharmacies
+                .filter(p => 
+                    Utils.normalizeText(p.localite).includes(searchTerm) ||
+                    Utils.normalizeText(p.adresse).includes(searchTerm) ||
+                    Utils.normalizeText(p.nom).includes(searchTerm)
+                )
+                .slice(0, 10);
+        }
+
+        async getAvailableLocations(weekId = null) {
+            const data = await this.fetchWeek(weekId);
+            const locations = new Set();
+            
+            data.pharmacies.forEach(p => {
+                if (p.localite && p.localite !== 'Non spécifié') {
+                    locations.add(p.localite);
+                }
+            });
+            
+            return Array.from(locations).sort();
         }
     }
 
-    // Service clinique
+    // ==================== SERVICE CLINIQUE ====================
     class ClinicService {
         constructor(pool) {
             this.pool = pool;
@@ -351,6 +693,14 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
             const result = await this.pool.query(query, params);
             return result.rows;
+        }
+
+        async getClinicById(id) {
+            const result = await this.pool.query(
+                'SELECT * FROM cliniques WHERE id_clinique = $1',
+                [id]
+            );
+            return result.rows[0];
         }
 
         async getMedecinsByClinic(clinicId) {
@@ -399,8 +749,9 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             await this.pool.query(`
                 INSERT INTO rendez_vous (
                     id, id_clinique, medecin, specialite,
-                    patient_nom, patient_telephone, date_rdv, heure_rdv, status
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    patient_nom, patient_telephone, patient_age, patient_poids, patient_taille,
+                    date_rdv, heure_rdv, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             `, [
                 appointmentId,
                 data.id_clinique,
@@ -408,6 +759,9 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 data.specialite,
                 data.patient_nom,
                 data.patient_telephone,
+                data.patient_age,
+                data.patient_poids,
+                data.patient_taille,
                 data.date_rdv,
                 data.heure_rdv,
                 'CONFIRME'
@@ -449,7 +803,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     }
 
-    // WhatsApp Service
+    // ==================== WHATSAPP SERVICE ====================
     class WhatsAppService {
         constructor() {
             this.apiUrl = WHATSAPP_API_URL;
@@ -504,7 +858,6 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 log('SUCCESS', `Message interactif envoyé à ${to}`);
             } catch (error) {
                 log('ERROR', `Erreur message interactif: ${error.message}`);
-                // Fallback au message texte simple
                 await this.sendMessage(to, text + "\n\n" + buttons.join(" - "));
             }
         }
@@ -521,23 +874,37 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 });
             } catch (error) {}
         }
+
+        async handleVoiceMessage(to) {
+            await this.sendMessage(to, 
+                "Désolé, je ne peux pas traiter les messages vocaux. 🎤❌\n\n" +
+                "Veuillez écrire votre demande ou utiliser les boutons interactifs, s'il vous plaît. 😊"
+            );
+        }
     }
 
-    // NLP Service
+    // ==================== NLP SERVICE ====================
     class NLPService {
         constructor() {
             this.manager = null;
-            this.modelPath = __dirname + '/model.nlp';
+            this.modelPath = path.join(__dirname, 'model.nlp');
             this.ready = false;
         }
 
         async loadModel() {
             try {
                 log('INFO', 'Chargement du modèle NLP...');
-                this.manager = new NlpManager({ languages: ['fr'] });
-                this.manager.load(this.modelPath);
-                this.ready = true;
-                log('SUCCESS', 'Modèle NLP chargé avec succès');
+                this.manager = new NlpManager({ languages: ['fr'], forceNER: true });
+                
+                const fs = require('fs');
+                if (fs.existsSync(this.modelPath)) {
+                    this.manager.load(this.modelPath);
+                    this.ready = true;
+                    log('SUCCESS', 'Modèle NLP chargé avec succès');
+                } else {
+                    log('WARN', 'Fichier modèle NLP non trouvé');
+                    this.ready = false;
+                }
                 return true;
             } catch (error) {
                 log('ERROR', 'Erreur chargement modèle NLP:', error);
@@ -559,6 +926,16 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
             try {
                 stats.nlpCalls++;
+                
+                if (!this.ready || !this.manager) {
+                    return { 
+                        intent: 'nlu_fallback', 
+                        confidence: 0, 
+                        entities: {},
+                        error: 'Modèle NLP non disponible'
+                    };
+                }
+                
                 const result = await this.manager.process('fr', message);
 
                 const formattedResult = {
@@ -567,9 +944,15 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                     entities: {}
                 };
 
-                result.entities.forEach(entity => {
-                    formattedResult.entities[entity.entity] = entity.option || entity.sourceText;
-                });
+                if (result.entities) {
+                    result.entities.forEach(entity => {
+                        if (entity.entity && entity.option) {
+                            formattedResult.entities[entity.entity] = entity.option;
+                        } else if (entity.entity && entity.sourceText) {
+                            formattedResult.entities[entity.entity] = entity.sourceText;
+                        }
+                    });
+                }
 
                 cache.set(cacheKey, formattedResult, 300);
                 stats.cacheMisses++;
@@ -579,36 +962,71 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
             } catch (error) {
                 log('ERROR', 'Erreur analyse NLP:', error);
-                return { intent: 'nlu_fallback', confidence: 0, entities: {} };
+                return { 
+                    intent: 'nlu_fallback', 
+                    confidence: 0, 
+                    entities: {}
+                };
             }
         }
     }
 
-    // Groq Service
+    // ==================== GROQ SERVICE (UNIQUEMENT POUR RÉPONSES NATURELLES) ====================
     class GroqService {
         constructor() {
-            this.client = new Groq({ apiKey: GROQ_API_KEY, timeout: 8000, maxRetries: 2 });
+            this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
             this.model = GROQ_MODEL;
         }
 
-        async generateResponse(messages, temperature = 0.7, maxTokens = 300) {
+        async generateResponse(context) {
+            if (!this.client) return null;
+            
             try {
                 stats.groqCalls++;
-                const chatCompletion = await this.client.chat.completions.create({
+                
+                const messages = [
+                    { 
+                        role: 'system', 
+                        content: `Tu es MIA, assistante santé de Pillbox CI en Côte d'Ivoire. 
+                        Réponds de façon naturelle, chaleureuse et concise. 
+                        Utilise des émojis adaptés. 
+                        Ne répète pas les informations techniques, reformule-les de façon agréable.
+                        Format de réponse simple et clair.` 
+                    },
+                    { role: 'user', content: this._buildPrompt(context) }
+                ];
+
+                const completion = await this.client.chat.completions.create({
                     messages: messages,
                     model: this.model,
-                    temperature: temperature,
-                    max_tokens: maxTokens
+                    temperature: 0.7,
+                    max_tokens: 300
                 });
-                return chatCompletion.choices[0]?.message?.content || null;
+
+                return completion.choices[0]?.message?.content || null;
             } catch (error) {
                 log('ERROR', 'Erreur Groq:', error.message);
                 return null;
             }
         }
+
+        _buildPrompt(context) {
+            const { intent, data, userMessage } = context;
+            
+            let prompt = `L'utilisateur a dit : "${userMessage}"\n`;
+            prompt += `Intention détectée : ${intent}\n`;
+            
+            if (data) {
+                prompt += `Données : ${JSON.stringify(data, null, 2)}\n`;
+            }
+            
+            prompt += `Génère une réponse naturelle et chaleureuse.`;
+            
+            return prompt;
+        }
     }
 
-    // Gestionnaire de conversations
+    // ==================== GESTIONNAIRE DE CONVERSATIONS ====================
     class ConversationManager {
         constructor(pool) {
             this.pool = pool;
@@ -623,54 +1041,69 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
                 if (result.rows.length === 0) {
                     const newConv = await this.pool.query(
-                        `INSERT INTO conversations (phone, state, cart, context, history)
-                         VALUES ($1, $2, $3, $4, $5)
+                        `INSERT INTO conversations (phone, state, cart, context, history, pending_medicament)
+                         VALUES ($1, $2, $3, $4, $5, $6)
                          RETURNING *`,
-                        [phone, ConversationStates.IDLE, '[]', '{}', '[]']
+                        [phone, ConversationStates.IDLE, '[]', '{}', '[]', null]
                     );
-                    return newConv.rows[0];
+                    return this._parseConversation(newConv.rows[0]);
                 }
 
-                const conv = result.rows[0];
-                conv.cart = typeof conv.cart === 'string' ? JSON.parse(conv.cart) : conv.cart;
-                conv.context = typeof conv.context === 'string' ? JSON.parse(conv.context) : conv.context;
-                conv.history = typeof conv.history === 'string' ? JSON.parse(conv.history) : conv.history;
-
-                return conv;
+                return this._parseConversation(result.rows[0]);
             } catch (error) {
                 log('ERROR', 'Erreur récupération conversation:', error);
-                return { phone, state: ConversationStates.IDLE, cart: [], context: {}, history: [], attempts: 0 };
+                return { 
+                    phone, 
+                    state: ConversationStates.IDLE, 
+                    cart: [], 
+                    context: {}, 
+                    history: [], 
+                    pending_medicament: null 
+                };
             }
+        }
+
+        _parseConversation(row) {
+            return {
+                ...row,
+                cart: typeof row.cart === 'string' ? JSON.parse(row.cart) : row.cart,
+                context: typeof row.context === 'string' ? JSON.parse(row.context) : row.context,
+                history: typeof row.history === 'string' ? JSON.parse(row.history) : row.history
+            };
         }
 
         async updateState(phone, newState, data = {}) {
             try {
-                const fields = [];
+                const updates = [];
                 const values = [];
                 let i = 1;
 
                 if (newState) {
-                    fields.push(`state = $${i++}`);
+                    updates.push(`state = $${i++}`);
                     values.push(newState);
                 }
 
                 if (data.cart !== undefined) {
-                    fields.push(`cart = $${i++}`);
+                    updates.push(`cart = $${i++}`);
                     values.push(JSON.stringify(data.cart));
                 }
 
                 if (data.context) {
-                    fields.push(`context = $${i++}`);
+                    updates.push(`context = $${i++}`);
                     values.push(JSON.stringify(data.context));
                 }
 
-                fields.push(`updated_at = NOW()`);
+                if (data.pending_medicament !== undefined) {
+                    updates.push(`pending_medicament = $${i++}`);
+                    values.push(data.pending_medicament);
+                }
+
+                updates.push(`updated_at = NOW()`);
 
                 const query = `
                     UPDATE conversations
-                    SET ${fields.join(', ')}
+                    SET ${updates.join(', ')}
                     WHERE phone = $${i}
-                    RETURNING *
                 `;
 
                 await this.pool.query(query, [...values, phone]);
@@ -681,20 +1114,34 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             }
         }
 
-        async addToHistory(phone, role, message, type) {
+        async addToHistory(phone, role, message, intent) {
             try {
                 const conv = await this.getConversation(phone);
                 const history = conv.history || [];
-                history.push({ role, message, type, time: new Date().toISOString() });
-                if (history.length > 5) history.shift();
+                history.push({ role, message, intent, time: new Date().toISOString() });
+                if (history.length > 10) history.shift();
                 await this.updateState(phone, null, { history });
             } catch (error) {
                 log('ERROR', 'Erreur ajout historique:', error);
             }
         }
+
+        async clearContext(phone) {
+            try {
+                await this.updateState(phone, ConversationStates.IDLE, { 
+                    context: {}, 
+                    cart: [],
+                    pending_medicament: null 
+                });
+                return true;
+            } catch (error) {
+                log('ERROR', 'Erreur nettoyage contexte:', error);
+                return false;
+            }
+        }
     }
 
-    // Service Livreur
+    // ==================== SERVICE LIVREUR ====================
     class LivreurService {
         constructor(pool, whatsappService) {
             this.pool = pool;
@@ -863,7 +1310,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     }
 
-    // Service de commandes
+    // ==================== SERVICE DE COMMANDES ====================
     class OrderService {
         constructor(pool, whatsappService, livreurService) {
             this.pool = pool;
@@ -882,8 +1329,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
 
         calculateDeliveryPrice(subtotal) {
-            if (subtotal >= 5000) return 0;
-            return Utils.getCurrentDeliveryPrice().price;
+            return Utils.getCurrentDeliveryPrice().price; // Pas de gratuité
         }
 
         async createOrder(data, userPhone) {
@@ -943,6 +1389,17 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             return order;
         }
 
+        async getOrdersByPhone(phone) {
+            const result = await this.pool.query(
+                'SELECT * FROM orders WHERE client_phone = $1 ORDER BY created_at DESC',
+                [phone]
+            );
+            return result.rows.map(row => {
+                row.items = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+                return row;
+            });
+        }
+
         async updateOrder(orderId, data) {
             const updates = [];
             const values = [];
@@ -975,8 +1432,17 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
 
         async notifySupport(order) {
-            const items = order.items.map(i => `• ${i.nom_commercial} (${i.prix} FCFA) x${i.quantite || 1}`).join('\n');
-            const message = `📦 *NOUVELLE COMMANDE*\nID: ${order.id}\nCode: ${order.confirmation_code}\n👤 Client: ${order.client_name}\n📱 Tél: ${order.client_phone}\n📍 Quartier: ${order.client_quartier}\n📦 Articles:\n${items}\n💰 Total: ${order.total} FCFA`;
+            const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
+            const message = 
+                `📦 *NOUVELLE COMMANDE*\n\n` +
+                `ID: ${order.id}\n` +
+                `Code: ${order.confirmation_code}\n\n` +
+                `👤 Client: ${order.client_name}\n` +
+                `📱 Tél: ${order.client_phone}\n` +
+                `📍 Quartier: ${order.client_quartier}\n` +
+                `📝 Indications: ${order.client_indications || 'Aucune'}\n\n` +
+                `📦 Articles:\n${items}\n\n` +
+                `💰 Total: ${order.total} FCFA`;
 
             await this.whatsapp.sendMessage(SUPPORT_PHONE, message);
         }
@@ -986,12 +1452,21 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 const livreurs = await this.livreurService.getLivreursDisponibles();
                 
                 if (livreurs.length === 0) {
-                    log('WARN', 'Aucun livreur disponible pour la commande', order.id);
+                    log('WARN', 'Aucun livreur disponible');
                     return;
                 }
 
                 const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
-                const message = `📦 *NOUVELLE COMMANDE À LIVRER*\n\nID: ${order.id}\nCode: ${order.confirmation_code}\n👤 Client: ${order.client_name}\n📍 Quartier: ${order.client_quartier}\n📦 Articles:\n${items}\n💰 À encaisser: ${order.total} FCFA\n\n👉 Répondez: *ACCEPTER ${order.id}* pour prendre la commande`;
+                const message = 
+                    `📦 *NOUVELLE COMMANDE À LIVRER*\n\n` +
+                    `ID: ${order.id}\n` +
+                    `Code: ${order.confirmation_code}\n\n` +
+                    `👤 Client: ${order.client_name}\n` +
+                    `📍 Quartier: ${order.client_quartier}\n` +
+                    `📝 Indications: ${order.client_indications || 'Aucune'}\n\n` +
+                    `📦 Articles:\n${items}\n\n` +
+                    `💰 À encaisser: ${order.total} FCFA\n\n` +
+                    `👉 Répondez: *ACCEPTER ${order.id}* pour prendre la commande`;
 
                 for (const livreur of livreurs) {
                     await this.whatsapp.sendMessage(livreur.phone, message);
@@ -1026,10 +1501,14 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                         const order = await this.getOrderById(commandeId);
                         
                         await this.whatsapp.sendMessage(phone,
-                            `✅ Commande ${commandeId} assignée !\nUtilisez *RECUPERER ${commandeId}* quand vous récupérez la commande\nUtilisez *LIVRER ${commandeId}* après livraison avec le code client`);
+                            `✅ Commande ${commandeId} assignée !\n\n` +
+                            `Utilisez *RECUPERER ${commandeId}* quand vous récupérez la commande\n` +
+                            `Utilisez *LIVRER ${commandeId}* après livraison avec le code client`);
 
                         await this.whatsapp.sendMessage(order.client_phone,
-                            `✅ Votre commande ${commandeId} a été acceptée par un livreur !\n🚚 Livreur: ${livreur.nom || 'Livreur'}\nVous serez notifié quand il récupère la commande.`);
+                            `✅ Votre commande ${commandeId} a été acceptée par un livreur !\n` +
+                            `🚚 Livreur: ${livreur.nom || 'Livreur'}\n` +
+                            `Vous serez notifié quand il récupère la commande.`);
 
                         await this.whatsapp.sendMessage(SUPPORT_PHONE,
                             `📦 Commande ${commandeId}\n✅ Acceptée par livreur: ${phone}`);
@@ -1042,10 +1521,12 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                         const order = await this.getOrderById(commandeId);
                         
                         await this.whatsapp.sendMessage(phone,
-                            `🛵 Commande ${commandeId} récupérée !\nUtilisez *LIVRER ${commandeId}* une fois livrée`);
+                            `🛵 Commande ${commandeId} récupérée !\n` +
+                            `Utilisez *LIVRER ${commandeId}* une fois livrée`);
 
                         await this.whatsapp.sendMessage(order.client_phone,
-                            `🛵 Votre commande ${commandeId} est en cours de livraison !\nPréparez le code: *${order.confirmation_code}*`);
+                            `🛵 Votre commande ${commandeId} est en cours de livraison !\n` +
+                            `Préparez le code: *${order.confirmation_code}*`);
 
                         await this.whatsapp.sendMessage(SUPPORT_PHONE,
                             `📦 Commande ${commandeId}\n🛵 En cours de livraison`);
@@ -1079,10 +1560,13 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 const order = await this.getOrderById(commandeId);
                 
                 await this.whatsapp.sendMessage(phone,
-                    `✅ Livraison confirmée !\nCommande ${commandeId} marquée comme livrée.\nMerci pour votre service ! 🎉`);
+                    `✅ Livraison confirmée !\n` +
+                    `Commande ${commandeId} marquée comme livrée.\n` +
+                    `Merci pour votre service ! 🎉`);
 
                 await this.whatsapp.sendMessage(order.client_phone,
-                    `🎉 Votre commande ${commandeId} a été livrée avec succès !\nMerci de votre confiance. À bientôt sur Pillbox CI ! 🚀`);
+                    `🎉 Votre commande ${commandeId} a été livrée avec succès !\n` +
+                    `Merci de votre confiance. À bientôt sur Pillbox CI ! 🚀`);
 
                 await this.whatsapp.sendMessage(SUPPORT_PHONE,
                     `📦 Commande ${commandeId}\n✅ Livrée par livreur: ${phone}\n💰 Total: ${order.total} FCFA`);
@@ -1097,52 +1581,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     }
 
-    // Cache Manager
-    class CacheManager {
-        constructor(pharmacyScraper, pool) {
-            this.pharmacyScraper = pharmacyScraper;
-            this.pool = pool;
-        }
-
-        async refreshAll() {
-            log('INFO', 'Rafraîchissement des pharmacies...');
-            try {
-                const pharmacies = await this.pharmacyScraper.fetch();
-                if (pharmacies.length > 0) {
-                    await this.savePharmaciesToDB(pharmacies);
-                    log('SUCCESS', `${pharmacies.length} pharmacies mises à jour`);
-                }
-            } catch (error) {
-                log('ERROR', 'Erreur rafraîchissement:', error);
-            }
-        }
-
-        async savePharmaciesToDB(pharmacies) {
-            const client = await this.pool.connect();
-            try {
-                await client.query('BEGIN');
-                for (const pharma of pharmacies) {
-                    await client.query(`
-                        INSERT INTO pharmacies_cache (nom, localite, adresse, telephone_principal, last_updated)
-                        VALUES ($1, $2, $3, $4, NOW())
-                        ON CONFLICT (nom) DO UPDATE SET
-                            localite = EXCLUDED.localite,
-                            adresse = EXCLUDED.adresse,
-                            telephone_principal = EXCLUDED.telephone_principal,
-                            last_updated = NOW()
-                    `, [pharma.nom, pharma.localite, pharma.adresse, pharma.telephone]);
-                }
-                await client.query('COMMIT');
-            } catch (error) {
-                await client.query('ROLLBACK');
-                log('ERROR', 'Erreur sauvegarde:', error);
-            } finally {
-                client.release();
-            }
-        }
-    }
-
-    // Timeout Manager
+    // ==================== TIMEOUT MANAGER ====================
     class TimeoutManager {
         constructor(convManager, whatsappService) {
             this.convManager = convManager;
@@ -1173,48 +1612,87 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     }
 
-    // Moteur de conversation principal
+    // ==================== MOTEUR DE CONVERSATION PRINCIPAL ====================
     class ConversationEngine {
-        constructor(nlp, groq, searchService, clinicService, orderService, convManager, whatsapp, livreurService) {
+        constructor(nlp, groq, searchEngine, clinicService, orderService, convManager, whatsapp, livreurService, pharmacyScraper) {
             this.nlp = nlp;
             this.groq = groq;
-            this.searchService = searchService;
+            this.searchEngine = searchEngine;
             this.clinicService = clinicService;
             this.orderService = orderService;
             this.convManager = convManager;
             this.whatsapp = whatsapp;
             this.livreurService = livreurService;
+            this.pharmacyScraper = pharmacyScraper;
             this.states = ConversationStates;
         }
 
         async process(phone, message) {
             try {
+                // Vérifier si c'est un message vocal (géré en amont)
+                
                 const conv = await this.convManager.getConversation(phone);
                 
                 // Vérifier si c'est une réponse de livreur en attente de code
                 if (conv.state === this.states.WAITING_LIVREUR_CODE) {
                     if (message.match(/^\d{6}$/)) {
                         const result = await this.orderService.confirmLivreurDelivery(phone, message, this.convManager);
-                        if (result) {
-                            return result;
-                        }
+                        if (result) return result;
                     } else {
-                        await this.whatsapp.sendMessage(phone, 
-                            "Code invalide. Veuillez entrer un code à 6 chiffres.");
-                        return null;
+                        return "Code invalide. Veuillez entrer un code à 6 chiffres.";
                     }
                 }
 
+                // Analyse NLP
                 const analysis = await this.nlp.parse(message, phone);
                 await this.convManager.addToHistory(phone, 'user', message, analysis.intent);
                 
-                const response = await this.routeIntent(analysis, conv, message);
-                
-                if (response) {
-                    await this.convManager.addToHistory(phone, 'assistant', response, 'response');
+                // Gestion des états d'attente
+                if (conv.state === this.states.WAITING_MEDICINE) {
+                    return await this.handleWaitingMedicine(phone, message, conv, analysis);
                 }
-                
-                return response;
+                if (conv.state === this.states.WAITING_QUANTITY) {
+                    return await this.handleWaitingQuantity(phone, message, conv, analysis);
+                }
+                if (conv.state === this.states.WAITING_NAME) {
+                    return await this.handleWaitingName(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_QUARTIER) {
+                    return await this.handleWaitingQuartier(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_PHONE) {
+                    return await this.handleWaitingPhone(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_INDICATIONS) {
+                    return await this.handleWaitingIndications(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_CONFIRMATION) {
+                    return await this.handleWaitingConfirmation(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_VILLE) {
+                    return await this.handleWaitingVille(phone, message, conv, analysis);
+                }
+                if (conv.state === this.states.WAITING_CLINIC_SELECTION) {
+                    return await this.handleWaitingClinicSelection(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_SPECIALITE_SELECTION) {
+                    return await this.handleWaitingSpecialiteSelection(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_PATIENT_INFO) {
+                    return await this.handleWaitingPatientInfo(phone, message, conv, analysis);
+                }
+                if (conv.state === this.states.WAITING_DATE) {
+                    return await this.handleWaitingDate(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_HEURE) {
+                    return await this.handleWaitingHeure(phone, message, conv);
+                }
+                if (conv.state === this.states.WAITING_RDV_CONFIRMATION) {
+                    return await this.handleWaitingRdvConfirmation(phone, message, conv);
+                }
+
+                // Intentions principales
+                return await this.routeIntent(analysis, conv, message);
 
             } catch (error) {
                 log('ERROR', 'Erreur moteur conversation:', error);
@@ -1223,193 +1701,242 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
 
         async routeIntent(analysis, conv, originalMessage) {
-            // États en attente
-            if (conv.state === this.states.WAITING_MEDICINE) {
-                return await this.handleWaitingMedicine(conv.phone, originalMessage, conv);
+            const intent = analysis.intent;
+            const entities = analysis.entities;
+            
+            // Salutations et aide
+            if (intent === 'saluer') {
+                return await this.handleIntentSaluer(conv);
             }
-            if (conv.state === this.states.WAITING_QUARTIER) {
-                return await this.handleWaitingQuartier(conv.phone, originalMessage, conv);
+            if (intent === 'aide') {
+                return await this.handleIntentAide(conv);
             }
-            if (conv.state === this.states.WAITING_CLINIC) {
-                return await this.handleWaitingClinic(conv.phone, originalMessage, conv);
+            if (intent === 'remercier') {
+                return await this.handleIntentRemercier(conv);
             }
-            if (conv.state === this.states.WAITING_SPECIALITE) {
-                return await this.handleWaitingSpecialite(conv.phone, originalMessage, conv);
+            if (intent === 'au_revoir') {
+                return await this.handleIntentAuRevoir(conv);
             }
-            if (conv.state === this.states.WAITING_DATE) {
-                return await this.handleWaitingDate(conv.phone, originalMessage, conv);
+            
+            // Recherche médicaments
+            if (intent === 'rechercher_medicament') {
+                return await this.handleIntentRechercherMedicament(analysis, conv);
             }
-            if (conv.state === this.states.WAITING_HEURE) {
-                return await this.handleWaitingHeure(conv.phone, originalMessage, conv);
+            if (intent === 'prix_medicament') {
+                return await this.handleIntentPrixMedicament(analysis, conv);
             }
-            if (conv.state === this.states.WAITING_RDV_CONFIRMATION) {
-                return await this.handleWaitingRdvConfirmation(conv.phone, originalMessage, conv);
+            if (intent === 'commander') {
+                return await this.handleIntentCommander(conv);
             }
-            if (conv.state === this.states.WAITING_COMMANDE_ID) {
-                return await this.handleWaitingCommandeId(conv.phone, originalMessage, conv);
+            if (intent === 'panier') {
+                return await this.handleIntentPanier(conv);
             }
-            if (conv.state === this.states.WAITING_RDV_ID) {
-                return await this.handleWaitingRdvId(conv.phone, originalMessage, conv);
+            if (intent === 'quantite') {
+                return await this.handleIntentQuantite(analysis, conv);
             }
-            if (conv.state === this.states.WAITING_MODIFICATION) {
-                return await this.handleWaitingModification(conv.phone, originalMessage, conv);
+            if (intent === 'choix_numero') {
+                return await this.handleIntentChoixNumero(analysis, conv);
             }
-            if (conv.state === this.states.WAITING_VILLE) {
-                conv.context.ville = originalMessage.trim();
-                await this.convManager.updateState(conv.phone, null, { context: conv.context });
+            
+            // Pharmacies
+            if (intent === 'pharmacie_garde') {
+                return await this.handleIntentPharmacieGarde(analysis, conv);
+            }
+            
+            // Rendez-vous
+            if (intent === 'prendre_rdv') {
                 return await this.handleIntentPrendreRdv(conv);
             }
-
-            // Intentions principales
-            switch(analysis.intent) {
-                case 'saluer':
-                    return await this.handleIntentSaluer(conv);
-                case 'rechercher_medicament':
-                    return await this.handleIntentRechercherMedicament(analysis, conv, originalMessage);
-                case 'prix_medicament':
-                    return await this.handleIntentPrixMedicament(analysis, conv, originalMessage);
-                case 'pharmacie_garde':
-                    return await this.handleIntentPharmacieGarde(analysis, conv);
-                case 'commander':
-                    return await this.handleIntentCommander(analysis, conv);
-                case 'panier':
-                    return await this.handleIntentPanier(conv);
-                case 'choix_numero':
-                    return await this.handleIntentChoixNumero(conv, originalMessage);
-                case 'prendre_rdv':
-                    return await this.handleIntentPrendreRdv(conv);
-                case 'annuler_rdv':
-                    return await this.handleIntentAnnulerRdv(analysis, conv);
-                case 'clinique_proche':
-                    return await this.handleIntentCliniqueProche(analysis, conv);
-                case 'specialite_clinique':
-                    return await this.handleIntentSpecialiteClinique(analysis, conv);
-                case 'infos_livraison':
-                    return await this.handleIntentInfosLivraison(analysis, conv);
-                case 'aide':
-                    return await this.handleIntentAide(conv);
-                default:
-                    return await this.handleIntentFallback(originalMessage, conv);
+            if (intent === 'annuler_rdv') {
+                return await this.handleIntentAnnulerRdv(analysis, conv);
             }
+            if (intent === 'disponibilite_medecin') {
+                return await this.handleIntentDisponibiliteMedecin(analysis, conv);
+            }
+            if (intent === 'clinique_proche') {
+                return await this.handleIntentCliniqueProche(analysis, conv);
+            }
+            if (intent === 'specialite_clinique') {
+                return await this.handleIntentSpecialiteClinique(analysis, conv);
+            }
+            if (intent === 'service_clinique') {
+                return await this.handleIntentServiceClinique(analysis, conv);
+            }
+            if (intent === 'tarif_clinique') {
+                return await this.handleIntentTarifClinique(analysis, conv);
+            }
+            
+            // Commandes et livraison
+            if (intent === 'infos_livraison') {
+                return await this.handleIntentInfosLivraison(conv);
+            }
+            if (intent === 'suivre_commande') {
+                return await this.handleIntentSuivreCommande(analysis, conv);
+            }
+            if (intent === 'annuler_commande') {
+                return await this.handleIntentAnnulerCommande(analysis, conv);
+            }
+            
+            // Autres
+            if (intent === 'urgence') {
+                return await this.handleIntentUrgence(conv);
+            }
+            if (intent === 'question_bot') {
+                return await this.handleIntentQuestionBot(analysis, conv);
+            }
+            if (intent === 'autre_ville') {
+                return await this.handleIntentAutreVille(analysis, conv);
+            }
+            if (intent === 'confirmer') {
+                return await this.handleIntentConfirmer(conv);
+            }
+            if (intent === 'refuser') {
+                return await this.handleIntentRefuser(conv);
+            }
+
+            // Fallback
+            return await this.handleIntentFallback(analysis, conv, originalMessage);
         }
 
         async handleIntentSaluer(conv) {
             await this.convManager.updateState(conv.phone, this.states.GREETED);
             const delivery = Utils.getCurrentDeliveryPrice();
             
-            await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `Bonjour ! 👋 Je suis MIA, votre assistante santé.\n💰 Livraison: ${delivery.price} FCFA`,
+            const message = 
+                `👋 Bonjour ! Je suis MIA, votre assistante santé.\n\n` +
+                `💰 Livraison : ${delivery.price} FCFA\n\n` +
+                `Comment puis-je vous aider aujourd'hui ?`;
+            
+            await this.whatsapp.sendInteractiveButtons(conv.phone, message,
+                ["💊 Chercher", "🏥 Pharmacie", "🏥 Cliniques", "🚚 Infos"]
+            );
+            return null;
+        }
+
+        async handleIntentAide(conv) {
+            const message = 
+                `📚 *Aide - Commandes disponibles*\n\n` +
+                `💊 *Chercher* - Rechercher un médicament\n` +
+                `💰 *Prix* - Connaître le prix d'un médicament\n` +
+                `🏥 *Pharmacie* - Trouver une pharmacie de garde\n` +
+                `🛒 *Commander* - Passer une commande\n` +
+                `📅 *RDV* - Prendre rendez-vous en clinique\n` +
+                `🚚 *Infos* - En savoir sur la livraison\n` +
+                `📦 *Suivre* - Suivre ma commande\n\n` +
+                `👉 Vous pouvez aussi écrire votre demande naturellement !`;
+            
+            await this.whatsapp.sendInteractiveButtons(conv.phone, message,
                 ["💊 Chercher", "🏥 Pharmacie", "📅 RDV", "🚚 Infos"]
             );
             return null;
         }
 
-        async handleIntentRechercherMedicament(analysis, conv, originalMessage) {
-            const medicineName = analysis.entities.medicament || originalMessage;
+        async handleIntentRemercier(conv) {
+            const context = {
+                intent: 'remercier',
+                userMessage: "merci"
+            };
+            const groqResponse = await this.groq.generateResponse(context);
+            return groqResponse || "Avec plaisir ! 😊 N'hésitez pas si vous avez d'autres questions.";
+        }
 
-            if (!medicineName || medicineName.length < 2) {
+        async handleIntentAuRevoir(conv) {
+            await this.convManager.clearContext(conv.phone);
+            return "Au revoir ! 👋 Passez une excellente journée. À bientôt sur Pillbox CI !";
+        }
+
+        async handleIntentRechercherMedicament(analysis, conv) {
+            const medicineName = analysis.entities.medicament;
+
+            if (!medicineName) {
                 await this.convManager.updateState(conv.phone, this.states.WAITING_MEDICINE);
                 return "Quel médicament cherchez-vous ? (ex: doliprane, amoxicilline) 💊";
             }
 
-            const results = await this.searchService.search(medicineName);
+            const results = await this.searchEngine.search(medicineName);
 
             if (results.results.length === 0) {
-                return `Désolé, je n'ai pas trouvé "${medicineName}". Vérifiez l'orthographe ou essayez autre chose. 😕`;
+                const context = {
+                    intent: 'rechercher_medicament',
+                    data: { terme: medicineName, aucun: true },
+                    userMessage: `chercher ${medicineName}`
+                };
+                const groqResponse = await this.groq.generateResponse(context);
+                return groqResponse || `Désolé, je n'ai pas trouvé "${medicineName}". Vérifiez l'orthographe ou essayez autre chose. 😕`;
             }
 
+            // Sauvegarder les résultats pour la suite
             await this.convManager.updateState(conv.phone, this.states.SEARCHING, {
-                context: { last_search: { term: medicineName, results: results.results.slice(0, 5) } }
+                context: { 
+                    last_search: { 
+                        term: medicineName, 
+                        results: results.results.slice(0, 10)
+                    } 
+                }
             });
 
             const resultsList = results.results.slice(0, 5).map((r, i) => 
-                `${i+1}. *${r.doc.nom_commercial}* : ${r.doc.prix} FCFA`
+                `${i+1}. ${r.item.nom_commercial} - ${r.item.prix} FCFA`
             ).join('\n');
 
-            await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `Voici ce que j'ai trouvé pour "${medicineName}" :\n\n${resultsList}`,
-                ["1", "2", "3", "4", "5", "🔍 Autre"]
-            );
+            let message = `🔍 *Résultats pour "${medicineName}"*\n\n${resultsList}`;
+            if (results.total > 5) {
+                message += `\n\nEt ${results.total - 5} autre(s) résultat(s).`;
+            }
+
+            const buttons = ['1', '2', '3', '4', '5'];
+            if (results.total > 5) buttons.push('🔍 Suite');
+            buttons.push('🔍 Autre');
+
+            await this.whatsapp.sendInteractiveButtons(conv.phone, message, buttons);
             return null;
         }
 
-        async handleIntentPrixMedicament(analysis, conv, originalMessage) {
-            const medicineName = analysis.entities.medicament || originalMessage;
+        async handleIntentPrixMedicament(analysis, conv) {
+            const medicineName = analysis.entities.medicament;
 
-            if (!medicineName || medicineName.length < 2) {
+            if (!medicineName) {
                 return "De quel médicament voulez-vous connaître le prix ? 💰";
             }
 
-            const results = await this.searchService.search(medicineName);
+            const results = await this.searchEngine.search(medicineName, 10);
 
             if (results.results.length === 0) {
                 return `Désolé, je n'ai pas trouvé de prix pour "${medicineName}". 😕`;
             }
 
-            const pricesList = results.results.slice(0, 5).map(r => 
-                `• ${r.doc.nom_commercial}: ${r.doc.prix} FCFA`
+            const pricesList = results.results.slice(0, 7).map(r => 
+                `• ${r.item.nom_commercial} : ${r.item.prix} FCFA`
             ).join('\n');
 
-            await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `💰 *Prix trouvés*\n\n${pricesList}\n\nVoulez-vous commander ?`,
-                ["✅ Commander", "🔍 Voir plus", "❌ Annuler"]
-            );
-            return null;
-        }
+            const context = {
+                intent: 'prix_medicament',
+                data: { medicament: medicineName, prix: results.results[0].item.prix },
+                userMessage: `prix ${medicineName}`
+            };
+            const groqResponse = await this.groq.generateResponse(context);
 
-        async handleIntentPharmacieGarde(analysis, conv) {
-            const quartier = analysis.entities.localisation || analysis.entities.quartier || analysis.entities.ville;
-
-            if (!quartier) {
-                await this.convManager.updateState(conv.phone, this.states.WAITING_QUARTIER);
-                return "Dans quel quartier cherchez-vous une pharmacie de garde ? 🏥";
+            if (groqResponse) {
+                return groqResponse + `\n\n${pricesList}`;
             }
 
-            const pharmacies = await this.pharmacyScraper.searchByLocation(quartier);
-
-            if (pharmacies.length === 0) {
-                return `Désolé, aucune pharmacie de garde trouvée à ${quartier}. 😕`;
-            }
-
-            const pharmaciesList = pharmacies.slice(0, 3).map(p =>
-                `🏥 *${p.nom}*\n📍 ${p.adresse}\n📞 ${p.telephone}`
-            ).join('\n\n');
-
-            return `Pharmacies de garde à ${quartier} :\n\n${pharmaciesList}`;
+            return `💰 *Prix trouvés*\n\n${pricesList}`;
         }
 
-        async handleIntentCommander(analysis, conv) {
+        async handleIntentCommander(conv) {
             if (!conv.cart || conv.cart.length === 0) {
                 return "Votre panier est vide. Cherchez d'abord un médicament à ajouter. 💊";
             }
 
-            if (!conv.context?.client_nom) {
-                await this.convManager.updateState(conv.phone, this.states.WAITING_NAME, {
-                    context: { ...conv.context, ordering: true }
-                });
+            await this.convManager.updateState(conv.phone, this.states.WAITING_NAME, {
+                context: { ordering: true }
+            });
 
-                const subtotal = conv.cart.reduce((sum, i) => sum + (i.prix * (i.quantite || 1)), 0);
-                const delivery = Utils.getCurrentDeliveryPrice();
-                const deliveryPrice = subtotal >= 5000 ? 0 : delivery.price;
-
-                const recap = `🛒 *Récapitulatif*\n${conv.cart.map((i, idx) => 
-                    `${idx+1}. ${i.nom_commercial} x${i.quantite || 1}: ${i.prix * (i.quantite || 1)} FCFA`
-                ).join('\n')}\n💰 Total: ${subtotal + deliveryPrice} FCFA`;
-
-                await this.whatsapp.sendInteractiveButtons(conv.phone,
-                    `${recap}\n\nQuel est votre nom pour finaliser ? 👤`,
-                    ["✏️ Modifier", "✅ Confirmer", "❌ Annuler"]
-                );
-                return null;
-            }
-
-            const subtotal = conv.cart.reduce((sum, i) => sum + (i.prix * (i.quantite || 1)), 0);
-            const delivery = Utils.getCurrentDeliveryPrice();
-            const deliveryPrice = subtotal >= 5000 ? 0 : delivery.price;
-
+            const { formatted } = Utils.formatCart(conv.cart);
+            
             await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `Confirmation pour ${conv.context.client_nom} :\n${conv.cart.length} article(s)\nTotal: ${subtotal + deliveryPrice} FCFA`,
-                ["✅ Confirmer", "✏️ Modifier", "❌ Annuler"]
+                `${formatted}\n\nQuel est votre nom ? 👤`,
+                ["✏️ Modifier", "✅ Confirmer", "❌ Annuler"]
             );
             return null;
         }
@@ -1419,77 +1946,145 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 return "Votre panier est vide. 🛒";
             }
 
-            const subtotal = conv.cart.reduce((sum, i) => sum + (i.prix * (i.quantite || 1)), 0);
-            const delivery = Utils.getCurrentDeliveryPrice();
-            const deliveryPrice = subtotal >= 5000 ? 0 : delivery.price;
-
-            const cartList = conv.cart.map((i, idx) =>
-                `${idx+1}. ${i.nom_commercial} x${i.quantite || 1} = ${i.prix * (i.quantite || 1)} FCFA`
-            ).join('\n');
+            const { formatted } = Utils.formatCart(conv.cart);
 
             await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `🛒 *Votre panier*\n\n${cartList}\n\n💰 Sous-total: ${subtotal} FCFA\n🚚 Livraison: ${deliveryPrice} FCFA\n💵 Total: ${subtotal + deliveryPrice} FCFA`,
+                `🛒 *Votre panier*\n\n${formatted}`,
                 ["✅ Commander", "✏️ Modifier", "🗑️ Vider"]
             );
             return null;
         }
 
-        async handleIntentChoixNumero(conv, message) {
-            const number = Utils.extractNumber(message);
-            const lastSearch = conv.context?.last_search;
-
-            if (!lastSearch || !lastSearch.results || !number) {
-                return "Je n'ai pas compris. Veuillez réessayer. 🤔";
+        async handleIntentQuantite(analysis, conv) {
+            const quantite = analysis.entities.quantite || 1;
+            
+            if (!conv.pending_medicament) {
+                return "Veuillez d'abord choisir un médicament. 💊";
             }
 
-            if (number < 1 || number > lastSearch.results.length) {
-                return `Choisissez un numéro entre 1 et ${lastSearch.results.length}.`;
-            }
-
-            const selected = lastSearch.results[number - 1];
+            const medicament = conv.pending_medicament;
             const cart = conv.cart || [];
 
-            const existing = cart.find(item => item.nom_commercial === selected.doc.nom_commercial);
+            const existing = cart.find(item => item.code_produit === medicament.code_produit);
             if (existing) {
-                existing.quantite = (existing.quantite || 1) + 1;
+                existing.quantite = (existing.quantite || 1) + quantite;
             } else {
-                cart.push({ ...selected.doc, quantite: 1 });
+                cart.push({ ...medicament, quantite });
             }
 
-            await this.convManager.updateState(conv.phone, null, { cart });
+            await this.convManager.updateState(conv.phone, null, { 
+                cart, 
+                pending_medicament: null 
+            });
+
+            const { formatted } = Utils.formatCart(cart);
+
+            const context = {
+                intent: 'ajout_panier',
+                data: { 
+                    medicament: medicament.nom_commercial,
+                    quantite,
+                    prix: medicament.prix * quantite,
+                    total: cart.length
+                },
+                userMessage: `${quantite} ${medicament.nom_commercial}`
+            };
+            const groqResponse = await this.groq.generateResponse(context);
+
+            if (groqResponse) {
+                await this.whatsapp.sendMessage(conv.phone, groqResponse);
+                await this.whatsapp.sendInteractiveButtons(conv.phone,
+                    `🛒 *Panier actuel :*\n${formatted}`,
+                    ["🛒 Voir panier", "🔍 Continuer", "✅ Commander"]
+                );
+                return null;
+            }
 
             await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `${selected.doc.nom_commercial} ajouté au panier ! ✅`,
+                `${quantite} x ${medicament.nom_commercial} ajouté au panier ! ✅\n\n🛒 *Panier :*\n${formatted}`,
                 ["🛒 Voir panier", "🔍 Continuer", "✅ Commander"]
             );
             return null;
         }
 
-        async handleIntentPrendreRdv(conv) {
-            try {
-                const clinics = await this.clinicService.getAllClinics();
+        async handleIntentChoixNumero(analysis, conv) {
+            const numero = analysis.entities.numero || analysis.entities.number;
 
-                if (clinics.length === 0) {
-                    return "Désolé, aucune clinique disponible pour le moment. 🏥";
-                }
-
-                await this.convManager.updateState(conv.phone, this.states.WAITING_CLINIC, {
-                    context: { appointment_step: 'clinics_listed' }
-                });
-
-                const clinicsList = clinics.slice(0, 5).map((c, i) =>
-                    `${i+1}. *${c.nom_clinique}*\n   📍 ${c.quartier}, ${c.ville}\n   📞 ${c.telephone}`
-                ).join('\n\n');
-
-                await this.whatsapp.sendInteractiveButtons(conv.phone,
-                    `🏥 *Cliniques disponibles*\n\n${clinicsList}`,
-                    ["1", "2", "3", "4", "5", "❌ Annuler"]
-                );
-                return null;
-            } catch (error) {
-                log('ERROR', 'Erreur prise RDV:', error);
-                return "Erreur lors de la récupération des cliniques. Réessayez plus tard. 😔";
+            if (!numero) {
+                return "Je n'ai pas compris. Veuillez choisir un numéro. 🤔";
             }
+
+            if (conv.state === this.states.SEARCHING && conv.context?.last_search?.results) {
+                return await this.handleMedicineSelection(conv, numero);
+            }
+
+            return "Je n'ai pas compris. Veuillez réessayer. 🤔";
+        }
+
+        async handleMedicineSelection(conv, numero) {
+            const lastSearch = conv.context?.last_search;
+            
+            if (!lastSearch || !lastSearch.results || numero < 1 || numero > lastSearch.results.length) {
+                return "Choix invalide. Veuillez réessayer.";
+            }
+
+            const selected = lastSearch.results[numero - 1].item;
+            
+            await this.convManager.updateState(conv.phone, this.states.WAITING_QUANTITY, {
+                pending_medicament: selected
+            });
+
+            return `*${selected.nom_commercial}* sélectionné\n\nQuelle quantité souhaitez-vous ? (1, 2, 3...)`;
+        }
+
+        async handleIntentPharmacieGarde(analysis, conv) {
+            const quartier = analysis.entities.localite || analysis.entities.quartier || analysis.entities.ville;
+
+            if (!quartier) {
+                await this.convManager.updateState(conv.phone, this.states.WAITING_QUARTIER, {
+                    context: { recherche_pharmacie: true }
+                });
+                return "Dans quelle ville ou quartier cherchez-vous une pharmacie de garde ? 🏥";
+            }
+
+            // Si c'est Abidjan, on demande la commune
+            if (quartier.toLowerCase() === 'abidjan') {
+                await this.convManager.updateState(conv.phone, this.states.WAITING_QUARTIER, {
+                    context: { recherche_pharmacie: true, ville: 'abidjan' }
+                });
+                return "Pour Abidjan, précisez la commune (Cocody, Marcory, Yopougon, etc.) 📍";
+            }
+
+            const pharmacies = await this.pharmacyScraper.searchByLocation(quartier);
+
+            if (pharmacies.length === 0) {
+                return `Désolé, aucune pharmacie de garde trouvée à ${quartier}. 😕`;
+            }
+
+            const pharmaciesList = pharmacies.slice(0, 5).map(p =>
+                `${p.nom}\n📍 ${p.adresse}\n📞 ${p.telephone}`
+            ).join('\n\n');
+
+            const context = {
+                intent: 'pharmacie_garde',
+                data: { quartier, nombre: pharmacies.length },
+                userMessage: `pharmacie garde ${quartier}`
+            };
+            const groqResponse = await this.groq.generateResponse(context);
+
+            if (groqResponse) {
+                return groqResponse + `\n\n${pharmaciesList}`;
+            }
+
+            return `Pharmacies de garde à ${quartier} :\n\n${pharmaciesList}`;
+        }
+
+        async handleIntentPrendreRdv(conv) {
+            await this.convManager.updateState(conv.phone, this.states.WAITING_VILLE, {
+                context: { prise_rdv: true }
+            });
+
+            return "Dans quelle ville souhaitez-vous prendre rendez-vous ? (ex: Abidjan, Bouaké) 🏥";
         }
 
         async handleIntentAnnulerRdv(analysis, conv) {
@@ -1505,8 +2100,23 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 return `Aucun rendez-vous trouvé avec l'ID ${rdvId}.`;
             }
 
+            if (appointment.patient_telephone !== conv.phone) {
+                return "Vous n'êtes pas autorisé à annuler ce rendez-vous. 🔒";
+            }
+
             await this.clinicService.cancelAppointment(rdvId);
+            await this.whatsapp.sendMessage(SUPPORT_PHONE, 
+                `📅 RDV ${rdvId} annulé par ${conv.phone}`);
+
             return `Rendez-vous ${rdvId} annulé avec succès. ✅`;
+        }
+
+        async handleIntentDisponibiliteMedecin(analysis, conv) {
+            return "Pour connaître les disponibilités, veuillez d'abord prendre un rendez-vous. Je vous guiderai. 📅";
+        }
+
+        async handleIntentCliniqueProche(analysis, conv) {
+            return "Pour trouver une clinique proche, veuillez d'abord prendre un rendez-vous. Je vous guiderai. 🏥";
         }
 
         async handleIntentSpecialiteClinique(analysis, conv) {
@@ -1519,101 +2129,497 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             }
         }
 
-        async handleIntentCliniqueProche(analysis, conv) {
-            return "Pour trouver une clinique proche, précisez votre quartier ou ville. 🏥";
+        async handleIntentServiceClinique(analysis, conv) {
+            return "Pour connaître les services disponibles, veuillez nous contacter ou consulter notre site web. 🌐";
         }
 
-        async handleIntentInfosLivraison(analysis, conv) {
+        async handleIntentTarifClinique(analysis, conv) {
+            return "Les tarifs varient selon les cliniques. Contactez-nous pour plus d'informations. 💰";
+        }
+
+        async handleIntentInfosLivraison(conv) {
             const delivery = Utils.getCurrentDeliveryPrice();
-            return `🚚 *Livraison*\n\n💰 Tarif actuel: ${delivery.price} FCFA (${delivery.period === 'NIGHT' ? '🌙 nuit 0h-7h' : '☀️ jour 8h-23h'})\n✅ Gratuit à partir de 5000 FCFA\n📍 Zones: Abidjan et grandes villes\n⏱️ Délais: 30-45 min Abidjan\n💵 Paiement: espèces, OM, Wave à la livraison`;
+            
+            const context = {
+                intent: 'infos_livraison',
+                data: { 
+                    tarif_jour: DELIVERY_PRICES.DAY.price,
+                    tarif_nuit: DELIVERY_PRICES.NIGHT.price,
+                    periode: delivery.period
+                },
+                userMessage: "infos livraison"
+            };
+            const groqResponse = await this.groq.generateResponse(context);
+
+            if (groqResponse) {
+                return groqResponse;
+            }
+
+            return `🚚 *Livraison*\n\n` +
+                   `💰 Tarif ${delivery.period === 'NIGHT' ? '🌙 nuit' : '☀️ jour'} : ${delivery.price} FCFA\n` +
+                   `📍 Zones : Abidjan et grandes villes\n` +
+                   `⏱️ Délais : 30-45 min Abidjan\n` +
+                   `💵 Paiement : espèces, OM, Wave à la livraison`;
         }
 
-        async handleIntentAide(conv) {
-            await this.whatsapp.sendInteractiveButtons(conv.phone,
-                `📚 *Aide - Commandes disponibles*\n\n` +
-                `💊 Chercher médicament\n💰 Prix médicament\n🏥 Pharmacie garde\n🛒 Commander\n📅 Prendre rendez-vous\n🚚 Infos livraison`,
-                ["💊 Chercher", "🏥 Pharmacie", "📅 RDV", "🚚 Infos"]
+        async handleIntentSuivreCommande(analysis, conv) {
+            const commandeId = analysis.entities.commande_id || Utils.extractCommandId(analysis.originalMessage);
+
+            if (!commandeId) {
+                const orders = await this.orderService.getOrdersByPhone(conv.phone);
+                if (orders.length === 0) {
+                    return "Vous n'avez pas de commande en cours. 📦";
+                }
+
+                const ordersList = orders.slice(0, 3).map(o =>
+                    `• ${o.id} - ${o.items.length} article(s) - ${o.status_livreur}`
+                ).join('\n');
+
+                await this.convManager.updateState(conv.phone, this.states.WAITING_COMMANDE_ID);
+                return `Vos commandes récentes :\n${ordersList}\n\nQuel est le numéro de la commande à suivre ?`;
+            }
+
+            const order = await this.orderService.getOrderById(commandeId);
+
+            if (!order || order.client_phone !== conv.phone) {
+                return `Commande ${commandeId} non trouvée.`;
+            }
+
+            const statusMessages = {
+                'PENDING': '📝 en attente',
+                'ASSIGNED': '👨‍🛵 acceptée',
+                'PICKED_UP': '🛵 en route',
+                'DELIVERED': '✅ livrée',
+                'CANCELLED': '❌ annulée'
+            };
+
+            const status = statusMessages[order.status_livreur] || order.status;
+            const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
+
+            return `📦 *Commande ${commandeId}*\n\n` +
+                   `📊 Statut : ${status}\n` +
+                   `📦 Articles :\n${items}\n` +
+                   `💰 Total : ${order.total} FCFA\n` +
+                   `📍 Livraison : ${order.client_quartier}`;
+        }
+
+        async handleIntentAnnulerCommande(analysis, conv) {
+            const commandeId = analysis.entities.commande_id || Utils.extractCommandId(analysis.originalMessage);
+
+            if (!commandeId) {
+                const orders = await this.orderService.getOrdersByPhone(conv.phone);
+                const pendingOrders = orders.filter(o => o.status === 'PENDING');
+                
+                if (pendingOrders.length === 0) {
+                    return "Vous n'avez aucune commande en cours à annuler. 📦";
+                }
+
+                const ordersList = pendingOrders.slice(0, 3).map(o =>
+                    `• ${o.id} - ${o.total} FCFA`
+                ).join('\n');
+
+                await this.convManager.updateState(conv.phone, this.states.WAITING_COMMANDE_ID, {
+                    context: { annulation_en_cours: true }
+                });
+
+                return `Vos commandes en cours :\n${ordersList}\n\nQuel numéro souhaitez-vous annuler ?`;
+            }
+
+            const order = await this.orderService.getOrderById(commandeId);
+
+            if (!order || order.client_phone !== conv.phone) {
+                return `Commande ${commandeId} non trouvée.`;
+            }
+
+            if (order.status !== 'PENDING') {
+                return "Cette commande ne peut plus être annulée. ❌";
+            }
+
+            await this.orderService.cancelOrder(commandeId);
+            await this.whatsapp.sendMessage(SUPPORT_PHONE, 
+                `📦 Commande ${commandeId} annulée par le client.`);
+
+            return `Commande ${commandeId} annulée avec succès. ✅`;
+        }
+
+        async handleIntentUrgence(conv) {
+            await this.whatsapp.sendMessage(conv.phone,
+                `🚨 *URGENCE MÉDICALE*\n\n` +
+                `📞 Appelez immédiatement le *185* (SAMU)\n` +
+                `🏥 Rendez-vous aux urgences\n` +
+                `📱 Contactez le support: ${SUPPORT_PHONE}\n\n` +
+                `Pour une pharmacie de garde, tapez *pharmacie de garde* suivi de votre quartier.`
             );
             return null;
         }
 
-        async handleIntentFallback(message, conv) {
+        async handleIntentQuestionBot(analysis, conv) {
+            const context = {
+                intent: 'question_bot',
+                data: { question: analysis.originalMessage },
+                userMessage: analysis.originalMessage
+            };
+            const groqResponse = await this.groq.generateResponse(context);
+            return groqResponse || "Je suis MIA, votre assistante santé Pillbox CI. Comment puis-je vous aider ? 😊";
+        }
+
+        async handleIntentAutreVille(analysis, conv) {
+            const ville = analysis.entities.localite || analysis.entities.ville;
+            if (ville) {
+                conv.context.ville = ville;
+                await this.convManager.updateState(conv.phone, null, { context: conv.context });
+            }
+            return `D'accord, je prends en compte que vous êtes à ${ville || 'cette ville'}. Comment puis-je vous aider ?`;
+        }
+
+        async handleIntentConfirmer(conv) {
+            if (conv.state === this.states.WAITING_NAME && conv.context.ordering) {
+                return await this.confirmOrderName(conv);
+            }
+            if (conv.state === this.states.WAITING_RDV_CONFIRMATION) {
+                return await this.confirmAppointment(conv);
+            }
+            return "Confirmation prise en compte. 😊";
+        }
+
+        async handleIntentRefuser(conv) {
+            await this.convManager.clearContext(conv.phone);
+            return "D'accord, j'annule l'opération. Besoin d'autre chose ?";
+        }
+
+        async handleIntentFallback(analysis, conv, message) {
+            const context = {
+                intent: 'fallback',
+                data: { message, confidence: analysis.confidence },
+                userMessage: message,
+                history: conv.history?.slice(-3)
+            };
+            const groqResponse = await this.groq.generateResponse(context);
+
+            if (groqResponse) {
+                return groqResponse;
+            }
+
             await this.whatsapp.sendInteractiveButtons(conv.phone,
-                "Désolé, je n'ai pas compris. Tapez *aide* pour voir ce que je peux faire. 🤗",
+                "Désolé, je n'ai pas bien compris. Tapez *aide* pour voir ce que je peux faire. 🤗",
                 ["💊 Chercher", "🏥 Pharmacie", "📅 RDV", "❓ Aide"]
             );
             return null;
         }
 
-        async handleWaitingMedicine(phone, message, conv) {
+        // ========== GESTION DES ÉTATS D'ATTENTE ==========
+
+        async handleWaitingMedicine(phone, message, conv, analysis) {
+            if (analysis.entities.medicament) {
+                return await this.handleIntentRechercherMedicament(analysis, conv);
+            }
             if (message.length < 2) {
                 return "Veuillez donner le nom du médicament (ex: doliprane). 💊";
             }
-            await this.convManager.updateState(phone, this.states.IDLE);
-            const newAnalysis = await this.nlp.parse(message, phone);
-            return await this.handleIntentRechercherMedicament(newAnalysis, { ...conv, state: this.states.IDLE }, message);
+            
+            const newAnalysis = { 
+                ...analysis, 
+                entities: { ...analysis.entities, medicament: message } 
+            };
+            return await this.handleIntentRechercherMedicament(newAnalysis, conv);
+        }
+
+        async handleWaitingQuantity(phone, message, conv, analysis) {
+            const quantite = analysis.entities.quantite || Utils.extractNumber(message);
+            
+            if (!quantite || quantite < 1) {
+                return "Veuillez indiquer une quantité valide (ex: 2, 3...)";
+            }
+
+            analysis.entities.quantite = quantite;
+            return await this.handleIntentQuantite(analysis, conv);
+        }
+
+        async handleWaitingName(phone, message, conv) {
+            conv.context.client_nom = message;
+            await this.convManager.updateState(phone, this.states.WAITING_QUARTIER, { context: conv.context });
+            return `Merci ${message} ! Dans quel quartier habitez-vous ? 📍`;
         }
 
         async handleWaitingQuartier(phone, message, conv) {
-            if (message.length < 2) {
-                return "Veuillez préciser le quartier. 📍";
+            if (conv.context.recherche_pharmacie) {
+                const pharmacies = await this.pharmacyScraper.searchByLocation(message);
+                
+                if (pharmacies.length === 0) {
+                    return `Aucune pharmacie trouvée à ${message}.`;
+                }
+
+                const pharmaciesList = pharmacies.slice(0, 5).map(p =>
+                    `${p.nom}\n📍 ${p.adresse}\n📞 ${p.telephone}`
+                ).join('\n\n');
+
+                await this.convManager.updateState(phone, this.states.IDLE, { context: {} });
+                return `Pharmacies à ${message} :\n\n${pharmaciesList}`;
             }
+
+            if (conv.context.ordering) {
+                conv.context.client_quartier = message;
+                await this.convManager.updateState(phone, this.states.WAITING_PHONE, { context: conv.context });
+                return "Quel est votre numéro de téléphone ? (ex: 0701406880) 📱";
+            }
+
             await this.convManager.updateState(phone, this.states.IDLE);
-            const pharmacies = await this.pharmacyScraper.searchByLocation(message);
-            
-            if (pharmacies.length === 0) {
-                return `Aucune pharmacie trouvée à ${message}.`;
-            }
-
-            const pharmaciesList = pharmacies.slice(0, 3).map(p =>
-                `🏥 *${p.nom}*\n📍 ${p.adresse}\n📞 ${p.telephone}`
-            ).join('\n\n');
-
-            return `Pharmacies trouvées à ${message} :\n\n${pharmaciesList}`;
+            return "Merci !";
         }
 
-        async handleWaitingClinic(phone, message, conv) {
-            const number = Utils.extractNumber(message);
-            const clinics = await this.clinicService.getAllClinics(conv.context.ville);
+        async handleWaitingPhone(phone, message, conv) {
+            const phoneNumber = message.replace(/\D/g, '');
+            if (phoneNumber.length < 8) {
+                return "Numéro invalide. Veuillez entrer un numéro valide (ex: 0701406880) 📱";
+            }
 
-            if (!number || number < 1 || number > clinics.length) {
+            conv.context.client_telephone = phoneNumber;
+            await this.convManager.updateState(phone, this.states.WAITING_INDICATIONS, { context: conv.context });
+            
+            await this.whatsapp.sendInteractiveButtons(phone,
+                "Avez-vous des indications particulières pour le livreur ?\n(ex: code d'accès, sonnette, point de repère)",
+                ["Non", "Oui"]
+            );
+            return null;
+        }
+
+        async handleWaitingIndications(phone, message, conv) {
+            if (message.toLowerCase() === 'non' || message === 'Non') {
+                conv.context.client_indications = '';
+            } else {
+                conv.context.client_indications = message;
+            }
+
+            const { items, subtotal, deliveryPrice, total } = Utils.formatCart(conv.cart);
+            
+            const recap = 
+                `*Résumé de commande :*\n\n` +
+                `${items}\n\n` +
+                `À livrer à ${conv.context.client_quartier}\n` +
+                `Tél : ${conv.context.client_telephone}\n` +
+                `Indications : ${conv.context.client_indications || 'Aucune'}\n\n` +
+                `Sous-total : ${subtotal} FCFA\n` +
+                `Frais de livraison : ${deliveryPrice} FCFA\n` +
+                `Prix Total : ${total} FCFA\n\n` +
+                `Paiement à la livraison (espèces/OM/Wave)`;
+
+            await this.convManager.updateState(phone, this.states.WAITING_CONFIRMATION, { context: conv.context });
+            
+            await this.whatsapp.sendInteractiveButtons(phone, recap,
+                ["✅ Confirmer", "✏️ Modifier", "❌ Annuler"]
+            );
+            return null;
+        }
+
+        async handleWaitingConfirmation(phone, message, conv) {
+            if (message === '✅ Confirmer' || message.toLowerCase() === 'oui' || message.toLowerCase() === 'confirmer') {
+                try {
+                    const order = await this.orderService.createOrder({
+                        client: {
+                            nom: conv.context.client_nom,
+                            telephone: conv.context.client_telephone,
+                            quartier: conv.context.client_quartier,
+                            indications: conv.context.client_indications
+                        },
+                        items: conv.cart
+                    }, phone);
+
+                    await this.convManager.clearContext(phone);
+
+                    const context = {
+                        intent: 'commande_confirmee',
+                        data: { 
+                            id: order.id,
+                            total: order.total,
+                            code: order.confirmation_code
+                        },
+                        userMessage: "commande confirmée"
+                    };
+                    const groqResponse = await this.groq.generateResponse(context);
+
+                    if (groqResponse) {
+                        await this.whatsapp.sendMessage(phone, groqResponse);
+                        await this.whatsapp.sendInteractiveButtons(phone,
+                            `Code de confirmation : *${order.confirmation_code}*\n\n` +
+                            `Vous recevrez une notification dès qu'un livreur prendra votre commande.`,
+                            ["📦 Suivre", "💊 Nouvelle recherche", "🏠 Accueil"]
+                        );
+                        return null;
+                    }
+
+                    return `✅ Commande confirmée !\n\n` +
+                           `Numéro : ${order.id}\n` +
+                           `Code : ${order.confirmation_code}\n\n` +
+                           `Vous serez notifié dès qu'un livreur prendra votre commande.`;
+                    
+                } catch (error) {
+                    log('ERROR', 'Erreur confirmation commande:', error);
+                    return "Erreur lors de la confirmation. Réessayez plus tard. 😔";
+                }
+            }
+            
+            if (message === '✏️ Modifier' || message.toLowerCase() === 'modifier') {
+                await this.convManager.updateState(phone, this.states.IDLE);
+                return "Que souhaitez-vous modifier ? Vous pouvez ajouter/supprimer des articles ou recommencer. 🛒";
+            }
+            
+            await this.convManager.clearContext(phone);
+            return "Commande annulée. ❌";
+        }
+
+        async handleWaitingVille(phone, message, conv, analysis) {
+            const ville = analysis.entities.localite || analysis.entities.ville || message;
+            
+            conv.context.ville = ville;
+            
+            if (ville.toLowerCase() === 'abidjan') {
+                await this.convManager.updateState(phone, this.states.WAITING_VILLE, {
+                    context: { ...conv.context, besoin_commune: true }
+                });
+                return "Pour Abidjan, précisez la commune (Cocody, Marcory, Yopougon, etc.) 📍";
+            }
+
+            const clinics = await this.clinicService.getAllClinics(ville);
+
+            if (clinics.length === 0) {
+                return `Désolé, aucune clinique trouvée à ${ville}. 🏥`;
+            }
+
+            await this.convManager.updateState(phone, this.states.WAITING_CLINIC_SELECTION, {
+                context: { ...conv.context, clinics_list: clinics }
+            });
+
+            const clinicsList = clinics.slice(0, 5).map((c, i) =>
+                `${i+1}. *${c.nom_clinique}*\n   📍 ${c.quartier || ''}\n   📞 ${c.telephone || 'Non disponible'}`
+            ).join('\n\n');
+
+            let message_text = `🏥 *Cliniques à ${ville}*\n\n${clinicsList}`;
+            if (clinics.length > 5) {
+                message_text += `\n\nEt ${clinics.length - 5} autre(s) clinique(s).`;
+            }
+
+            const buttons = clinics.slice(0, 5).map((_, i) => String(i + 1));
+            buttons.push("❌ Annuler");
+
+            await this.whatsapp.sendInteractiveButtons(phone, message_text, buttons);
+            return null;
+        }
+
+        async handleWaitingClinicSelection(phone, message, conv) {
+            const numero = Utils.extractNumber(message);
+            const clinics = conv.context.clinics_list;
+
+            if (!numero || numero < 1 || numero > clinics.length) {
                 return "Numéro invalide. Choisissez un numéro dans la liste.";
             }
 
-            const selectedClinic = clinics[number - 1];
+            const selectedClinic = clinics[numero - 1];
             const medecins = await this.clinicService.getMedecinsByClinic(selectedClinic.id_clinique);
             const specialites = [...new Set(medecins.map(m => m.specialite))];
 
-            await this.convManager.updateState(phone, this.states.WAITING_SPECIALITE, {
-                context: { ...conv.context, selected_clinic: selectedClinic, specialites_list: specialites }
+            await this.convManager.updateState(phone, this.states.WAITING_SPECIALITE_SELECTION, {
+                context: { 
+                    ...conv.context, 
+                    selected_clinic: selectedClinic, 
+                    specialites_list: specialites 
+                }
             });
 
             const specialitesList = specialites.slice(0, 5).map((spec, idx) => 
                 `${idx+1}. ${spec}`
             ).join('\n');
 
-            await this.whatsapp.sendInteractiveButtons(phone,
-                `🏥 *${selectedClinic.nom_clinique}*\n\nSpécialités:\n${specialitesList}`,
-                ["1", "2", "3", "4", "5", "❌ Annuler"]
-            );
+            let message_text = `🏥 *${selectedClinic.nom_clinique}*\n\nSpécialités disponibles :\n${specialitesList}`;
+            if (specialites.length > 5) {
+                message_text += `\n\nEt ${specialites.length - 5} autre(s) spécialité(s).`;
+            }
+
+            const buttons = specialites.slice(0, 5).map((_, i) => String(i + 1));
+            buttons.push("❌ Annuler");
+
+            await this.whatsapp.sendInteractiveButtons(phone, message_text, buttons);
             return null;
         }
 
-        async handleWaitingSpecialite(phone, message, conv) {
-            const number = Utils.extractNumber(message);
+        async handleWaitingSpecialiteSelection(phone, message, conv) {
+            const numero = Utils.extractNumber(message);
             const specialites = conv.context.specialites_list || [];
 
-            if (!number || number < 1 || number > specialites.length) {
+            if (!numero || numero < 1 || numero > specialites.length) {
                 return "Numéro de spécialité invalide.";
             }
 
-            const selectedSpecialite = specialites[number - 1];
-
-            await this.convManager.updateState(phone, this.states.WAITING_DATE, {
-                context: { ...conv.context, selected_specialite: selectedSpecialite }
+            conv.context.selected_specialite = specialites[numero - 1];
+            
+            // Demander les informations patient
+            await this.convManager.updateState(phone, this.states.WAITING_PATIENT_INFO, {
+                context: { ...conv.context, patient_info_step: 'nom' }
             });
 
-            return `🩺 *${selectedSpecialite}*\n\nVeuillez indiquer la date souhaitée (JJ/MM/AAAA) :`;
+            return `🩺 *${conv.context.selected_specialite}*\n\n` +
+                   `Pour finaliser le rendez-vous, j'ai besoin de quelques informations :\n\n` +
+                   `👤 Quel est votre nom complet ?`;
+        }
+
+        async handleWaitingPatientInfo(phone, message, conv, analysis) {
+            const step = conv.context.patient_info_step;
+
+            if (step === 'nom') {
+                conv.context.patient_nom = message;
+                await this.convManager.updateState(phone, null, {
+                    context: { ...conv.context, patient_info_step: 'naissance' }
+                });
+                return "📅 Votre date de naissance ? (JJ/MM/AAAA)";
+
+            } else if (step === 'naissance') {
+                const date = Utils.extractDate(message);
+                if (!date) {
+                    return "Format incorrect. Utilisez JJ/MM/AAAA (ex: 15/03/1994)";
+                }
+                conv.context.patient_naissance = date;
+                conv.context.patient_age = Utils.calculateAge(date);
+                await this.convManager.updateState(phone, null, {
+                    context: { ...conv.context, patient_info_step: 'poids' }
+                });
+                return "⚖️ Votre poids ? (en kg, ex: 65)";
+
+            } else if (step === 'poids') {
+                const poids = Utils.extractNumber(message);
+                if (!poids || poids < 20 || poids > 200) {
+                    return "Poids invalide. Entrez un poids entre 20 et 200 kg.";
+                }
+                conv.context.patient_poids = poids;
+                await this.convManager.updateState(phone, null, {
+                    context: { ...conv.context, patient_info_step: 'taille' }
+                });
+                return "📏 Votre taille ? (en cm, ex: 168)";
+
+            } else if (step === 'taille') {
+                const taille = Utils.extractNumber(message);
+                if (!taille || taille < 100 || taille > 250) {
+                    return "Taille invalide. Entrez une taille entre 100 et 250 cm.";
+                }
+                conv.context.patient_taille = taille;
+                await this.convManager.updateState(phone, null, {
+                    context: { ...conv.context, patient_info_step: 'telephone' }
+                });
+                return "📱 Votre numéro de téléphone ? (ex: 0701406880)";
+
+            } else if (step === 'telephone') {
+                const phoneNumber = message.replace(/\D/g, '');
+                if (phoneNumber.length < 8) {
+                    return "Numéro invalide. Veuillez entrer un numéro valide.";
+                }
+                conv.context.patient_telephone = phoneNumber;
+                
+                // Passer à la demande de date
+                await this.convManager.updateState(phone, this.states.WAITING_DATE, {
+                    context: conv.context
+                });
+                return `📅 Date souhaitée pour le rendez-vous (JJ/MM/AAAA) :`;
+            }
+
+            return "Erreur dans le processus.";
         }
 
         async handleWaitingDate(phone, message, conv) {
@@ -1627,7 +2633,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 context: { ...conv.context, selected_date: date }
             });
 
-            return `📅 Date: ${date}\n\nIndiquez l'heure (HH:MM, ex: 14:30) :`;
+            return `📅 Date : ${date}\n\nIndiquez l'heure (HH:MM, ex: 14:30) :`;
         }
 
         async handleWaitingHeure(phone, message, conv) {
@@ -1641,21 +2647,32 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                 context: { ...conv.context, selected_heure: heure }
             });
 
-            await this.whatsapp.sendInteractiveButtons(phone,
-                `📋 *Récapitulatif*\n🏥 Clinique: ${conv.context.selected_clinic?.nom_clinique}\n🩺 Spécialité: ${conv.context.selected_specialite}\n📅 Date: ${conv.context.selected_date}\n⏰ Heure: ${heure}`,
+            const recap = 
+                `*Résumé rendez-vous :*\n\n` +
+                `👤 Patient : ${conv.context.patient_nom}\n` +
+                `📅 Âge : ${conv.context.patient_age} ans (${conv.context.patient_naissance})\n` +
+                `⚖️ Poids : ${conv.context.patient_poids} kg\n` +
+                `📏 Taille : ${conv.context.patient_taille} cm\n` +
+                `📱 Tél : ${conv.context.patient_telephone}\n\n` +
+                `🏥 Clinique : ${conv.context.selected_clinic.nom_clinique}\n` +
+                `📍 Adresse : ${conv.context.selected_clinic.quartier || ''}, ${conv.context.selected_clinic.ville}\n` +
+                `🩺 Spécialité : ${conv.context.selected_specialite}\n\n` +
+                `📅 Date : ${conv.context.selected_date}\n` +
+                `⏰ Heure : ${heure}`;
+
+            await this.whatsapp.sendInteractiveButtons(phone, recap,
                 ["✅ Confirmer", "✏️ Modifier", "❌ Annuler"]
             );
             return null;
         }
 
         async handleWaitingRdvConfirmation(phone, message, conv) {
-            const confirmation = message.toLowerCase();
-
-            if (confirmation === 'oui' || confirmation === 'o' || confirmation === 'confirmer') {
+            if (message === '✅ Confirmer' || message.toLowerCase() === 'oui' || message.toLowerCase() === 'confirmer') {
                 try {
+                    // Récupérer un médecin pour la spécialité
                     const medecins = await this.clinicService.getMedecinsBySpecialite(
                         conv.context.selected_specialite, 
-                        conv.context.selected_clinic.ville
+                        conv.context.ville
                     );
                     const medecin = medecins.length > 0 ? medecins[0].medecin : 'Médecin disponible';
 
@@ -1663,86 +2680,79 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                         id_clinique: conv.context.selected_clinic.id_clinique,
                         medecin: medecin,
                         specialite: conv.context.selected_specialite,
-                        patient_nom: conv.context.client_nom || 'Patient',
-                        patient_telephone: phone,
+                        patient_nom: conv.context.patient_nom,
+                        patient_telephone: conv.context.patient_telephone,
+                        patient_age: conv.context.patient_age,
+                        patient_poids: conv.context.patient_poids,
+                        patient_taille: conv.context.patient_taille,
                         date_rdv: conv.context.selected_date,
                         heure_rdv: conv.context.selected_heure
                     };
 
                     const appointmentId = await this.clinicService.createAppointment(appointmentData);
 
+                    // Notification support
                     await this.whatsapp.sendMessage(CLINIC_NOTIFICATION_PHONE,
-                        `📅 RDV: ${appointmentId}\n👤 ${phone}\n🏥 ${conv.context.selected_clinic.nom_clinique}\n🩺 ${conv.context.selected_specialite}\n👨‍⚕️ ${medecin}\n📅 ${conv.context.selected_date} ${conv.context.selected_heure}`);
+                        `📅 *NOUVEAU RENDEZ-VOUS*\n\n` +
+                        `👤 Patient : ${conv.context.patient_nom}\n` +
+                        `📱 Tél : ${conv.context.patient_telephone}\n` +
+                        `📅 Âge : ${conv.context.patient_age} ans\n` +
+                        `⚖️ Poids : ${conv.context.patient_poids} kg\n` +
+                        `📏 Taille : ${conv.context.patient_taille} cm\n\n` +
+                        `🏥 Clinique : ${conv.context.selected_clinic.nom_clinique}\n` +
+                        `🩺 Spécialité : ${conv.context.selected_specialite}\n` +
+                        `👨‍⚕️ Médecin : ${medecin}\n` +
+                        `📅 Date : ${conv.context.selected_date} à ${conv.context.selected_heure}\n\n` +
+                        `🆔 RDV : ${appointmentId}`
+                    );
 
-                    await this.convManager.updateState(phone, this.states.RDV_COMPLETED, { context: {} });
+                    await this.convManager.clearContext(phone);
 
-                    await this.whatsapp.sendInteractiveButtons(phone,
-                        `Rendez-vous confirmé ! 🎉\nNuméro: ${appointmentId}`,
+                    const recap = 
+                        `*Rendez-vous confirmé !* 🎉\n\n` +
+                        `👤 Patient : ${conv.context.patient_nom}\n` +
+                        `🏥 Clinique : ${conv.context.selected_clinic.nom_clinique}\n` +
+                        `🩺 Spécialité : ${conv.context.selected_specialite}\n` +
+                        `👨‍⚕️ Médecin : ${medecin}\n` +
+                        `📅 Date : ${conv.context.selected_date} à ${conv.context.selected_heure}\n\n` +
+                        `📋 Numéro : ${appointmentId}\n\n` +
+                        `Un rappel vous sera envoyé 24h avant.`;
+
+                    await this.whatsapp.sendInteractiveButtons(phone, recap,
                         ["📅 Autre RDV", "💊 Médicaments", "🏠 Accueil"]
                     );
                     return null;
+
                 } catch (error) {
                     log('ERROR', 'Erreur création rendez-vous:', error);
                     return "Erreur lors de la confirmation. Réessayez plus tard. 😔";
                 }
-            } else if (confirmation === 'modifier') {
-                return await this.handleIntentPrendreRdv(conv);
-            } else {
-                await this.convManager.updateState(phone, this.states.IDLE, { context: {} });
-                return "Rendez-vous annulé. ❌";
             }
+            
+            if (message === '✏️ Modifier' || message.toLowerCase() === 'modifier') {
+                await this.convManager.updateState(phone, this.states.WAITING_VILLE);
+                return "Recommençons. Dans quelle ville ? 🏥";
+            }
+            
+            await this.convManager.clearContext(phone);
+            return "Rendez-vous annulé. ❌";
         }
 
-        async handleWaitingCommandeId(phone, message, conv) {
-            const commandeId = Utils.extractCommandId(message) || message.trim();
-
-            if (!commandeId || commandeId.length < 5) {
-                return "Numéro de commande invalide. Vérifiez le format (ex: CMD2402150001).";
-            }
-
-            const order = await this.orderService.getOrderById(commandeId);
-
-            if (!order) {
-                return `Aucune commande trouvée avec l'ID ${commandeId}.`;
-            }
-
-            const statusMessages = {
-                'PENDING': 'en attente de confirmation',
-                'ASSIGNED': 'acceptée par livreur',
-                'PICKED_UP': 'récupérée par livreur',
-                'DELIVERED': 'livrée',
-                'CANCELLED': 'annulée'
-            };
-
-            return `Commande ${commandeId} : ${statusMessages[order.status_livreur] || order.status}`;
+        async confirmOrderName(conv) {
+            await this.convManager.updateState(conv.phone, this.states.WAITING_NAME);
+            return "Quel est votre nom ? 👤";
         }
 
-        async handleWaitingRdvId(phone, message, conv) {
-            const rdvId = Utils.extractRdvId(message) || message.trim();
-
-            if (!rdvId || rdvId.length < 5) {
-                return "Numéro de rendez-vous invalide. Vérifiez le format (ex: RDV2026030201).";
-            }
-
-            const appointment = await this.clinicService.getAppointmentById(rdvId);
-
-            if (!appointment) {
-                return `Aucun rendez-vous trouvé avec l'ID ${rdvId}.`;
-            }
-
-            return `Rendez-vous ${rdvId} : ${appointment.status === 'CONFIRME' ? 'Confirmé' : appointment.status}`;
-        }
-
-        async handleWaitingModification(phone, message, conv) {
-            return "Modification en cours de développement...";
+        async confirmAppointment(conv) {
+            return await this.handleWaitingRdvConfirmation(conv.phone, 'confirmer', conv);
         }
     }
 
-    // Initialisation DB
+    // ==================== INITIALISATION DB ====================
     async function initDatabase() {
         try {
             await pool.query(`
-                CREATE TABLE IF NOT EXISTS medicaments_cache (
+                CREATE TABLE IF NOT EXISTS medicaments (
                     id SERIAL PRIMARY KEY,
                     code_produit VARCHAR(50),
                     nom_commercial VARCHAR(200) NOT NULL,
@@ -1767,6 +2777,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                     cart JSONB DEFAULT '[]',
                     context JSONB DEFAULT '{}',
                     history JSONB DEFAULT '[]',
+                    pending_medicament JSONB DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
@@ -1837,6 +2848,9 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
                     specialite VARCHAR(100),
                     patient_nom VARCHAR(100),
                     patient_telephone VARCHAR(20),
+                    patient_age INTEGER,
+                    patient_poids INTEGER,
+                    patient_taille INTEGER,
                     date_rdv VARCHAR(20),
                     heure_rdv VARCHAR(10),
                     status VARCHAR(50) DEFAULT 'CONFIRME',
@@ -1850,7 +2864,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     }
 
-    // Webhook WhatsApp
+    // ==================== WEBHOOK WHATSAPP ====================
     app.get('/webhook', (req, res) => {
         if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
             res.send(req.query['hub.challenge']);
@@ -1869,6 +2883,13 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
             if (!change || change.field !== 'messages') return;
 
             const msg = change.value?.messages?.[0];
+            
+            // Gestion des messages vocaux
+            if (msg?.type === 'voice') {
+                await whatsappService.handleVoiceMessage(msg.from);
+                return;
+            }
+
             if (!msg || msg.type !== 'text') return;
 
             const from = msg.from;
@@ -1880,7 +2901,7 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
 
             await whatsappService.markAsRead(msgId);
 
-            // Vérifier si c'est une réponse de livreur
+            // Réponses livreurs
             if (text.startsWith('ACCEPTER ') || text.startsWith('RECUPERER ') || text.startsWith('LIVRER ')) {
                 await orderService.handleLivreurResponse(from, text, convManager);
                 return;
@@ -1904,14 +2925,14 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     });
 
-    // Routes API
+    // ==================== ROUTES API ====================
     app.get('/', (req, res) => {
         const delivery = Utils.getCurrentDeliveryPrice();
         res.json({
             name: 'MIA - Pillbox CI',
-            version: '7.0.0-light',
+            version: '8.0.0-production',
             status: 'production',
-            description: 'Version allégée avec Fuse.js et gestion livreurs',
+            description: 'Version complète avec NLP, Groq et gestion de rendez-vous',
             uptime: process.uptime(),
             delivery: delivery,
             stats: {
@@ -1942,7 +2963,25 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     });
 
-    // Route pour enregistrer un livreur
+    app.get('/api/pharmacies', async (req, res) => {
+        try {
+            const { schedule, location } = req.query;
+            
+            let result;
+            if (location) {
+                const pharmacies = await pharmacyScraper.searchByLocation(location, schedule);
+                result = { success: true, pharmacies, query: location };
+            } else {
+                result = await pharmacyScraper.fetchWeek(schedule);
+                result.success = true;
+            }
+            
+            res.json(result);
+        } catch (error) {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
     app.post('/api/livreur/register', async (req, res) => {
         try {
             const { phone, nom, zone } = req.body;
@@ -1958,7 +2997,6 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     });
 
-    // Route pour les commandes d'un livreur
     app.get('/api/livreur/:phone/commandes', async (req, res) => {
         try {
             const { phone } = req.params;
@@ -1970,61 +3008,94 @@ if (cluster.isPrimary && NODE_ENV === 'production') {
         }
     });
 
-    // Initialisation des services
+    app.get('/api/cliniques', async (req, res) => {
+        try {
+            const { ville } = req.query;
+            const cliniques = await clinicService.getAllClinics(ville);
+            res.json({ success: true, cliniques });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    app.get('/api/specialites', async (req, res) => {
+        try {
+            const specialites = await clinicService.getAllSpecialites();
+            res.json({ success: true, specialites });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    // Route pour entraîner le modèle NLP (sécurisée)
+    app.post('/api/nlp/train', async (req, res) => {
+        const authKey = req.headers['x-api-key'];
+        if (authKey !== process.env.API_KEY) {
+            return res.status(403).json({ error: 'Non autorisé' });
+        }
+
+        try {
+            const success = await nlpService.trainModel();
+            if (success) {
+                res.json({ success: true, message: 'Modèle NLP entraîné avec succès' });
+            } else {
+                res.status(500).json({ success: false, message: 'Erreur entraînement' });
+            }
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    // ==================== INITIALISATION DES SERVICES ====================
     const whatsappService = new WhatsAppService();
     const nlpService = new NLPService();
     const groqService = new GroqService();
-    const pharmacyScraper = new SimplePharmacyScraper();
-    const searchEngine = new SimpleSearchEngine(pool);
+    const pharmacyScraper = new PharmacyScraper();
+    const searchEngine = new SearchEngine(pool);
     const clinicService = new ClinicService(pool);
     const convManager = new ConversationManager(pool);
     const livreurService = new LivreurService(pool, whatsappService);
     const orderService = new OrderService(pool, whatsappService, livreurService);
-    const cacheManager = new CacheManager(pharmacyScraper, pool);
 
     const conversationEngine = new ConversationEngine(
         nlpService, groqService, searchEngine, clinicService, 
-        orderService, convManager, whatsappService, livreurService
+        orderService, convManager, whatsappService, livreurService, pharmacyScraper
     );
 
     const timeoutManager = new TimeoutManager(convManager, whatsappService);
 
-    // Démarrage
+    // ==================== DÉMARRAGE ====================
     const server = app.listen(PORT, '0.0.0.0', async () => {
         await initDatabase();
         await nlpService.loadModel();
         await searchEngine.buildIndex();
 
-        setTimeout(async () => {
-            await cacheManager.refreshAll();
-            setInterval(() => cacheManager.refreshAll(), 60 * 60 * 1000);
-        }, 5000);
+        // Rafraîchissement périodique des pharmacies
+        setInterval(async () => {
+            await pharmacyScraper.fetchWeek();
+        }, 6 * 60 * 60 * 1000); // Toutes les 6h
 
         console.log(`
     ╔══════════════════════════════════════════════════════════════╗
-    ║     🚀 MIA - Pillbox CI 🇨🇮 VERSION LIVREURS                  ║
+    ║     🚀 MIA - Pillbox CI 🇨🇮 VERSION PRODUCTION FINALE         ║
     ╠══════════════════════════════════════════════════════════════╣
     ║  Worker: ${process.pid}                                                ║
     ║  Port: ${PORT}                                                     ║
     ║                                                              ║
-    ║  🔍 Moteur de recherche: Fuse.js uniquement                 ║
-    ║  ✅ Tolérance aux fautes d'orthographe                       ║
+    ║  🧠 NLP : 30+ intentions, extraction d'entités              ║
+    ║  🔥 Groq : Génération de réponses naturelles                 ║
+    ║  🔍 Fuse.js : Recherche tolérante aux fautes                 ║
     ║                                                              ║
-    ║  🛵 GESTION LIVREURS ACTIVE                                  ║
-    ║  • ACCEPTER - Prendre commande                               ║
-    ║  • RECUPERER - Récupérer commande                            ║
-    ║  • LIVRER + code - Finaliser livraison                       ║
+    ║  🛵 LIVREURS : ACCEPTER / RECUPERER / LIVRER                 ║
+    ║  📅 RENDEZ-VOUS : Informations patient complètes             ║
+    ║  🏥 PHARMACIES : Cache intelligent par semaine               ║
     ║                                                              ║
-    ║  🎯 BOUTONS INTERACTIFS                                      ║
-    ║  • Panier : MODIFIER / CONFIRMER / ANNULER                   ║
-    ║  • RDV : MODIFIER / CONFIRMER                                ║
-    ║                                                              ║
-    ║  💰 Livraison: Nuit 600F | Jour 400F | Gratuit >5000F       ║
+    ║  💰 Livraison : Nuit 600F | Jour 400F                        ║
     ╚══════════════════════════════════════════════════════════════╝
         `);
     });
 
-    // Gestion des erreurs
+    // ==================== GESTION DES ERREURS ====================
     process.on('unhandledRejection', (err) => {
         log('ERROR', 'Unhandled Rejection:', err);
         stats.errors++;

@@ -221,6 +221,15 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         }
     }, 30000);
     
+    // ==================== EXPORT POUR LE MASTER ====================
+    module.exports = (req, res) => {
+        res.status(200).json({ 
+            status: 'master', 
+            message: 'MIA Bot - Master process',
+            workers: Object.keys(workers).length
+        });
+    };
+    
 } else {
     // ==================== EXPRESS ====================
     const app = express();
@@ -2581,7 +2590,6 @@ Analyse l'image et retourne JSON:
     // ==================== PROCESSUS DE NOTIFICATION ====================
     batchQueue.process('send-batch', async (job) => {
         const { phone, messages } = job.data;
-        const whatsappService = new WhatsAppService(null);
         
         try {
             if (messages.length > 1) {
@@ -2616,7 +2624,6 @@ Analyse l'image et retourne JSON:
 
     notificationQueue.process('order-notification', async (job) => {
         const { order } = job.data;
-        const whatsappService = new WhatsAppService(null);
         
         const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
         const message = 
@@ -2627,7 +2634,6 @@ Analyse l'image et retourne JSON:
 
     notificationQueue.process('notify-livreurs', async (job) => {
         const { order } = job.data;
-        const whatsappService = new WhatsAppService(null);
         
         const livreurResult = await pool.query(
             'SELECT phone FROM livreurs WHERE disponible = true LIMIT 1'
@@ -2659,7 +2665,6 @@ Analyse l'image et retourne JSON:
 
     notificationQueue.process('clinic-notification', async (job) => {
         const { appointmentId, data } = job.data;
-        const whatsappService = new WhatsAppService(null);
         
         try {
             const clinicResult = await pool.query(
@@ -3092,6 +3097,7 @@ Analyse l'image et retourne JSON:
             process.exit(0);
         });
     });
+    
+    // ✅ EXPORT POUR LE WORKER
+    module.exports = app;
 }
-
-module.exports = app;

@@ -94,8 +94,19 @@ const CACHE_TTL = {
     USER_SESSION: 86400     // 24 heures
 };
 
-// ==================== LOGGER ====================
+// ==================== LOGGER CORRIGÉ ====================
+const logLevels = {
+    error: 0,
+    warn: 1,
+    info: 2,
+    http: 3,
+    verbose: 4,
+    debug: 5,
+    silly: 6
+};
+
 const logger = winston.createLogger({
+    levels: logLevels,
     level: IS_PRODUCTION ? 'info' : 'debug',
     format: winston.format.combine(
         winston.format.timestamp(),
@@ -123,15 +134,40 @@ function log(level, message, data = null) {
         INFO: '📘', SUCCESS: '✅', ERROR: '❌', USER: '👤', BOT: '🤖', 
         GROQ: '🔥', SCRAPE: '🕷️', WEBHOOK: '📨', CACHE: '📦',
         DB: '💾', ORDER: '📦', APPT: '📅', SEARCH: '🔍', LIVREUR: '🛵',
-        BATCH: '📦', COMPRESS: '🗜️', COMPOUND: '🌐', MOD: '🛡️'
+        BATCH: '📦', COMPRESS: '🗜️', COMPOUND: '🌐', MOD: '🛡️',
+        WARN: '⚠️', URGENT: '🚨', BUTTON: '🔘', QUEUE: '⏱️'
     };
     
-    logger.log({ 
-        level: level.toLowerCase(), 
-        message: `${icons[level] || '📌'} ${message}`,
-        data: data,
-        worker: process.pid
-    });
+    // Mapping des niveaux Winston
+    const winstonLevel = {
+        'ERROR': 'error',
+        'WARN': 'warn',
+        'SUCCESS': 'info',
+        'INFO': 'info',
+        'DEBUG': 'debug',
+        'CACHE': 'info',
+        'DB': 'info',
+        'GROQ': 'info',
+        'BATCH': 'info',
+        'COMPRESS': 'info'
+    }[level] || 'info';
+    
+    logger.log(winstonLevel, `${icons[level] || '📌'} ${message}`, { data, worker: process.pid });
+    
+    // Console en développement
+    if (!IS_PRODUCTION) {
+        const colors = {
+            ERROR: '\x1b[31m',
+            SUCCESS: '\x1b[32m',
+            WARN: '\x1b[33m',
+            INFO: '\x1b[36m',
+            CACHE: '\x1b[35m',
+            DB: '\x1b[34m',
+            GROQ: '\x1b[33m',
+            default: '\x1b[0m'
+        };
+        console.log(`${colors[level] || colors.default}${icons[level] || '📌'} ${message}\x1b[0m`, data ? data : '');
+    }
 }
 
 // ==================== MÉTRIQUES PROMETHEUS ====================
@@ -309,8 +345,8 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         res.json = function(data) {
             res.setHeader('x-ratelimit-limit-requests', '14400');
             res.setHeader('x-ratelimit-limit-tokens', '18000');
-            res.setHeader('x-ratelimit-remaining-requests', Math.max(0, 14400 - stats.messagesProcessed % 14400));
-            res.setHeader('x-ratelimit-remaining-tokens', Math.max(0, 18000 - stats.groqCalls * 500 % 18000));
+            res.setHeader('x-ratelimit-remaining-requests', Math.max(0, 14400 - (stats.messagesProcessed || 0) % 14400));
+            res.setHeader('x-ratelimit-remaining-tokens', Math.max(0, 18000 - (stats.groqCalls || 0) * 500 % 18000));
             res.setHeader('x-ratelimit-reset-requests', '1d');
             res.setHeader('x-ratelimit-reset-tokens', '1m');
             
@@ -336,50 +372,51 @@ if (cluster.isPrimary && IS_PRODUCTION) {
     app.use('/webhook', webhookLimiter);
     app.use('/api/', apiLimiter);
 
-    // ==================== REDIS (CACHE AGRESSIF) ====================
-    let redis;
+    // ==================== REDIS (AVEC FALLBACK) ====================
+    let redis = null;
+    let useRedis = false;
+    
     try {
-        redis = new Redis({
-            host: process.env.REDIS_HOST || 'localhost',
-            port: process.env.REDIS_PORT || 6379,
-            password: process.env.REDIS_PASSWORD,
-            retryStrategy: (times) => Math.min(times * 50, 2000),
-            maxRetriesPerRequest: 3,
-            enableReadyCheck: true,
-            lazyConnect: true,
-            keepAlive: 30000,
-            family: 4,
-            keyPrefix: 'mia:',
-            connectTimeout: 10000,
-            disconnectTimeout: 5000,
-            commandTimeout: 5000,
-            maxLoadingRetryTime: 10000,
-            enableOfflineQueue: true,
-            autoResubscribe: true,
-            autoResendUnfulfilledCommands: true
-        });
-        
-        redis.on('error', (err) => {
-            log('ERROR', 'Redis error:', err);
-        });
-        
-        redis.on('ready', () => {
-            log('SUCCESS', 'Redis connecté (mode agressif)');
-        });
-        
-        // Nettoyage périodique
-        setInterval(async () => {
-            try {
-                const keys = await redis.keys('mia:*');
-                log('CACHE', `${keys.length} clés en cache`);
-            } catch (error) {
-                log('ERROR', 'Erreur nettoyage cache:', error);
-            }
-        }, 3600000);
-        
+        if (process.env.REDIS_URL) {
+            log('INFO', 'Tentative de connexion Redis...');
+            redis = new Redis(process.env.REDIS_URL, {
+                retryStrategy: (times) => {
+                    if (times > 3) {
+                        log('WARN', 'Redis: abandon après 3 tentatives');
+                        return null;
+                    }
+                    return Math.min(times * 100, 1000);
+                },
+                maxRetriesPerRequest: 1,
+                lazyConnect: true,
+                connectTimeout: 3000,
+                commandTimeout: 2000
+            });
+            
+            redis.on('error', (err) => {
+                log('WARN', 'Redis error (mode dégradé activé):', err.message);
+                useRedis = false;
+            });
+            
+            redis.on('ready', () => {
+                log('SUCCESS', '✅ Redis connecté');
+                useRedis = true;
+            });
+            
+            // Timeout de connexion
+            setTimeout(() => {
+                if (redis && redis.status !== 'ready') {
+                    log('WARN', 'Redis timeout - utilisation cache mémoire');
+                    useRedis = false;
+                }
+            }, 3000);
+        } else {
+            log('INFO', 'REDIS_URL non défini - utilisation cache mémoire');
+        }
     } catch (error) {
-        log('ERROR', 'Erreur connexion Redis:', error);
+        log('ERROR', 'Erreur initialisation Redis:', error.message);
         redis = null;
+        useRedis = false;
     }
 
     // ==================== CACHES ====================
@@ -387,7 +424,7 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         stdTTL: 300,
         checkperiod: 60,
         useClones: false,
-        maxKeys: 10000
+        maxKeys: 50000
     });
     
     const processedMessages = new NodeCache({ 
@@ -437,73 +474,100 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         log('INFO', 'Nouvelle connexion DB établie');
     });
 
-    // ==================== QUEUES ====================
-    const messageQueue = new Queue('message processing', {
-        redis: {
-            host: process.env.REDIS_HOST || 'localhost',
-            port: process.env.REDIS_PORT || 6379,
-            password: process.env.REDIS_PASSWORD,
-            keyPrefix: 'bull:'
-        },
-        defaultJobOptions: {
-            attempts: 3,
-            backoff: {
-                type: 'exponential',
-                delay: 1000
+    // ==================== QUEUES AVEC FALLBACK ====================
+    function createQueue(name, options = {}) {
+        // Si Redis n'est pas disponible, utiliser une queue en mémoire
+        if (!useRedis) {
+            log('WARN', `Queue ${name} en mode mémoire (fallback)`);
+            return {
+                add: async (type, data) => {
+                    log('QUEUE', `Job ${type} ajouté (mode mémoire)`);
+                    setTimeout(() => {
+                        if (name === 'message processing') {
+                            if (type === 'text-message') {
+                                conversationEngine?.process(data.from, data.text).catch(log);
+                            } else if (type === 'image-message') {
+                                conversationEngine?.process(data.from, null, data.mediaId).catch(log);
+                            }
+                        } else if (name === 'batch-whatsapp' && type === 'send-batch') {
+                            sendBatchFallback(data).catch(log);
+                        }
+                    }, 100);
+                    return { id: Date.now() };
+                },
+                process: () => {},
+                close: async () => {},
+                getJobCounts: async () => ({ waiting: 0 })
+            };
+        }
+        
+        // Sinon utiliser Bull avec Redis
+        return new Queue(name, {
+            redis: {
+                url: process.env.REDIS_URL,
+                keyPrefix: `bull:${name}:`
             },
-            removeOnComplete: 200,
-            removeOnFail: 100,
-            timeout: 30000
-        }
-    });
+            defaultJobOptions: {
+                attempts: 3,
+                backoff: {
+                    type: 'exponential',
+                    delay: 1000
+                },
+                removeOnComplete: 200,
+                removeOnFail: 100,
+                timeout: 30000
+            },
+            ...options
+        });
+    }
 
-    const notificationQueue = new Queue('notifications', {
-        redis: {
-            host: process.env.REDIS_HOST || 'localhost',
-            port: process.env.REDIS_PORT || 6379,
-            password: process.env.REDIS_PASSWORD,
-            keyPrefix: 'bull:'
-        },
-        defaultJobOptions: {
-            attempts: 3,
-            backoff: 2000,
-            removeOnComplete: 100,
-            timeout: 15000
+    const messageQueue = createQueue('message processing');
+    const notificationQueue = createQueue('notifications');
+    const batchQueue = createQueue('batch-whatsapp');
+
+    // Fallback pour l'envoi de batch
+    async function sendBatchFallback({ phone, messages }) {
+        try {
+            if (messages.length > 1) {
+                const combined = messages.map(m => m.text).join('\n\n---\n\n');
+                await whatsappService.sendUrgentMessage(phone, combined.substring(0, 4096));
+            } else {
+                await whatsappService.sendUrgentMessage(phone, messages[0].text);
+            }
+            log('BATCH', `✅ ${messages.length} messages envoyés (fallback)`);
+        } catch (error) {
+            log('ERROR', 'Erreur envoi batch fallback:', error);
+            // Envoyer un par un en cas d'erreur
+            for (const msg of messages) {
+                await whatsappService.sendUrgentMessage(phone, msg.text).catch(e => 
+                    log('ERROR', 'Échec envoi individuel:', e)
+                );
+            }
         }
-    });
-    
-    // Queue pour batch WhatsApp
-    const batchQueue = new Queue('batch-whatsapp', {
-        redis: {
-            host: process.env.REDIS_HOST || 'localhost',
-            port: process.env.REDIS_PORT || 6379,
-            password: process.env.REDIS_PASSWORD,
-            keyPrefix: 'batch:'
-        },
-        defaultJobOptions: {
-            attempts: 3,
-            backoff: 5000,
-            removeOnComplete: true,
-            timeout: 60000
-        }
-    });
+    }
 
     setInterval(async () => {
-        const counts = await messageQueue.getJobCounts();
-        queueSize.set(counts.waiting || 0);
+        try {
+            const counts = await messageQueue.getJobCounts();
+            queueSize.set(counts.waiting || 0);
+        } catch (error) {
+            // Ignorer
+        }
     }, 10000);
 
     const serverAdapter = new ExpressAdapter();
     serverAdapter.setBasePath('/admin/queues');
     
-    createBullBoard({
-        queues: [
-            new BullAdapter(messageQueue),
-            new BullAdapter(notificationQueue),
-            new BullAdapter(batchQueue)
-        ],
-        serverAdapter: serverAdapter
-    });
+    if (useRedis) {
+        createBullBoard({
+            queues: [
+                new BullAdapter(messageQueue),
+                new BullAdapter(notificationQueue),
+                new BullAdapter(batchQueue)
+            ],
+            serverAdapter: serverAdapter
+        });
+    }
 
     // ==================== ÉTATS DE CONVERSATION ====================
     const ConversationStates = {
@@ -708,20 +772,31 @@ if (cluster.isPrimary && IS_PRODUCTION) {
 
         static async cacheGet(key) {
             dbQueries.inc({ type: 'cache_get' });
-            if (redis) {
-                const val = await redis.get(key);
-                if (val) {
-                    cacheHits.inc();
-                    stats.cacheHits++;
-                    return JSON.parse(val);
-                }
-            }
+            
+            // D'abord le cache mémoire
             const memVal = memoryCache.get(key);
             if (memVal) {
                 cacheHits.inc();
                 stats.cacheHits++;
                 return memVal;
             }
+            
+            // Ensuite Redis si disponible
+            if (useRedis && redis) {
+                try {
+                    const val = await redis.get(key);
+                    if (val) {
+                        const parsed = JSON.parse(val);
+                        memoryCache.set(key, parsed, 300); // Sauvegarde en mémoire
+                        cacheHits.inc();
+                        stats.cacheHits++;
+                        return parsed;
+                    }
+                } catch (error) {
+                    log('WARN', 'Erreur lecture Redis:', error.message);
+                }
+            }
+            
             stats.cacheMisses++;
             return null;
         }
@@ -738,18 +813,19 @@ if (cluster.isPrimary && IS_PRODUCTION) {
                 else ttl = 300;
             }
             
-            if (redis) {
-                await redis.setex(key, ttl, JSON.stringify(value));
-            } else {
-                memoryCache.set(key, value, ttl);
+            // Toujours en mémoire
+            memoryCache.set(key, value, ttl);
+            
+            // Redis en parallèle si disponible
+            if (useRedis && redis) {
+                redis.setex(key, ttl, JSON.stringify(value)).catch(() => {});
             }
         }
 
         static async cacheDel(key) {
-            if (redis) {
-                await redis.del(key);
-            } else {
-                memoryCache.del(key);
+            memoryCache.del(key);
+            if (useRedis && redis) {
+                redis.del(key).catch(() => {});
             }
         }
     }
@@ -758,6 +834,7 @@ if (cluster.isPrimary && IS_PRODUCTION) {
     class BatchProcessingService {
         constructor() {
             this.pendingMessages = new Map();
+            this.processing = false;
             setInterval(() => this.processBatch(), 30000);
         }
 
@@ -768,29 +845,52 @@ if (cluster.isPrimary && IS_PRODUCTION) {
                 this.pendingMessages.set(phone, []);
             }
             
-            this.pendingMessages.get(phone).push({
+            const messages = this.pendingMessages.get(phone);
+            
+            // Éviter les doublons exacts dans les 5 dernières secondes
+            const lastMessage = messages[messages.length - 1];
+            if (lastMessage && lastMessage.text === text && Date.now() - lastMessage.timestamp < 5000) {
+                return;
+            }
+            
+            messages.push({
                 to: phone,
                 text: text,
                 timestamp: Date.now()
             });
             
-            log('BATCH', `Message en lot pour ${phone} (${this.pendingMessages.get(phone).length})`);
+            log('BATCH', `📦 Message en lot pour ${phone} (${messages.length})`);
+            
+            if (messages.length >= 5) {
+                await this.processBatch();
+            }
         }
 
         async processBatch() {
-            const now = Date.now();
-            const batchSize = 5;
-            const maxWait = 60000;
+            if (this.processing) return;
+            this.processing = true;
             
-            for (const [phone, messages] of this.pendingMessages) {
-                if (messages.length >= batchSize || 
-                    (messages.length > 0 && now - messages[0].timestamp > maxWait)) {
-                    
-                    const toSend = messages.splice(0, batchSize);
-                    await batchQueue.add('send-batch', { phone, messages: toSend });
-                    batchSaved.inc(toSend.length - 1);
-                    log('BATCH', `Lot ${toSend.length} messages pour ${phone}`);
+            try {
+                const now = Date.now();
+                const batchSize = 5;
+                const maxWait = 30000;
+                
+                for (const [phone, messages] of this.pendingMessages) {
+                    if (messages.length >= batchSize || 
+                        (messages.length > 0 && now - messages[0].timestamp > maxWait)) {
+                        
+                        const toSend = messages.splice(0, batchSize);
+                        await batchQueue.add('send-batch', { phone, messages: toSend });
+                        batchSaved.inc(toSend.length - 1);
+                        log('BATCH', `Lot ${toSend.length} messages pour ${phone}`);
+                        
+                        if (messages.length === 0) {
+                            this.pendingMessages.delete(phone);
+                        }
+                    }
                 }
+            } finally {
+                this.processing = false;
             }
         }
 
@@ -819,37 +919,47 @@ if (cluster.isPrimary && IS_PRODUCTION) {
             const cached = await Utils.cacheGet(cacheKey);
             if (cached) return cached;
 
-            const results = await this.pool.query(`
-                SELECT 
-                    code_produit,
-                    nom_commercial,
-                    dci,
-                    prix::float
-                FROM medicaments
-                WHERE 
-                    LOWER(nom_commercial) LIKE LOWER($1) OR
-                    LOWER(dci) LIKE LOWER($1)
-                ORDER BY 
-                    CASE 
-                        WHEN LOWER(nom_commercial) = LOWER($2) THEN 0
-                        WHEN LOWER(nom_commercial) LIKE LOWER($2 || '%') THEN 1
-                        ELSE 2
-                    END,
-                    prix ASC
-                LIMIT 3
-            `, [`%${query}%`, query]);
+            try {
+                const results = await this.pool.query(`
+                    SELECT 
+                        code_produit,
+                        nom_commercial,
+                        dci,
+                        prix::float
+                    FROM medicaments
+                    WHERE 
+                        LOWER(nom_commercial) LIKE LOWER($1) OR
+                        LOWER(dci) LIKE LOWER($1)
+                    ORDER BY 
+                        CASE 
+                            WHEN LOWER(nom_commercial) = LOWER($2) THEN 0
+                            WHEN LOWER(nom_commercial) LIKE LOWER($2 || '%') THEN 1
+                            ELSE 2
+                        END,
+                        prix ASC
+                    LIMIT 3
+                `, [`%${query}%`, query]);
 
-            await Utils.cacheSet(cacheKey, results.rows, CACHE_TTL.QUICK_SEARCH);
-            
-            return results.rows;
+                await Utils.cacheSet(cacheKey, results.rows, CACHE_TTL.QUICK_SEARCH);
+                
+                return results.rows;
+            } catch (error) {
+                log('ERROR', 'Erreur recherche médicaments:', error);
+                return [];
+            }
         }
 
         async getMedicineByCode(code) {
-            const result = await this.pool.query(
-                'SELECT * FROM medicaments WHERE code_produit = $1',
-                [code]
-            );
-            return result.rows[0];
+            try {
+                const result = await this.pool.query(
+                    'SELECT * FROM medicaments WHERE code_produit = $1',
+                    [code]
+                );
+                return result.rows[0];
+            } catch (error) {
+                log('ERROR', 'Erreur getMedicineByCode:', error);
+                return null;
+            }
         }
         
         formatShort(medicines) {
@@ -886,7 +996,6 @@ if (cluster.isPrimary && IS_PRODUCTION) {
 
         async fetchWeek(weekId = null) {
             const cacheKey = weekId ? `${this.cachePrefix}_${weekId}` : `${this.cachePrefix}_current`;
-            const now = Date.now();
 
             const cached = await Utils.cacheGet(cacheKey);
             if (cached) {
@@ -898,6 +1007,9 @@ if (cluster.isPrimary && IS_PRODUCTION) {
                 const url = weekId ? `${this.baseUrl}?schedule=${weekId}` : this.baseUrl;
                 log('SCRAPE', `Récupération semaine ${weekId || 'courante'}...`);
                 
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+                
                 const response = await axios.get(url, {
                     headers: {
                         'User-Agent': this.userAgents[Math.floor(Math.random() * this.userAgents.length)],
@@ -905,9 +1017,10 @@ if (cluster.isPrimary && IS_PRODUCTION) {
                         'Accept-Language': 'fr,fr-FR;q=0.8,en-US;q=0.5,en;q=0.3',
                         'Cache-Control': 'no-cache'
                     },
+                    signal: controller.signal,
                     timeout: this.timeout,
                     maxContentLength: 2 * 1024 * 1024
-                });
+                }).finally(() => clearTimeout(timeoutId));
 
                 const $ = cheerio.load(response.data);
                 
@@ -915,7 +1028,6 @@ if (cluster.isPrimary && IS_PRODUCTION) {
                 const pharmacies = this._extractPharmacies($);
                 const scheduleOptions = this._extractScheduleOptions($);
                 
-                // Extraire date du jour
                 let dateDuJour = null;
                 const dateHeader = $('.page-header p').text();
                 const dateMatch = dateHeader.match(/(\d{1,2}\s+\w+\s+\d{4})/);
@@ -1220,42 +1332,57 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         }
 
         async getClinicById(id) {
-            const result = await this.pool.query(
-                'SELECT * FROM cliniques WHERE id_clinique = $1',
-                [id]
-            );
-            return result.rows[0];
+            try {
+                const result = await this.pool.query(
+                    'SELECT * FROM cliniques WHERE id_clinique = $1',
+                    [id]
+                );
+                return result.rows[0];
+            } catch (error) {
+                log('ERROR', 'Erreur getClinicById:', error);
+                return null;
+            }
         }
 
         async getMedecinsByClinic(clinicId) {
-            const result = await this.pool.query(
-                `SELECT m.*, c.nom_clinique, c.quartier, c.ville, c.telephone
-                 FROM medecins_clinique m
-                 JOIN cliniques c ON m.id_clinique = c.id_clinique
-                 WHERE m.id_clinique = $1
-                 ORDER BY m.specialite, m.medecin`,
-                [clinicId]
-            );
-            return result.rows;
+            try {
+                const result = await this.pool.query(
+                    `SELECT m.*, c.nom_clinique, c.quartier, c.ville, c.telephone
+                     FROM medecins_clinique m
+                     JOIN cliniques c ON m.id_clinique = c.id_clinique
+                     WHERE m.id_clinique = $1
+                     ORDER BY m.specialite, m.medecin`,
+                    [clinicId]
+                );
+                return result.rows;
+            } catch (error) {
+                log('ERROR', 'Erreur getMedecinsByClinic:', error);
+                return [];
+            }
         }
 
         async getMedecinsBySpecialite(specialite, ville = null) {
-            let query = `
-                SELECT m.*, c.nom_clinique, c.quartier, c.ville, c.telephone
-                FROM medecins_clinique m
-                JOIN cliniques c ON m.id_clinique = c.id_clinique
-                WHERE LOWER(m.specialite) LIKE LOWER($1)
-            `;
-            let params = [`%${specialite}%`];
+            try {
+                let query = `
+                    SELECT m.*, c.nom_clinique, c.quartier, c.ville, c.telephone
+                    FROM medecins_clinique m
+                    JOIN cliniques c ON m.id_clinique = c.id_clinique
+                    WHERE LOWER(m.specialite) LIKE LOWER($1)
+                `;
+                let params = [`%${specialite}%`];
 
-            if (ville) {
-                query += ` AND LOWER(c.ville) = LOWER($2)`;
-                params.push(ville);
+                if (ville) {
+                    query += ` AND LOWER(c.ville) = LOWER($2)`;
+                    params.push(ville);
+                }
+
+                query += ` ORDER BY m.specialite, m.medecin LIMIT 5`;
+                const result = await this.pool.query(query, params);
+                return result.rows;
+            } catch (error) {
+                log('ERROR', 'Erreur getMedecinsBySpecialite:', error);
+                return [];
             }
-
-            query += ` ORDER BY m.specialite, m.medecin LIMIT 5`;
-            const result = await this.pool.query(query, params);
-            return result.rows;
         }
 
         formatClinicsShort(clinics, context = {}) {
@@ -1295,56 +1422,66 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         async createAppointment(data) {
             const appointmentId = Utils.generateId('RDV');
 
-            const result = await this.pool.query(`
-                INSERT INTO rendez_vous (
-                    id, id_clinique, medecin, specialite,
-                    patient_nom, patient_telephone, patient_age, 
-                    patient_poids, patient_taille, patient_genre,
-                    patient_ville, patient_commune,
-                    date_rdv, heure_rdv, status
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                RETURNING id
-            `, [
-                appointmentId,
-                data.id_clinique,
-                data.medecin || 'Médecin de garde',
-                data.specialite,
-                data.patient_nom,
-                data.patient_telephone,
-                data.patient_age,
-                data.patient_poids,
-                data.patient_taille,
-                data.patient_genre,
-                data.patient_ville,
-                data.patient_commune || null,
-                data.date_rdv,
-                data.heure_rdv,
-                'CONFIRME'
-            ]);
+            try {
+                const result = await this.pool.query(`
+                    INSERT INTO rendez_vous (
+                        id, id_clinique, medecin, specialite,
+                        patient_nom, patient_telephone, patient_age, 
+                        patient_poids, patient_taille, patient_genre,
+                        patient_ville, patient_commune,
+                        date_rdv, heure_rdv, status
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    RETURNING id
+                `, [
+                    appointmentId,
+                    data.id_clinique,
+                    data.medecin || 'Médecin de garde',
+                    data.specialite,
+                    data.patient_nom,
+                    data.patient_telephone,
+                    data.patient_age,
+                    data.patient_poids,
+                    data.patient_taille,
+                    data.patient_genre,
+                    data.patient_ville,
+                    data.patient_commune || null,
+                    data.date_rdv,
+                    data.heure_rdv,
+                    'CONFIRME'
+                ]);
 
-            if (result.rows.length > 0) {
-                log('DB', `✅ Rendez-vous ${appointmentId} enregistré`);
+                if (result.rows.length > 0) {
+                    log('DB', `✅ Rendez-vous ${appointmentId} enregistré`);
+                }
+
+                stats.appointmentsCreated++;
+                
+                notificationQueue.add('clinic-notification', {
+                    appointmentId,
+                    data
+                });
+                
+                return appointmentId;
+            } catch (error) {
+                log('ERROR', 'Erreur création rendez-vous:', error);
+                throw error;
             }
-
-            stats.appointmentsCreated++;
-            
-            notificationQueue.add('clinic-notification', {
-                appointmentId,
-                data
-            });
-            
-            return appointmentId;
         }
 
         async getAppointmentById(id) {
-            const result = await this.pool.query(
-                `SELECT r.*, c.nom_clinique, c.quartier, c.ville, c.telephone as clinique_telephone
-                 FROM rendez_vous r
-                 JOIN cliniques c ON r.id_clinique = c.id_clinique
-                 WHERE r.id = $1`,
-                [id]
-            );
-            return result.rows[0];
+            try {
+                const result = await this.pool.query(
+                    `SELECT r.*, c.nom_clinique, c.quartier, c.ville, c.telephone as clinique_telephone
+                     FROM rendez_vous r
+                     JOIN cliniques c ON r.id_clinique = c.id_clinique
+                     WHERE r.id = $1`,
+                    [id]
+                );
+                return result.rows[0];
+            } catch (error) {
+                log('ERROR', 'Erreur getAppointmentById:', error);
+                return null;
+            }
         }
     }
 
@@ -1421,39 +1558,49 @@ if (cluster.isPrimary && IS_PRODUCTION) {
         }
 
         async getOrderById(orderId) {
-            const result = await this.pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
-            if (result.rows.length === 0) return null;
+            try {
+                const result = await this.pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+                if (result.rows.length === 0) return null;
 
-            const order = result.rows[0];
-            order.items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;
-            return order;
+                const order = result.rows[0];
+                order.items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;
+                return order;
+            } catch (error) {
+                log('ERROR', 'Erreur getOrderById:', error);
+                return null;
+            }
         }
 
         async updateOrder(orderId, data) {
-            const updates = [];
-            const values = [];
-            let i = 1;
+            try {
+                const updates = [];
+                const values = [];
+                let i = 1;
 
-            if (data.status) {
-                updates.push(`status = $${i++}`);
-                values.push(data.status);
+                if (data.status) {
+                    updates.push(`status = $${i++}`);
+                    values.push(data.status);
+                }
+                if (data.livreur_phone) {
+                    updates.push(`livreur_phone = $${i++}`);
+                    values.push(data.livreur_phone);
+                }
+
+                updates.push(`updated_at = NOW()`);
+
+                const query = `
+                    UPDATE orders
+                    SET ${updates.join(', ')}
+                    WHERE id = $${i}
+                    RETURNING *
+                `;
+
+                const result = await this.pool.query(query, [...values, orderId]);
+                return result.rows[0];
+            } catch (error) {
+                log('ERROR', 'Erreur updateOrder:', error);
+                return null;
             }
-            if (data.livreur_phone) {
-                updates.push(`livreur_phone = $${i++}`);
-                values.push(data.livreur_phone);
-            }
-
-            updates.push(`updated_at = NOW()`);
-
-            const query = `
-                UPDATE orders
-                SET ${updates.join(', ')}
-                WHERE id = $${i}
-                RETURNING *
-            `;
-
-            const result = await this.pool.query(query, [...values, orderId]);
-            return result.rows[0];
         }
     }
 
@@ -1811,6 +1958,16 @@ Si médicament détecté → priorité à "rechercher_medicament".
                 log('ERROR', 'Erreur Groq intent:', error);
                 return { intent: 'fallback', entities: {} };
             }
+        }
+
+        async parseWithTimeout(message, phone, conv, timeoutMs = 5000) {
+            return Promise.race([
+                this.parse(message, phone, conv),
+                new Promise(resolve => setTimeout(() => {
+                    log('WARN', `⚠️ Groq timeout pour ${phone}`);
+                    resolve({ intent: 'fallback', entities: {} });
+                }, timeoutMs))
+            ]);
         }
     }
 
@@ -2268,7 +2425,7 @@ Analyse l'image et retourne JSON:
                     return;
                 }
 
-                if (message.startsWith('btn_')) {
+                if (message && message.startsWith('btn_')) {
                     const buttonText = message.substring(4);
                     const result = await this.buttonHandler.handleButton(phone, buttonText, conv);
                     if (result.handled && result.response) {
@@ -2278,24 +2435,26 @@ Analyse l'image et retourne JSON:
                 }
 
                 // Modération et sécurité
-                const isInjection = await this.promptGuard.detectInjection(message);
-                if (isInjection) {
-                    await this.whatsapp.sendMessage(phone, 
-                        "⛔ Désolé, je ne peux pas traiter cette demande."
-                    );
-                    return;
-                }
-                
-                const moderation = await this.groqModeration.moderate(message);
-                if (!moderation.safe) {
-                    log('WARN', `Message modéré: ${moderation.category} de ${phone}`);
-                    await this.whatsapp.sendMessage(phone,
-                        "⛔ Ce message ne peut pas être traité."
-                    );
-                    return;
+                if (message) {
+                    const isInjection = await this.promptGuard.detectInjection(message);
+                    if (isInjection) {
+                        await this.whatsapp.sendMessage(phone, 
+                            "⛔ Désolé, je ne peux pas traiter cette demande."
+                        );
+                        return;
+                    }
+                    
+                    const moderation = await this.groqModeration.moderate(message);
+                    if (!moderation.safe) {
+                        log('WARN', `Message modéré: ${moderation.category} de ${phone}`);
+                        await this.whatsapp.sendMessage(phone,
+                            "⛔ Ce message ne peut pas être traité."
+                        );
+                        return;
+                    }
                 }
 
-                const analysis = await this.groqIntent.parse(message, phone, conv);
+                const analysis = await this.groqIntent.parseWithTimeout(message, phone, conv);
                 await this.convManager.addToHistory(phone, 'user', message, analysis.intent);
 
                 if (analysis.intent === 'urgence') {
@@ -2588,109 +2747,115 @@ Analyse l'image et retourne JSON:
     }
 
     // ==================== PROCESSUS DE NOTIFICATION ====================
-    batchQueue.process('send-batch', async (job) => {
-        const { phone, messages } = job.data;
-        
-        try {
-            if (messages.length > 1) {
-                const combined = messages.map(m => m.text).join('\n---\n');
-                await axios.post(WHATSAPP_API_URL, {
-                    messaging_product: 'whatsapp',
-                    to: phone,
-                    type: 'text',
-                    text: { body: combined.substring(0, 4096) }
-                }, {
-                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                    timeout: 8000
-                });
-                log('BATCH', `${messages.length} messages combinés à ${phone}`);
-            } else {
-                await axios.post(WHATSAPP_API_URL, {
-                    messaging_product: 'whatsapp',
-                    to: phone,
-                    type: 'text',
-                    text: { body: messages[0].text.substring(0, 4096) }
-                }, {
-                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                    timeout: 8000
-                });
+    if (useRedis) {
+        batchQueue.process('send-batch', async (job) => {
+            const { phone, messages } = job.data;
+            
+            try {
+                if (messages.length > 1) {
+                    const combined = messages.map(m => m.text).join('\n---\n');
+                    await axios.post(WHATSAPP_API_URL, {
+                        messaging_product: 'whatsapp',
+                        to: phone,
+                        type: 'text',
+                        text: { body: combined.substring(0, 4096) }
+                    }, {
+                        headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                        timeout: 8000
+                    });
+                    log('BATCH', `${messages.length} messages combinés à ${phone}`);
+                } else {
+                    await axios.post(WHATSAPP_API_URL, {
+                        messaging_product: 'whatsapp',
+                        to: phone,
+                        type: 'text',
+                        text: { body: messages[0].text.substring(0, 4096) }
+                    }, {
+                        headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                        timeout: 8000
+                    });
+                }
+                return { success: true, count: messages.length };
+            } catch (error) {
+                log('ERROR', 'Erreur envoi batch:', error);
+                throw error;
             }
-            return { success: true, count: messages.length };
-        } catch (error) {
-            log('ERROR', 'Erreur envoi batch:', error);
-            throw error;
-        }
-    });
-
-    notificationQueue.process('order-notification', async (job) => {
-        const { order } = job.data;
-        
-        const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
-        const message = 
-            `📦 *NOUVELLE COMMANDE*\nID: ${order.id}\nCode: ${order.confirmation_code}\n\n👤 ${order.client_name}\n📍 ${order.client_quartier}, ${order.client_ville}\n📦 ${items}\n💰 ${order.total} FCFA`;
-
-        await whatsappService.sendUrgentMessage(SUPPORT_PHONE, message);
-    });
-
-    notificationQueue.process('notify-livreurs', async (job) => {
-        const { order } = job.data;
-        
-        const livreurResult = await pool.query(
-            'SELECT phone FROM livreurs WHERE disponible = true LIMIT 1'
-        );
-        
-        if (livreurResult.rows.length === 0) {
-            log('ERROR', 'Aucun livreur disponible');
-            return;
-        }
-        
-        const livreur = livreurResult.rows[0];
-        
-        const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
-        const message = 
-            `🛵 *NOUVELLE LIVRAISON*\nID: ${order.id}\n\n👤 ${order.client_name}\n📞 ${order.client_phone}\n📍 ${order.client_quartier}, ${order.client_ville}\n📦 ${items}\n💰 À encaisser: ${order.total} FCFA`;
-
-        await whatsappService.sendUrgentMessage(livreur.phone, message);
-        
-        await orderService.updateOrder(order.id, { 
-            livreur_phone: livreur.phone,
-            status: 'ASSIGNED'
         });
-        
-        await pool.query(
-            'UPDATE livreurs SET commandes_livrees = commandes_livrees + 1 WHERE phone = $1',
-            [livreur.phone]
-        );
-    });
 
-    notificationQueue.process('clinic-notification', async (job) => {
-        const { appointmentId, data } = job.data;
-        
-        try {
-            const clinicResult = await pool.query(
-                'SELECT nom_clinique, telephone FROM cliniques WHERE id_clinique = $1',
-                [data.id_clinique]
-            );
+        notificationQueue.process('order-notification', async (job) => {
+            const { order } = job.data;
             
-            if (clinicResult.rows.length === 0 || !clinicResult.rows[0].telephone) {
-                const fallbackMessage = 
-                    `📞 *À TRANSMETTRE*\nRDV: ${appointmentId}\n👤 ${data.patient_nom}\n📞 ${data.patient_telephone}\n📅 ${data.date_rdv} à ${data.heure_rdv}`;
-                
-                await whatsappService.sendUrgentMessage(SUPPORT_PHONE, fallbackMessage);
-                return;
-            }
-            
-            const clinique = clinicResult.rows[0];
-            
+            const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
             const message = 
-                `📅 *NOUVEAU RENDEZ-VOUS*\n🆔 ${appointmentId}\n👤 ${data.patient_nom}\n📞 ${data.patient_telephone}\n🩺 ${data.specialite}\n📅 ${data.date_rdv} à ${data.heure_rdv}`;
+                `📦 *NOUVELLE COMMANDE*\nID: ${order.id}\nCode: ${order.confirmation_code}\n\n👤 ${order.client_name}\n📍 ${order.client_quartier}, ${order.client_ville}\n📦 ${items}\n💰 ${order.total} FCFA`;
 
-            await whatsappService.sendUrgentMessage(clinique.telephone, message);
+            await whatsappService.sendUrgentMessage(SUPPORT_PHONE, message);
+        });
+
+        notificationQueue.process('notify-livreurs', async (job) => {
+            const { order } = job.data;
             
-        } catch (error) {
-            log('ERROR', 'Erreur notification clinique:', error);
-        }
-    });
+            try {
+                const livreurResult = await pool.query(
+                    'SELECT phone FROM livreurs WHERE disponible = true LIMIT 1'
+                );
+                
+                if (livreurResult.rows.length === 0) {
+                    log('ERROR', 'Aucun livreur disponible');
+                    return;
+                }
+                
+                const livreur = livreurResult.rows[0];
+                
+                const items = order.items.map(i => `• ${i.nom_commercial} x${i.quantite || 1}`).join('\n');
+                const message = 
+                    `🛵 *NOUVELLE LIVRAISON*\nID: ${order.id}\n\n👤 ${order.client_name}\n📞 ${order.client_phone}\n📍 ${order.client_quartier}, ${order.client_ville}\n📦 ${items}\n💰 À encaisser: ${order.total} FCFA`;
+
+                await whatsappService.sendUrgentMessage(livreur.phone, message);
+                
+                await orderService.updateOrder(order.id, { 
+                    livreur_phone: livreur.phone,
+                    status: 'ASSIGNED'
+                });
+                
+                await pool.query(
+                    'UPDATE livreurs SET commandes_livrees = commandes_livrees + 1 WHERE phone = $1',
+                    [livreur.phone]
+                );
+            } catch (error) {
+                log('ERROR', 'Erreur notification livreur:', error);
+            }
+        });
+
+        notificationQueue.process('clinic-notification', async (job) => {
+            const { appointmentId, data } = job.data;
+            
+            try {
+                const clinicResult = await pool.query(
+                    'SELECT nom_clinique, telephone FROM cliniques WHERE id_clinique = $1',
+                    [data.id_clinique]
+                );
+                
+                if (clinicResult.rows.length === 0 || !clinicResult.rows[0].telephone) {
+                    const fallbackMessage = 
+                        `📞 *À TRANSMETTRE*\nRDV: ${appointmentId}\n👤 ${data.patient_nom}\n📞 ${data.patient_telephone}\n📅 ${data.date_rdv} à ${data.heure_rdv}`;
+                    
+                    await whatsappService.sendUrgentMessage(SUPPORT_PHONE, fallbackMessage);
+                    return;
+                }
+                
+                const clinique = clinicResult.rows[0];
+                
+                const message = 
+                    `📅 *NOUVEAU RENDEZ-VOUS*\n🆔 ${appointmentId}\n👤 ${data.patient_nom}\n📞 ${data.patient_telephone}\n🩺 ${data.specialite}\n📅 ${data.date_rdv} à ${data.heure_rdv}`;
+
+                await whatsappService.sendUrgentMessage(clinique.telephone, message);
+                
+            } catch (error) {
+                log('ERROR', 'Erreur notification clinique:', error);
+            }
+        });
+    }
 
     // ==================== WEBHOOK WHATSAPP ====================
     app.get('/webhook', (req, res) => {
@@ -2755,34 +2920,36 @@ Analyse l'image et retourne JSON:
     });
 
     // ==================== PROCESSUS DE MESSAGE ====================
-    messageQueue.process('text-message', async (job) => {
-        const { from, text } = job.data;
-        
-        try {
-            await conversationEngine.process(from, text);
-        } catch (error) {
-            log('ERROR', 'Erreur traitement texte:', error);
-            await whatsappService.sendUrgentMessage(from, 
-                "Désolé, une erreur est survenue. 😔"
-            );
-        }
-    });
-
-    messageQueue.process('image-message', async (job) => {
-        const { from, mediaId } = job.data;
-        
-        try {
-            const response = await conversationEngine.process(from, null, mediaId);
-            if (response) {
-                await whatsappService.sendMessage(from, response);
+    if (useRedis) {
+        messageQueue.process('text-message', async (job) => {
+            const { from, text } = job.data;
+            
+            try {
+                await conversationEngine.process(from, text);
+            } catch (error) {
+                log('ERROR', 'Erreur traitement texte:', error);
+                await whatsappService.sendUrgentMessage(from, 
+                    "Désolé, une erreur est survenue. 😔"
+                );
             }
-        } catch (error) {
-            log('ERROR', 'Erreur traitement image:', error);
-            await whatsappService.sendUrgentMessage(from, 
-                "Désolé, erreur lors du traitement de l'image. 😔"
-            );
-        }
-    });
+        });
+
+        messageQueue.process('image-message', async (job) => {
+            const { from, mediaId } = job.data;
+            
+            try {
+                const response = await conversationEngine.process(from, null, mediaId);
+                if (response) {
+                    await whatsappService.sendMessage(from, response);
+                }
+            } catch (error) {
+                log('ERROR', 'Erreur traitement image:', error);
+                await whatsappService.sendUrgentMessage(from, 
+                    "Désolé, erreur lors du traitement de l'image. 😔"
+                );
+            }
+        });
+    }
 
     // ==================== ROUTES API ====================
     app.get('/', (req, res) => {
@@ -2796,15 +2963,15 @@ Analyse l'image et retourne JSON:
             delivery: delivery,
             service_fee: SERVICE_FEE,
             stats: {
-                messages: stats.messagesProcessed,
-                orders: stats.ordersCreated,
-                appointments: stats.appointmentsCreated,
-                activeUsers: stats.activeUsersSet.size,
-                groqCalls: stats.groqCalls,
-                cacheHits: stats.cacheHits,
-                cacheMisses: stats.cacheMisses,
-                errors: stats.errors,
-                uptime: Math.floor((Date.now() - stats.startTime) / 1000)
+                messages: stats.messagesProcessed || 0,
+                orders: stats.ordersCreated || 0,
+                appointments: stats.appointmentsCreated || 0,
+                activeUsers: stats.activeUsersSet ? stats.activeUsersSet.size : 0,
+                groqCalls: stats.groqCalls || 0,
+                cacheHits: stats.cacheHits || 0,
+                cacheMisses: stats.cacheMisses || 0,
+                errors: stats.errors || 0,
+                uptime: Math.floor((Date.now() - (stats.startTime || Date.now())) / 1000)
             }
         });
     });
@@ -2822,7 +2989,31 @@ Analyse l'image et retourne JSON:
         res.end(await register.metrics());
     });
 
-    app.use('/admin/queues', serverAdapter.getRouter());
+    app.get('/test', async (req, res) => {
+        const tests = {
+            redis: useRedis ? '✅' : '⚠️ (mode mémoire)',
+            postgres: await pool.query('SELECT 1').then(() => '✅').catch(() => '❌'),
+            groq: GROQ_API_KEY ? '✅' : '❌',
+            whatsapp: WHATSAPP_TOKEN ? '✅' : '❌',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            stats: {
+                messages: stats.messagesProcessed,
+                cacheHits: stats.cacheHits,
+                errors: stats.errors
+            }
+        };
+        
+        res.json({
+            status: 'ok',
+            worker: process.pid,
+            tests
+        });
+    });
+
+    if (useRedis) {
+        app.use('/admin/queues', serverAdapter.getRouter());
+    }
 
     // ==================== INITIALISATION DB ====================
     async function initDatabase() {
@@ -2958,6 +3149,11 @@ Analyse l'image et retourne JSON:
             `);
 
             log('SUCCESS', 'Base de données initialisée');
+            
+            // Vérifier la connexion
+            const result = await pool.query('SELECT NOW()');
+            log('SUCCESS', `✅ PostgreSQL connecté: ${result.rows[0].now}`);
+            
         } catch (err) {
             log('ERROR', 'Erreur DB:', err);
         }
@@ -2968,9 +3164,21 @@ Analyse l'image et retourne JSON:
         log('CACHE', 'Préchargement...');
         
         try {
-            const pharmacies = await pharmacyScraper.fetchWeek();
-            await Utils.cacheSet('pharmacies:current', pharmacies, CACHE_TTL.PHARMACIES);
-            log('CACHE', '✅ Pharmacies préchargées');
+            const pharmaciesPromise = pharmacyScraper.fetchWeek();
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout pharmacies')), 5000)
+            );
+            
+            const pharmacies = await Promise.race([pharmaciesPromise, timeoutPromise])
+                .catch(err => {
+                    log('WARN', 'Préchargement pharmacies ignoré:', err.message);
+                    return null;
+                });
+                
+            if (pharmacies) {
+                await Utils.cacheSet('pharmacies:current', pharmacies, CACHE_TTL.PHARMACIES);
+                log('CACHE', '✅ Pharmacies préchargées');
+            }
         } catch (error) {
             log('ERROR', '❌ Erreur préchargement pharmacies:', error);
         }
@@ -2978,9 +3186,12 @@ Analyse l'image et retourne JSON:
         try {
             const meds = await pool.query(
                 'SELECT * FROM medicaments ORDER BY RANDOM() LIMIT 100'
-            );
-            await Utils.cacheSet('medicaments:popular', meds.rows, CACHE_TTL.MEDICAMENTS);
-            log('CACHE', '✅ 100 médicaments en cache');
+            ).catch(() => ({ rows: [] }));
+            
+            if (meds.rows.length > 0) {
+                await Utils.cacheSet('medicaments:popular', meds.rows, CACHE_TTL.MEDICAMENTS);
+                log('CACHE', '✅ 100 médicaments en cache');
+            }
         } catch (error) {
             log('ERROR', '❌ Erreur préchargement médicaments:', error);
         }
@@ -3053,6 +3264,7 @@ Analyse l'image et retourne JSON:
     ║  Port: ${PORT}                                                     ║
     ║  Environnement: ${NODE_ENV}                                         ║
     ║  Cluster: ${numCPUs} workers                                        ║
+    ║  Redis: ${useRedis ? '✅ Connecté' : '⚠️ Mode mémoire'}                         ║
     ║                                                              ║
     ║  🔒 SÉCURITÉ: Llama Guard + Prompt Guard                     ║
     ║  📱 NOTIFICATIONS: Support, Livreur, Cliniques               ║
@@ -3090,10 +3302,12 @@ Analyse l'image et retourne JSON:
         log('INFO', 'SIGTERM reçu, arrêt gracieux...');
         server.close(() => {
             pool.end();
-            redis?.quit();
-            messageQueue.close();
-            notificationQueue.close();
-            batchQueue.close();
+            if (redis) redis.quit();
+            if (useRedis) {
+                messageQueue.close();
+                notificationQueue.close();
+                batchQueue.close();
+            }
             process.exit(0);
         });
     });

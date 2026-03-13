@@ -101,16 +101,23 @@ function log(level, message, data = null) {
 // ===========================================
 // BASE DE DONNÉES
 // ===========================================
+console.log("🟡 Création du pool PostgreSQL...");
+console.log("🔍 DATABASE_URL présent:", !!process.env.DATABASE_URL);
+
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: IS_PRODUCTION ? { rejectUnauthorized: true } : false,
+    ssl: { rejectUnauthorized: false }, // Forcer à false pour Render
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
-    statement_timeout: 10000
 });
 
-pool.on('error', (err) => log('ERROR', 'Erreur pool DB:', err));
+console.log("✅ Pool créé avec SSL: false");
+
+pool.on('error', (err) => {
+    console.error("❌ ERREUR POOL:", err);
+    log('ERROR', 'Erreur pool DB:', err);
+});
 
 // ===========================================
 // CACHE

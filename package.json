@@ -8,19 +8,19 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "express": "4.19.2",
     "axios": "1.6.8",
-    "pg": "8.11.5",
-    "node-cache": "5.1.2",
-    "groq-sdk": "0.3.3",
-    "express-rate-limit": "7.1.5",
-    "winston": "3.13.0",
-    "dotenv": "16.4.5",
-    "fuse.js": "7.0.0",
     "compression": "1.7.4",
+    "dotenv": "16.4.5",
+    "express": "4.19.2",
+    "express-rate-limit": "7.1.5",
+    "fuse.js": "7.0.0",
+    "groq-sdk": "0.3.3",
     "helmet": "7.1.0",
     "morgan": "1.10.0",
-    "node-nlp": "4.27.0"
+    "node-cache": "5.1.2",
+    "node-nlp": "^4.27.0",
+    "pg": "8.11.5",
+    "winston": "3.13.0"
   },
   "devDependencies": {
     "nodemon": "3.1.0"

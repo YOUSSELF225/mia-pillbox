@@ -2365,7 +2365,9 @@ class MariamBot {
         console.log("✅ Search initialisé");
         await this.initDatabase();
         console.log("✅ Database initialisée");
+        console.log("🟡 Tentative de chargement NLP...");
         await this.initializeNLP();
+        console.log("✅ NLP initialisé");
         console.log("✅ NLP initialisé");
     }
 
@@ -2438,6 +2440,7 @@ class MariamBot {
     async initializeNLP() {
         try {
             const modelPath = path.join(__dirname, 'model.nlp');
+        console.log("📁 Chemin du modèle NLP:", modelPath);
             
             if (!fs.existsSync(modelPath)) {
                 throw new Error(`Fichier modèle non trouvé: ${modelPath}`);

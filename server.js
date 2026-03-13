@@ -2365,10 +2365,9 @@ class MariamBot {
         console.log("✅ Search initialisé");
         await this.initDatabase();
         console.log("✅ Database initialisée");
-        console.log("🟡 Tentative de chargement NLP...");
+        console.log("🟡 Chargement du modèle NLP...");
         await this.initializeNLP();
-        console.log("✅ NLP initialisé");
-        console.log("✅ NLP initialisé");
+        console.log("✅ Bot initialisé avec succès");
     }
 
     async initDatabase() {
@@ -2439,76 +2438,35 @@ class MariamBot {
 
     async initializeNLP() {
         try {
-            const modelPath = path.join(__dirname, 'model.nlp');
-        console.log("📁 Chemin du modèle NLP:", modelPath);
+            // Pour Render - chemin absolu
+            const renderPath = '/opt/render/project/src/model.nlp';
+            
+            // Pour développement local
+            const localPath = path.join(__dirname, 'model.nlp');
+            
+            // Choisir le chemin selon l'environnement
+            const modelPath = process.env.NODE_ENV === 'production' ? renderPath : localPath;
+            
+            console.log("📁 Tentative de chargement du modèle depuis:", modelPath);
             
             if (!fs.existsSync(modelPath)) {
+                console.error(`❌ Modèle introuvable: ${modelPath}`);
+                console.log("📁 Répertoire courant:", __dirname);
+                console.log("📁 Fichiers présents:", fs.readdirSync(__dirname));
                 throw new Error(`Fichier modèle non trouvé: ${modelPath}`);
             }
 
+            console.log("✅ Modèle trouvé, chargement en cours...");
             this.nlp = new NlpManager({ languages: ['fr'] });
             await this.nlp.load(modelPath);
             
-            const test = await this.nlp.process('fr', 'bonjour');
-            if (!test.intent) {
-                throw new Error('Modèle chargé mais ne retourne pas d\'intent');
-            }
+            console.log("✅ Modèle NLP chargé avec succès");
             
-            log('SUCCESS', `✅ Modèle NLP chargé: ${modelPath}`);
-            log('INFO', `📊 Test: "bonjour" → intent: ${test.intent} (score: ${test.score})`);
-            
-            return true;
         } catch (error) {
-            log('ERROR', '❌ Échec chargement modèle NLP:', error);
-            this.nlp = null;
-            return false;
+            console.error('❌ ÉCHEC CRITIQUE - Impossible de charger le modèle NLP:', error);
+            console.error('❌ Le bot ne peut pas démarrer sans le modèle NLP');
+            process.exit(1); // Arrête le processus si le modèle n'est pas chargé
         }
-    }
-
-    fallbackNLP(text) {
-        const lowerText = text.toLowerCase();
-        let intent = 'unknown';
-        const entities = [];
-
-        if (lowerText.includes('doliprane') || lowerText.includes('paracétamol') || 
-            lowerText.includes('ibuprofène') || lowerText.includes('médicament')) {
-            intent = 'search_medicine';
-            const medicineMatch = lowerText.match(/(doliprane|paracétamol|ibuprofène|amoxicilline)/i);
-            if (medicineMatch) {
-                entities.push({ entity: 'medicine', sourceText: medicineMatch[0] });
-            }
-        } else if (lowerText.includes('panier')) {
-            intent = 'view_cart';
-        } else if (lowerText.includes('aide') || lowerText.includes('help')) {
-            intent = 'help';
-        } else if (lowerText.includes('annuler')) {
-            intent = 'cancel_order';
-        } else if (lowerText.includes('merci') || lowerText.includes('thanks')) {
-            intent = 'thanks';
-        } else if (lowerText.includes('bonjour') || lowerText.includes('salut')) {
-            intent = 'greet';
-        } else if (lowerText.includes('au revoir') || lowerText.includes('bye')) {
-            intent = 'goodbye';
-        } else if (lowerText.includes('urgence')) {
-            intent = 'emergency';
-        } else if (lowerText.includes('qui') && lowerText.includes('créé')) {
-            intent = 'ask_bot_creation';
-        }
-
-        const qtyMatch = text.match(/\d+/);
-        if (qtyMatch) {
-            entities.push({ entity: 'quantity', sourceText: qtyMatch[0] });
-        }
-
-        const quartiers = ['cité', 'balmer', 'saguitta', 'doba', 'grand bereby'];
-        for (const q of quartiers) {
-            if (lowerText.includes(q)) {
-                entities.push({ entity: 'quartier', sourceText: q });
-                break;
-            }
-        }
-
-        return { intent, entities, score: 0.5 };
     }
 
     extractEntities(entities) {
@@ -2561,25 +2519,12 @@ class MariamBot {
 
             await this.whatsapp.sendTyping(phone);
 
-            let nlpResult;
-            if (this.nlp) {
-                try {
-                    nlpResult = await this.nlp.process('fr', text);
-                    log('NLP', `🧠 Intent: ${nlpResult.intent} (score: ${nlpResult.score?.toFixed(3)})`, {
-                        entities: nlpResult.entities
-                    });
-
-                    if (nlpResult.score < 0.5) {
-                        log('WARN', `⚠️ Score faible (${nlpResult.score}), fallback utilisé`);
-                        nlpResult = this.fallbackNLP(text);
-                    }
-                } catch (nlpError) {
-                    log('ERROR', '❌ Erreur NLP, fallback utilisé:', nlpError);
-                    nlpResult = this.fallbackNLP(text);
-                }
-            } else {
-                nlpResult = this.fallbackNLP(text);
-            }
+            // Utilisation directe du NLP sans fallback
+            const nlpResult = await this.nlp.process('fr', text);
+            
+            log('NLP', `🧠 Intent: ${nlpResult.intent} (score: ${nlpResult.score?.toFixed(3)})`, {
+                entities: nlpResult.entities
+            });
 
             const entities = this.extractEntities(nlpResult.entities || []);
 
@@ -2769,30 +2714,6 @@ class MariamBot {
                 break;
 
             default:
-                const qtyMatch = nlpResult.utterance?.match(/\d+/);
-                const words = nlpResult.utterance?.toLowerCase().split(' ') || [];
-                const possibleMedicine = words.find(w => 
-                    w.length > 3 && !['pour', 'avec', 'dans', 'chez'].includes(w)
-                );
-
-                if (qtyMatch && possibleMedicine) {
-                    const qty = parseInt(qtyMatch[0]);
-                    const meds = await this.search.search(possibleMedicine, 1);
-                    
-                    if (meds.length > 0) {
-                        if (!conv.cart) conv.cart = [];
-                        conv.cart.push({ ...meds[0], quantite: qty });
-                        await this.convManager.update(phone, { cart: conv.cart });
-                        await this.whatsapp.sendMessage(phone,
-                            Utils.randomMessage(MESSAGES.ADDED_TO_CART, qty, meds[0].nom_commercial, meds[0].prix * qty, context.nom)
-                        );
-                        setTimeout(async () => {
-                            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ASK_MORE));
-                        }, 1000);
-                        return;
-                    }
-                }
-
                 await this.whatsapp.sendMessage(phone,
                     Utils.randomMessage(MESSAGES.ERROR)
                 );
@@ -3262,7 +3183,6 @@ class MariamBot {
         });
     }
 }
-
 // ===========================================
 // EXPRESS APP
 // ===========================================

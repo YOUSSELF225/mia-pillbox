@@ -3435,9 +3435,12 @@ app.get('/health', async (req, res) => {
 // DÉMARRAGE
 // ===========================================
 async function start() {
+    console.log("🔍 PORT =", process.env.PORT);
     await bot.initialize();
+    console.log("✅ Bot initialisé");
 
     const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log("✅ Serveur en cours de démarrage...");
         console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║

@@ -42,7 +42,7 @@ if (missing.length > 0) {
 // ===========================================
 // CONFIGURATION
 // ===========================================
-const PORT = process.env.PORT || 10000;
+const PORT = 10000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const IS_PRODUCTION = NODE_ENV === 'production';
 
@@ -1255,6 +1255,7 @@ class SearchService {
     }
 
     async initialize() {
+        console.log("🟡 Début initialize()...");
         try {
             const result = await pool.query(`
                 SELECT
@@ -2359,9 +2360,13 @@ class MariamBot {
     }
 
     async initialize() {
+        console.log("🟡 Début initialize()...");
         await this.search.initialize();
+        console.log("✅ Search initialisé");
         await this.initDatabase();
+        console.log("✅ Database initialisée");
         await this.initializeNLP();
+        console.log("✅ NLP initialisé");
     }
 
     async initDatabase() {

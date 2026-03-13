@@ -1,12 +1,6 @@
-# render.yaml
 services:
   - type: web
-    name: mia-pillbox
+    name: mariam-bot
     env: node
-    buildCommand: npm install && npm rebuild
+    buildCommand: npm install
     startCommand: node server.js
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: PORT
-        value: 10000

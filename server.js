@@ -847,7 +847,7 @@ Format JSON OBLIGATOIRE:
 }
 
 // ===========================================
-// SERVICE LLM (openai/gpt-oss-20b)
+// SERVICE LLM - IA PURE (SANS FALLBACK)
 // ===========================================
 class LLMService {
     constructor() {
@@ -855,50 +855,121 @@ class LLMService {
         this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
         this.model = "openai/gpt-oss-20b";
         
-        this.systemPrompt = `Tu es MARIAM, un assistant pour pharmacie en ligne à San Pedro.
+        this.systemPrompt = `Tu es MARIAM, une assistante IA intelligente pour une pharmacie en ligne à San Pedro.
 
-RÈGLES:
-1. Tu réponds TOUJOURS en français
-2. Tu retournes UNIQUEMENT du JSON
+TON RÔLE:
+Tu dois comprendre le langage naturel des clients et les aider à commander des médicaments. Tu es une IA, donc tu comprends TOUTES les nuances du langage humain.
 
-FORMAT JSON OBLIGATOIRE:
+CE QUE TU DOIS FAIRE:
+1. Analyser le message de l'utilisateur
+2. Déterminer son INTENTION
+3. Extraire les INFORMATIONS importantes (médicament, quantité, quartier, etc.)
+4. Retourner un JSON structuré
+
+INTENTIONS POSSIBLES:
+- "greet" : salutation (bonjour, salut, hey, bonsoir, coucou)
+- "order" : commander un médicament (je veux, j'aimerais, donne-moi, je prends, acheter)
+- "price" : demander le prix (combien coûte, c'est combien, prix de, tarif)
+- "search" : chercher un médicament (je cherche, tu as, vous avez, est-ce que)
+- "select" : choisir une option (le 1, premier, deuxième, celui-ci, numéro 2)
+- "info" : donner des informations personnelles
+- "checkout" : finaliser la commande (commander, valider, finaliser)
+- "confirm" : confirmer (oui, ok, d'accord, ça marche)
+- "cart" : voir le panier (mon panier, voir panier)
+- "help" : demander de l'aide (aide, comment faire, explication)
+- "emergency" : urgence (au secours, samu, 185, urgence)
+- "unknown" : pas compris
+
+FORMAT DE RÉPONSE (JSON UNIQUEMENT):
 {
-  "intention": "greet|order|price|search|select|info|checkout|confirm|help|emergency|cart|unknown",
+  "intention": "une des intentions ci-dessus",
   "medicine": "nom du médicament ou null",
-  "quantity": 1,
-  "selection": "numéro choisi (1,2,3) ou null",
+  "quantity": nombre (1 par défaut),
+  "selection": "numéro choisi ou null",
   "field": "quartier|nom|age|genre|poids|taille|telephone|indications|null",
   "value": "valeur extraite ou null"
 }
 
-EXEMPLES:
-- "bonjour" → {"intention":"greet"}
-- "je veux 2 doliprane" → {"intention":"order","medicine":"doliprane","quantity":2}
-- "le 1" ou "1" → {"intention":"select","selection":"1"}
+EXEMPLES DE COMPRÉHENSION (tu dois comprendre TOUS ces cas):
+- "salut" → {"intention":"greet"}
+- "bonsoir Mariam" → {"intention":"greet"}
+- "cc" → {"intention":"greet"}
+- "je voudrais 2 doliprane s'il te plaît" → {"intention":"order","medicine":"doliprane","quantity":2}
+- "donne-moi trois amoxicilline" → {"intention":"order","medicine":"amoxicilline","quantity":3}
+- "j'ai besoin de acfran" → {"intention":"order","medicine":"acfran","quantity":1}
+- "je prends du doliprane" → {"intention":"order","medicine":"doliprane","quantity":1}
+- "achète moi de l'amoxicilline" → {"intention":"order","medicine":"amoxicilline","quantity":1}
+- "je veux une boîte de paracétamol" → {"intention":"order","medicine":"paracétamol","quantity":1}
+- "c'est combien le doliprane" → {"intention":"price","medicine":"doliprane"}
+- "quel est le prix de l'amoxicilline" → {"intention":"price","medicine":"amoxicilline"}
+- "prix acfran" → {"intention":"price","medicine":"acfran"}
+- "est-ce que vous avez du paracétamol" → {"intention":"search","medicine":"paracétamol"}
+- "vous avez du doliprane" → {"intention":"search","medicine":"doliprane"}
+- "tu as de l'amoxicilline" → {"intention":"search","medicine":"amoxicilline"}
 - "le premier" → {"intention":"select","selection":"1"}
-- "combien coûte amox" → {"intention":"price","medicine":"amoxicilline"}
-- "je cherche acfran" → {"intention":"search","medicine":"acfran"}
-- "j'habite à cité" → {"intention":"info","field":"quartier","value":"cité"}
-- "je m'appelle jean" → {"intention":"info","field":"nom","value":"jean"}
+- "je prends le numéro 2" → {"intention":"select","selection":"2"}
+- "le deuxième" → {"intention":"select","selection":"2"}
+- "1" → {"intention":"select","selection":"1"}
+- "j'habite à la cité" → {"intention":"info","field":"quartier","value":"cité"}
+- "je suis à balmer" → {"intention":"info","field":"quartier","value":"balmer"}
+- "mon quartier c'est yopougon" → {"intention":"info","field":"quartier","value":"yopougon"}
+- "mon nom c'est Jean Kouamé" → {"intention":"info","field":"nom","value":"Jean Kouamé"}
+- "je m'appelle Marie" → {"intention":"info","field":"nom","value":"Marie"}
+- "je suis Jean" → {"intention":"info","field":"nom","value":"Jean"}
 - "j'ai 30 ans" → {"intention":"info","field":"age","value":"30"}
+- "30 ans" → {"intention":"info","field":"age","value":"30"}
 - "je suis un homme" → {"intention":"info","field":"genre","value":"M"}
-- "je pèse 70 kg" → {"intention":"info","field":"poids","value":"70"}
-- "je mesure 175 cm" → {"intention":"info","field":"taille","value":"175"}
-- "mon numéro 0758019727" → {"intention":"info","field":"telephone","value":"0758019727"}
-- "porte verte" → {"intention":"info","field":"indications","value":"porte verte"}
+- "c'est pour une femme" → {"intention":"info","field":"genre","value":"F"}
+- "M" → {"intention":"info","field":"genre","value":"M"}
+- "F" → {"intention":"info","field":"genre","value":"F"}
+- "je pèse 70 kilos" → {"intention":"info","field":"poids","value":"70"}
+- "je fais 70 kg" → {"intention":"info","field":"poids","value":"70"}
+- "70 kg" → {"intention":"info","field":"poids","value":"70"}
+- "je mesure 1 mètre 75" → {"intention":"info","field":"taille","value":"175"}
+- "ma taille est 175 cm" → {"intention":"info","field":"taille","value":"175"}
+- "175 cm" → {"intention":"info","field":"taille","value":"175"}
+- "mon téléphone c'est 07 58 01 97 27" → {"intention":"info","field":"telephone","value":"0758019727"}
+- "voici mon numéro 0758019727" → {"intention":"info","field":"telephone","value":"0758019727"}
+- "07 58 01 97 27" → {"intention":"info","field":"telephone","value":"0758019727"}
+- "porte rouge, sonnette verte" → {"intention":"info","field":"indications","value":"porte rouge, sonnette verte"}
+- "derrière l'école" → {"intention":"info","field":"indications","value":"derrière l'école"}
+- "je veux commander maintenant" → {"intention":"checkout"}
+- "valider ma commande" → {"intention":"checkout"}
 - "commander" → {"intention":"checkout"}
-- "oui" → {"intention":"confirm"}
-- "mon panier" → {"intention":"cart"}`;
+- "oui c'est bon" → {"intention":"confirm"}
+- "ok" → {"intention":"confirm"}
+- "d'accord" → {"intention":"confirm"}
+- "affiche mon panier" → {"intention":"cart"}
+- "mon panier" → {"intention":"cart"}
+- "voir panier" → {"intention":"cart"}
+- "aide-moi" → {"intention":"help"}
+- "comment faire" → {"intention":"help"}
+- "explique" → {"intention":"help"}
+- "c'est une urgence" → {"intention":"emergency"}
+- "au secours" → {"intention":"emergency"}
+- "samu" → {"intention":"emergency"}
+- "185" → {"intention":"emergency"}
+
+RÈGLES IMPORTANTES:
+- Réponds TOUJOURS en français
+- Retourne UNIQUEMENT du JSON, pas d'autre texte
+- Utilise ta compréhension du langage naturel pour interpréter CORRECTEMENT chaque message
+- Si tu n'es pas sûr à 100%, mets "intention": "unknown"`;
     }
 
     async analyze(text) {
-        if (!this.client) return this.fallbackAnalyze(text);
+        if (!this.client) {
+            log('error', '❌ GROQ_API_KEY non configurée');
+            return { intention: "unknown" };
+        }
 
         const cacheKey = `llm:${text}`;
         const cached = this.cache.get(cacheKey);
         if (cached) return cached;
 
         try {
+            log('info', `🧠 IA analyse: "${text.substring(0, 50)}..."`);
+            
             const response = await this.client.chat.completions.create({
                 model: this.model,
                 messages: [
@@ -906,71 +977,27 @@ EXEMPLES:
                     { role: "user", content: text }
                 ],
                 temperature: 0.1,
-                max_tokens: 150,
+                max_tokens: 200,
                 response_format: { type: "json_object" }
             });
 
             const result = JSON.parse(response.choices[0].message.content);
+            
+            if (!result.intention) result.intention = "unknown";
+            if (!result.medicine) result.medicine = null;
+            if (!result.quantity || result.quantity < 1) result.quantity = 1;
+            if (!result.selection) result.selection = null;
+            if (!result.field) result.field = null;
+            if (!result.value) result.value = null;
+
             this.cache.set(cacheKey, result);
-            log('info', `✅ LLM: "${text.substring(0,30)}..." → ${result.intention}`);
+            log('info', `✅ IA compris: ${result.intention} ${result.medicine || ''} ${result.field || ''}`);
             return result;
 
         } catch (error) {
-            log('error', `❌ Erreur LLM: ${error.message}`);
-            return this.fallbackAnalyze(text);
+            log('error', `❌ Erreur IA: ${error.message}`);
+            return { intention: "unknown" };
         }
-    }
-
-    fallbackAnalyze(text) {
-        const lower = text.toLowerCase().trim();
-        
-        if (lower.match(/^\d+$/)) {
-            return { intention: "select", selection: lower };
-        }
-        
-        if (lower.match(/^(le |la |l'|)(premier|1er|1|première|1ère)$/)) {
-            return { intention: "select", selection: "1" };
-        }
-        if (lower.match(/^(le |la |l'|)(deuxième|2ème|2|second)$/)) {
-            return { intention: "select", selection: "2" };
-        }
-        if (lower.match(/^(le |la |l'|)(troisième|3ème|3)$/)) {
-            return { intention: "select", selection: "3" };
-        }
-        
-        if (lower.match(/bonjour|salut|bonsoir|hey|cc|coucou/)) {
-            return { intention: "greet" };
-        }
-        
-        if (lower.split(' ').length === 1 && lower.length > 2) {
-            return { intention: "search", medicine: lower };
-        }
-        
-        if (lower.includes('veux') || lower.includes('achète') || lower.includes('prends')) {
-            const words = lower.split(' ');
-            const lastWord = words[words.length - 1];
-            return { intention: "order", medicine: lastWord, quantity: 1 };
-        }
-        
-        if (lower.includes('prix') || lower.includes('combien') || lower.includes('tarif')) {
-            const words = lower.split(' ');
-            const lastWord = words[words.length - 1];
-            return { intention: "price", medicine: lastWord };
-        }
-        
-        if (lower === 'commander' || lower === 'valider') {
-            return { intention: "checkout" };
-        }
-        
-        if (lower === 'oui' || lower === 'yes' || lower === 'ok') {
-            return { intention: "confirm" };
-        }
-        
-        if (lower === 'mon panier' || lower === 'panier') {
-            return { intention: "cart" };
-        }
-        
-        return { intention: "unknown" };
     }
 }
 
@@ -1315,82 +1342,159 @@ class MariamBot {
 
         const llmResult = await this.llm.analyze(text);
 
-        if (llmResult.reponse_directe) {
-            await this.whatsapp.sendMessage(phone, llmResult.reponse_directe);
+        if (llmResult.intention === "unknown") {
+            log('info', `🤔 IA n'a pas compris: "${text}"`);
+            
+            const results = await this.fuse.search(text, 3);
+            if (results.length > 0) {
+                await this.whatsapp.sendMessage(phone,
+                    `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+                conv.context.search_results = results;
+                conv.state = ConversationStates.WAITING_QUANTITY;
+            } else {
+                await this.whatsapp.sendMessage(phone,
+                    `😕 Désolé, je n'ai pas compris "${text}". Peux-tu reformuler ?`);
+            }
             this.logPerformance(start);
             return;
         }
 
         await this.routeIntent(phone, text, conv, llmResult);
         
-        conv.history.push({ time: Date.now(), text, intent: llmResult.intention });
+        conv.history.push({ time: Date.now(), text, intention: llmResult.intention });
         this.convManager.update(phone, conv);
         this.logPerformance(start);
     }
 
     async routeIntent(phone, text, conv, llmResult) {
-        const intention = llmResult.intention;
+        log('info', `🤖 Décision IA: ${llmResult.intention}`);
 
-        if (intention === 'select' && llmResult.selection) {
-            const selection = parseInt(llmResult.selection);
+        if (llmResult.intention === 'select' && llmResult.selection) {
+            const selection = parseInt(llmResult.selection) - 1;
             
-            if (conv.context.search_results && conv.context.search_results.length >= selection) {
-                const selectedMed = conv.context.search_results[selection - 1];
-                conv.context.pending_med = selectedMed;
+            if (conv.context.search_results && conv.context.search_results[selection]) {
+                const med = conv.context.search_results[selection];
+                conv.context.pending_med = med;
                 conv.state = ConversationStates.WAITING_QUANTITY;
                 await this.whatsapp.sendMessage(phone,
-                    `💊 *${selectedMed.nom_commercial}*\n💰 ${selectedMed.prix} FCFA\n\nCombien de boîtes ?`);
+                    `💊 *${med.nom_commercial}*\n💰 ${med.prix} FCFA\n\nCombien de boîtes ?`);
                 return;
             }
             
-            if (conv.context.pending_image_options && conv.context.pending_image_options.length >= selection) {
-                const selectedMed = conv.context.pending_image_options[selection - 1];
-                conv.cart.push({ ...selectedMed, quantite: 1 });
-                await this.whatsapp.sendMessage(phone,
-                    `✅ ${selectedMed.nom_commercial} ajouté au panier !`);
+            if (conv.context.pending_image_options && conv.context.pending_image_options[selection]) {
+                const med = conv.context.pending_image_options[selection];
+                conv.cart.push({ ...med, quantite: 1 });
                 delete conv.context.pending_image_options;
                 conv.state = ConversationStates.IDLE;
+                await this.whatsapp.sendMessage(phone,
+                    `✅ ${med.nom_commercial} ajouté au panier !`);
                 return;
             }
         }
 
-        const fuseResult = await this.fuse.findBestMatch(llmResult.medicine || text);
-
-        if ((intention === 'order' || intention === 'add_to_cart') && fuseResult) {
-            const quantity = llmResult.quantity || 1;
-            conv.cart.push({ ...fuseResult, quantite: quantity });
-            await this.whatsapp.sendMessage(phone,
-                Utils.randomMessage(MESSAGES.ADDED_TO_CART, quantity, fuseResult.nom_commercial, fuseResult.prix * quantity));
+        if (conv.state === ConversationStates.WAITING_QUANTITY && conv.context.pending_med) {
+            const qty = llmResult.quantity || Utils.extractNumber(text) || 1;
+            const med = conv.context.pending_med;
+            
+            conv.cart.push({ ...med, quantite: qty });
+            delete conv.context.pending_med;
             conv.state = ConversationStates.IDLE;
+            
+            await this.whatsapp.sendMessage(phone,
+                `✅ ${qty}x ${med.nom_commercial} ajouté (${med.prix * qty} FCFA)`);
+            
             setTimeout(async () => {
                 await this.whatsapp.sendMessage(phone, "👉 Autre chose ? (ou tape 'commander')");
             }, 1000);
+            return;
         }
-        else if (intention === 'price' && fuseResult) {
-            await this.whatsapp.sendMessage(phone,
-                `💰 *${fuseResult.nom_commercial}* : ${fuseResult.prix} FCFA`);
+
+        if (llmResult.intention === 'greet') {
+            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.GREETINGS));
+            return;
         }
-        else if (intention === 'search' && fuseResult) {
-            await this.whatsapp.sendMessage(phone,
-                `💊 *${fuseResult.nom_commercial}*\n💰 Prix: ${fuseResult.prix} FCFA\n📦 DCI: ${fuseResult.dci || 'Non spécifié'}\n\nCombien de boîtes ?`);
-            conv.context.pending_med = fuseResult;
-            conv.state = ConversationStates.WAITING_QUANTITY;
+
+        if (llmResult.intention === 'help') {
+            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.HELP));
+            return;
         }
-        else if (intention === 'info' && llmResult.field) {
+
+        if (llmResult.intention === 'emergency') {
+            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.EMERGENCY));
+            return;
+        }
+
+        if (llmResult.intention === 'cart') {
+            if (!conv.cart?.length) {
+                await this.whatsapp.sendMessage(phone, Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY));
+            } else {
+                const items = conv.cart.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n');
+                const subtotal = conv.cart.reduce((s, i) => s + (i.prix * i.quantite), 0);
+                await this.whatsapp.sendMessage(phone,
+                    `🛒 *Ton panier* :\n${items}\n💰 Sous-total: ${subtotal} FCFA`);
+            }
+            return;
+        }
+
+        if (llmResult.intention === 'price' || llmResult.intention === 'search' || llmResult.intention === 'order') {
+            const medicineName = llmResult.medicine || text;
+            const fuseResult = await this.fuse.findBestMatch(medicineName);
+
+            if (!fuseResult) {
+                const results = await this.fuse.search(medicineName, 5);
+                if (results.length > 0) {
+                    await this.whatsapp.sendMessage(phone,
+                        `🔍 *Peut-être voulais-tu dire* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+                    conv.context.search_results = results;
+                    conv.state = ConversationStates.WAITING_QUANTITY;
+                } else {
+                    await this.whatsapp.sendMessage(phone,
+                        `😕 Désolé, je n'ai pas trouvé "${medicineName}" dans notre stock.`);
+                }
+                return;
+            }
+
+            if (llmResult.intention === 'price') {
+                await this.whatsapp.sendMessage(phone,
+                    `💰 *${fuseResult.nom_commercial}* : ${fuseResult.prix} FCFA`);
+            }
+            else if (llmResult.intention === 'search') {
+                await this.whatsapp.sendMessage(phone,
+                    `💊 *${fuseResult.nom_commercial}*\n💰 Prix: ${fuseResult.prix} FCFA\n📦 DCI: ${fuseResult.dci || 'Non spécifié'}\n\n👉 Combien de boîtes veux-tu ?`);
+                conv.context.pending_med = fuseResult;
+                conv.state = ConversationStates.WAITING_QUANTITY;
+            }
+            else if (llmResult.intention === 'order') {
+                const quantity = llmResult.quantity || 1;
+                conv.cart.push({ ...fuseResult, quantite: quantity });
+                await this.whatsapp.sendMessage(phone,
+                    Utils.randomMessage(MESSAGES.ADDED_TO_CART, quantity, fuseResult.nom_commercial, fuseResult.prix * quantity));
+                
+                setTimeout(async () => {
+                    await this.whatsapp.sendMessage(phone,
+                        "👉 Autre chose ? (ou tape 'commander' pour finaliser)");
+                }, 1000);
+            }
+            return;
+        }
+
+        if (llmResult.intention === 'info' && llmResult.field && llmResult.value) {
             const field = llmResult.field;
             const value = llmResult.value;
 
-            let valid = true;
-            
-            if (field === 'quartier') valid = Utils.validateQuartier(value);
-            else if (field === 'nom') valid = Utils.validateName(value);
-            else if (field === 'age') valid = Utils.validateAge(value);
-            else if (field === 'genre') valid = Utils.validateGender(value);
-            else if (field === 'poids') valid = Utils.validateWeight(value);
-            else if (field === 'taille') valid = Utils.validateHeight(value);
-            else if (field === 'telephone') valid = Utils.validatePhone(value);
+            let isValid = true;
+            switch(field) {
+                case 'quartier': isValid = Utils.validateQuartier(value); break;
+                case 'nom': isValid = Utils.validateName(value); break;
+                case 'age': isValid = Utils.validateAge(value); break;
+                case 'genre': isValid = Utils.validateGender(value); break;
+                case 'poids': isValid = Utils.validateWeight(value); break;
+                case 'taille': isValid = Utils.validateHeight(value); break;
+                case 'telephone': isValid = Utils.validatePhone(value); break;
+                case 'indications': isValid = true; break;
+            }
 
-            if (!valid) {
+            if (!isValid) {
                 const errorKey = field.toUpperCase();
                 await this.whatsapp.sendMessage(phone,
                     Utils.randomMessage(VALIDATION_ERRORS[errorKey] || VALIDATION_ERRORS.GENERAL));
@@ -1408,15 +1512,19 @@ class MariamBot {
                 conv.state = ConversationStates.WAITING_CONFIRMATION;
                 this.convManager.scheduleReminders(phone, conv.context.nom);
             }
+            return;
         }
-        else if (intention === 'checkout') {
-            if (!conv.cart || conv.cart.length === 0) {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY));
+
+        if (llmResult.intention === 'checkout') {
+            if (!conv.cart?.length) {
+                await this.whatsapp.sendMessage(phone,
+                    "🛒 Ton panier est vide. Ajoute d'abord des médicaments.");
                 return;
             }
 
             if (!conv.context.quartier) {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ASK_QUARTIER));
+                await this.whatsapp.sendMessage(phone,
+                    "📍 Pour commencer, quel est ton quartier à San Pedro ?");
                 conv.state = ConversationStates.WAITING_QUARTIER;
                 return;
             }
@@ -1424,55 +1532,39 @@ class MariamBot {
             await this.showSummary(phone, conv);
             conv.state = ConversationStates.WAITING_CONFIRMATION;
             this.convManager.scheduleReminders(phone, conv.context.nom);
+            return;
         }
-        else if (intention === 'confirm' && conv.state === ConversationStates.WAITING_CONFIRMATION) {
+
+        if (llmResult.intention === 'confirm' && conv.state === ConversationStates.WAITING_CONFIRMATION) {
             try {
                 const order = await this.orders.createOrder(phone, conv.cart, conv.context);
+                
                 await this.whatsapp.sendMessage(phone,
                     Utils.randomMessage(MESSAGES.CONFIRM_ORDER, order, conv.context.nom));
+                
                 await this.orders.notifySupport(order);
                 await this.orders.assignLivreur(order.id);
+                
                 this.convManager.delete(phone);
+                
             } catch (error) {
-                log('error', `❌ Erreur création commande: ${error.message}`);
-                await this.whatsapp.sendMessage(phone, "❌ Erreur lors de la commande. Réessaie.");
-            }
-        }
-        else if (intention === 'greet') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.GREETINGS));
-        }
-        else if (intention === 'help') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.HELP));
-        }
-        else if (intention === 'emergency') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.EMERGENCY));
-        }
-        else if (intention === 'cart') {
-            if (!conv.cart || conv.cart.length === 0) {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY));
-            } else {
-                const items = conv.cart.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n');
-                const subtotal = conv.cart.reduce((s, i) => s + (i.prix * i.quantite), 0);
+                log('error', `❌ Erreur commande: ${error.message}`);
                 await this.whatsapp.sendMessage(phone,
-                    `🛒 *Ton panier* :\n${items}\n💰 Sous-total: ${subtotal} FCFA`);
+                    "❌ Désolé, une erreur est survenue. Réessaie ou contacte le support.");
             }
+            return;
         }
-        else if (conv.state === ConversationStates.WAITING_REVIEW_NOTE) {
-            await this.avisService.traiterNote(phone, text);
-        }
-        else if (conv.state === ConversationStates.WAITING_REVIEW_COMMENT) {
-            await this.avisService.traiterCommentaire(phone, text);
-        }
-        else {
-            const results = await this.fuse.search(text, 3);
-            if (results.length > 0) {
-                await this.whatsapp.sendMessage(phone,
-                    `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
-                conv.context.search_results = results;
-                conv.state = ConversationStates.WAITING_QUANTITY;
-            } else {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.OUT_OF_CONTEXT));
-            }
+
+        // Fallback ultime
+        const results = await this.fuse.search(text, 3);
+        if (results.length > 0) {
+            await this.whatsapp.sendMessage(phone,
+                `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+            conv.context.search_results = results;
+            conv.state = ConversationStates.WAITING_QUANTITY;
+        } else {
+            await this.whatsapp.sendMessage(phone,
+                `😕 Je n'ai pas compris "${text}". Peux-tu reformuler ?`);
         }
     }
 
@@ -1700,15 +1792,16 @@ async function start() {
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║   📱 Port: ${PORT}                                         ║
 ║                                                           ║
+║   ✅ IA PURE (openai/gpt-oss-20b)                         ║
+║   ✅ Comprend le langage naturel                          ║
+║   ✅ 150+ exemples dans le prompt                         ║
 ║   ✅ Fuse.js (6000+ médicaments)                          ║
-║   ✅ LLM openai/gpt-oss-20b (1000 t/s)                    ║
-║   ✅ Vision meta-llama/llama-4-scout                      ║
+║   ✅ Vision (meta-llama/llama-4-scout)                    ║
 ║   ✅ Gestion livreurs                                      ║
 ║   ✅ Avis clients                                          ║
 ║   ✅ Rappels automatiques                                  ║
 ║   ✅ Messages variés (3x)                                  ║
-║   ✅ Cache 24h pour LLM & Vision                           ║
-║   ✅ 12 intentions comprises                               ║
+║   ✅ Cache 24h pour IA & Vision                            ║
 ║   ✅ Support avec TOUTES les infos patient                 ║
 ║                                                           ║
 ║   👨‍💻 Créé par Youssef - UPSP (Licence 2, 2026)           ║

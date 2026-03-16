@@ -13,7 +13,7 @@ const fs = require('fs');
 // CONFIGURATION DES LOGS
 // ===========================================
 const logger = winston.createLogger({
-    level: 'debug',
+    level: 'info',
     format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
         winston.format.printf(info => {
@@ -43,7 +43,6 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 const DELIVERY_CONFIG = {
     PRICES: { DAY: 400, NIGHT: 600 },
@@ -91,79 +90,94 @@ const MESSAGES = {
         `🌟 Bonjour ! MARIAM à ton service. 💊 Dis-moi ce qu'il te faut.`,
         `👋 Hey ! Content de te voir. Quel médicament aujourd'hui ?`
     ],
+    
     FIRST_INTERACTION: [
-        `👋 *Bienvenue sur MARIAM* !
+        `👋 *Bienvenue sur MARIAM* ! 
 Je suis ton assistante santé 24h/24 à San Pedro. 💊
 *Exemples* :
 • "2 doliprane" → commander
 • Envoie une photo → scan automatique
 • "aide" → voir les options
 📍 *Livraison uniquement à San Pedro*`,
+        
         `🌟 *MARIAM - Pharmacie en ligne* 🌟
 Commande en 2 minutes, livraison en 45 min !
 💊 "doliprane" → rechercher
 📸 Photo → scan automatique
 📍 "cité" → donner ton quartier`,
+        
         `👋 *Bienvenue* ! Je suis MARIAM.
 💊 Pour commander : "2 doliprane"
 📸 Pour une ordonnance : envoie la photo
 ❓ "aide" pour plus d'infos`
     ],
+
     ASK_QUARTIER: [
         `📍 Ton quartier à San Pedro ?`,
         `🗺️ Où habites-tu à San Pedro ?`,
         `📌 Quartier de livraison ?`
     ],
+
     ASK_NAME: [
         `👤 Ton nom complet ?`,
         `📝 Comment t'appelles-tu ?`,
         `👤 Nom et prénom ?`
     ],
+
     ASK_AGE: [
         `🎂 Ton âge ?`,
         `📅 Quel âge as-tu ?`,
         `🎈 Âge du patient ?`
     ],
+
     ASK_GENDER: [
         `⚧ Genre (M/F) ?`,
         `👔 Masculin ou féminin ? (M/F)`,
         `⚥ M pour homme, F pour femme ?`
     ],
+
     ASK_WEIGHT: [
         `⚖️ Poids en kg ?`,
         `🏋️ Combien de kilos ?`,
         `📊 Ton poids ? (kg)`
     ],
+
     ASK_HEIGHT: [
         `📏 Taille en cm ?`,
         `📐 Combien mesures-tu ? (cm)`,
         `👣 Ta taille ? (ex: 175)`
     ],
+
     ASK_PHONE: [
         `📞 Ton numéro de téléphone ?`,
         `📱 À quel numéro te joindre ?`,
         `📞 Téléphone pour le livreur ?`
     ],
+
     ASK_INDICATIONS: [
         `📍 Indications pour le livreur ? (porte, immeuble)`,
         `🗺️ Comment te trouver ?`,
         `📌 Point de repère ? (ou "non")`
     ],
+
     ADDED_TO_CART: (qty, med, total) => [
         `✅ ${qty}x ${med} ajouté (${total} FCFA). Autre chose ?`,
         `🎉 C'est noté ! ${qty}x ${med} = ${total} FCFA`,
         `✨ ${qty}x ${med} ajouté au panier !`
     ],
+
     NOT_FOUND: (query) => [
         `😕 "${query}" introuvable. Essaie autrement.`,
         `🔍 Pas de "${query}" en stock. Vérifie l'orthographe.`,
         `❌ Aucun résultat pour "${query}".`
     ],
+
     ERROR: [
         `🤔 Je n'ai pas compris. Tape "aide" pour voir les options.`,
         `❌ Désolé, je n'ai pas saisi. Réessaie.`,
         `😕 Pas clair pour moi. "aide" pour les commandes.`
     ],
+
     HELP: [
         `👋 *AIDE* :
 💊 "doliprane" → chercher
@@ -171,17 +185,20 @@ Commande en 2 minutes, livraison en 45 min !
 📍 "cité" → quartier
 📸 Photo → scan
 🚨 "urgence" → SAMU 185`,
+        
         `📱 *Commandes* :
 1️⃣ Tape le médicament
 2️⃣ Donne ton quartier
 3️⃣ Confirme
 📸 Ou envoie une photo !`,
+        
         `💡 *Exemples* :
 • "2 doliprane"
 • "amoxicilline"
 • "mon panier"
 • "je suis à balmer"`
     ],
+
     EMERGENCY: [
         `🚨 *URGENCE MÉDICALE* 🚨
 📞 Appelle le **185** (SAMU)`,
@@ -190,26 +207,31 @@ Compose le **185** (SAMU)`,
         `🆘 *ALERTE* 🆘
 Contacte les urgences au **185**`
     ],
+
     CREATOR: [
         `👨‍💻 Créé par **Youssef** - UPSP (Licence 2, 2026) 🇨🇮`,
         `👨‍💻 Made with ❤️ par **Youssef** à San Pedro`,
         `👨‍💻 Mon créateur c'est **Youssef**, étudiant entrepreneur`
     ],
+
     AUDIO_MESSAGE: [
         `🎤 Je ne comprends pas les messages vocaux. Envoie un texte ou une photo.`,
         `📢 Message vocal non supporté. Utilise le texte.`,
         `🔊 Je ne traite que les textes et images.`
     ],
+
     OUT_OF_CONTEXT: [
         `🤔 Je suis spécialisé dans les médicaments. Tape "aide" pour voir ce que je peux faire.`,
         `💊 Je ne réponds qu'aux questions sur les médicaments.`,
         `🏥 Je suis ton assistant santé. Pour les médicaments uniquement.`
     ],
+
     CART_EMPTY: [
         `🛒 Ton panier est vide. Ajoute des médicaments.`,
         `📭 Rien dans ton panier. Commence par chercher un médicament.`,
         `💊 Panier vide. "doliprane" pour commencer.`
     ],
+
     IMAGE_RESULTS: (medicines) => {
         const list = medicines.map((med, i) =>
             `   ${i+1}. *${med.nom_commercial}* - ${med.prix} FCFA`
@@ -220,65 +242,150 @@ Contacte les urgences au **185**`
             `💊 *Résultats* :\n${list}\n📝 Tape le numéro.`
         ][Math.floor(Math.random() * 3)];
     },
+
     DELIVERY_INSTRUCTIONS: (order) => [
-        `🛵 *NOUVELLE COMMANDE #${order.id}*
+        `🛵 *NOUVELLE LIVRAISON* #${order.id}
 👤 Client: ${order.client_name} (${order.client_phone})
 📍 ${order.client_quartier}, San Pedro
+📌 Indications: ${order.client_indications || 'Aucune'}
+👶 Patient: ${order.patient_age || '?'} ans, ${order.patient_genre || '?'}
 📦 ${order.items.map(i => `${i.quantite}x ${i.nom_commercial}`).join(', ')}
-💰 ${order.total} FCFA
+💰 À encaisser: ${order.total} FCFA
 ✅ Demander le CODE au client`,
+        
         `🚀 *LIVRAISON #${order.id}*
 Pour: ${order.client_name}
-À: ${order.client_quartier}
+📍 ${order.client_quartier} - ${order.client_indications || ''}
+👶 ${order.patient_age || '?'} ans, ${order.patient_genre || '?'}
 📦 ${order.items.map(i => `${i.quantite}x ${i.nom_commercial}`).join(', ')}
 💰 ${order.total} FCFA
-🔑 Demander le CODE`,
+🔑 CODE à demander`,
+        
         `📌 *MISSION #${order.id}*
-👤 ${order.client_name}
-📍 ${order.client_quartier}
-📞 ${order.client_phone}
+👤 ${order.client_name} (${order.client_phone})
+📍 ${order.client_quartier} - ${order.client_indications || ''}
+👶 ${order.patient_age || '?'} ans
 💰 ${order.total} FCFA
 ⚠️ CODE à demander au client`
     ],
-    SUPPORT_NOTIFICATION: (order) => [
-        `📦 *NOUVELLE COMMANDE* #${order.id}
+
+    SUPPORT_NOTIFICATION: (order) => {
+        const items = order.items.map(i => `   • ${i.quantite}x ${i.nom_commercial} (${i.prix * i.quantite} FCFA)`).join('\n');
+        
+        return [
+            `📦 *NOUVELLE COMMANDE* #${order.id}
+🕒 ${new Date().toLocaleString('fr-FR')}
+
+👤 *CLIENT*
+   • Nom: ${order.client_name}
+   • Téléphone: ${order.client_phone}
+   • Quartier: ${order.client_quartier}
+   • Indications: ${order.client_indications || 'Aucune'}
+
+👶 *PATIENT*
+   • Âge: ${order.patient_age || 'Non précisé'} ans
+   • Genre: ${order.patient_genre || 'Non précisé'}
+   • Poids: ${order.patient_poids || 'Non précisé'} kg
+   • Taille: ${order.patient_taille || 'Non précisé'} cm
+
+📦 *ARTICLES*
+${items}
+
+💰 *TOTAL*: ${order.total} FCFA
+   • Sous-total: ${order.subtotal} FCFA
+   • Livraison: ${order.delivery_price} FCFA (${order.delivery_period})
+   • Frais service: ${order.service_fee} FCFA
+
+🔑 *CODE*: ${order.confirmation_code}
+
+[✅ Valider] [❌ Annuler]`,
+            
+            `📋 *COMMANDE #${order.id}*
 👤 ${order.client_name} (${order.client_phone})
 📍 ${order.client_quartier}
+👶 ${order.patient_age || '?'} ans, ${order.patient_genre || '?'}, ${order.patient_poids || '?'}kg
 📦 ${order.items.map(i => `${i.quantite}x ${i.nom_commercial}`).join(', ')}
 💰 ${order.total} FCFA
 🔑 ${order.confirmation_code}`,
-        `📋 *COMMANDE #${order.id}*
-👤 ${order.client_name}
-📍 ${order.client_quartier}
-💰 ${order.total} FCFA
-🔑 ${order.confirmation_code}`,
-        `✅ *NOUVELLE COMMANDE*
+            
+            `✅ *NOUVELLE COMMANDE*
 ID: #${order.id}
 Client: ${order.client_name}
 Tél: ${order.client_phone}
 Quartier: ${order.client_quartier}
 Montant: ${order.total} FCFA`
-    ],
+        ];
+    },
+
     DELIVERY_VALIDATED: (order) => [
-        `🎉 *LIVRAISON VALIDÉE* #${order.id}\n👤 ${order.client_name}\n💰 ${order.total} FCFA`,
-        `✅ *COMMANDE LIVRÉE* #${order.id}\n👤 ${order.client_name}\nMerci !`,
-        `📦 *LIVRAISON TERMINÉE* #${order.id}\n👤 ${order.client_name}\n👍`
+        `🎉 *LIVRAISON VALIDÉE* #${order.id}
+👤 ${order.client_name} (${order.client_phone})
+📍 ${order.client_quartier}
+💰 ${order.total} FCFA
+🔑 Code: ${order.confirmation_code}
+✅ Commande marquée DELIVERED`,
+        
+        `✅ *COMMANDE LIVRÉE* #${order.id}
+👤 ${order.client_name}
+📍 ${order.client_quartier}
+💰 ${order.total} FCFA
+Merci !`,
+        
+        `📦 *LIVRAISON TERMINÉE* #${order.id}
+👤 ${order.client_name}
+📍 ${order.client_quartier}
+💰 ${order.total} FCFA`
     ],
+
+    ORDER_CANCELLED: (order) => [
+        `❌ *COMMANDE ANNULÉE* #${order.id}
+👤 ${order.client_name} (${order.client_phone})
+📍 ${order.client_quartier}
+💰 ${order.total} FCFA
+🔑 ${order.confirmation_code}
+⚠️ Annulation manuelle par le support`,
+        
+        `🚫 *ANNULATION* #${order.id}
+Client: ${order.client_name}
+Motif: Support`,
+        
+        `❌ *COMMANDE SUPPRIMÉE* #${order.id}
+👤 ${order.client_name}`
+    ],
+
     ASK_REVIEW: (nom) => [
         `⭐ ${nom || 'Bonjour'} ! Ta commande est livrée. Note de 1 à 5 ?`,
         `📝 ${nom || ''}, satisfait ? Donne une note (1-5)`,
         `💬 ${nom || ''}, ton avis nous intéresse ! Note de 1 à 5`
     ],
+
     ASK_COMMENT: (note) => [
         `🙏 Merci pour ta note ${note}/5 ! Un commentaire ?`,
         `✨ Super ! ${note}/5. Tu veux ajouter quelque chose ?`,
         `💝 On te remercie (${note}/5). Laisse un commentaire ?`
     ],
+
     THANK_REVIEW: [
         `😊 Merci beaucoup ! À bientôt !`,
         `🙌 On te remercie ! Tes avis nous aident.`,
         `👋 Merci ! N'hésite pas à recommander MARIAM !`
     ],
+
+    REVIEW_NOTIFICATION: (review) => [
+        `📊 *Nouvel avis* #${review.orderId}
+👤 ${review.nom || 'Anonyme'} (${review.phone})
+⭐ ${review.note}/5
+💬 "${review.commentaire || 'Aucun commentaire'}"`,
+        
+        `⭐ *AVIS CLIENT* #${review.orderId}
+👤 ${review.nom}
+Note: ${review.note}/5`,
+        
+        `📝 *Nouveau feedback*
+Commande: ${review.orderId}
+⭐ ${review.note}/5`
+    ],
+
     CONFIRM_ORDER: (order, nom) => [
         `🎉 *Commande confirmée ${nom || ''}* !
 📦 #${order.id}
@@ -286,23 +393,43 @@ Montant: ${order.total} FCFA`
 📍 ${order.client_quartier}
 💰 ${order.total} FCFA
 ⚠️ À donner au livreur !`,
+        
         `✅ *C'est validé ${nom || ''}* !
 📋 Commande #${order.id}
 🔑 ${order.confirmation_code}
 🛵 Livraison dans 45 min.`,
+        
         `🎊 *Félicitations ${nom || ''}* !
 📦 #${order.id}
 📍 ${order.client_quartier}
 🔑 ${order.confirmation_code}`
     ],
+
     ORDER_SUMMARY: (conv, total) => {
         const items = conv.cart.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n');
         return [
-            `📋 *Récapitulatif* :\n${items}\n📍 ${conv.context.quartier || '?'}\n💰 Total: ${total} FCFA\n👉 Confirme avec "oui"`,
-            `✅ *Vérifie ta commande* :\n${items}\n📍 ${conv.context.quartier || '?'}\n💰 Total: ${total} FCFA\nTout est bon ? (oui/non)`,
-            `📝 *Récap* :\n${items}\n🏠 ${conv.context.quartier || '?'}\n💵 Total: ${total} FCFA\nOn valide ?`
+            `📋 *Récapitulatif* :
+${items}
+📍 ${conv.context.quartier || '?'}
+👤 ${conv.context.nom || '?'}, ${conv.context.age || '?'} ans
+💰 Total: ${total} FCFA
+👉 Confirme avec "oui"`,
+            
+            `✅ *Vérifie ta commande* :
+${items}
+📍 ${conv.context.quartier || '?'}
+👤 ${conv.context.nom || '?'}
+💰 Total: ${total} FCFA
+Tout est bon ? (oui/non)`,
+            
+            `📝 *Récap* :
+${items}
+🏠 ${conv.context.quartier || '?'}
+💵 Total: ${total} FCFA
+On valide ?`
         ][Math.floor(Math.random() * 3)];
     },
+
     REMINDERS: {
         GENERAL: [
             (nom) => `👋 ${nom || 'Toi'}, tu es toujours là ? Ta commande t'attend.`,
@@ -328,7 +455,7 @@ Montant: ${order.total} FCFA`
 };
 
 // ===========================================
-// MESSAGES D'ERREUR VARIÉS
+// MESSAGES D'ERREUR VARIÉS (3 PAR TYPE)
 // ===========================================
 const VALIDATION_ERRORS = {
     NAME: [
@@ -511,7 +638,7 @@ class WhatsAppService {
                     action: {
                         buttons: buttons.slice(0, 3).map((btn, index) => ({
                             type: 'reply',
-                            reply: { id: `btn_${Date.now()}_${index}`, title: btn.substring(0, 20) }
+                            reply: { id: `btn_${Date.now()}_${index}_${to}`, title: btn.substring(0, 20) }
                         }))
                     }
                 }
@@ -527,13 +654,44 @@ class WhatsAppService {
 
     async downloadMedia(mediaId) {
         try {
-            const media = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
+            log('info', `📸 Téléchargement média ${mediaId}`);
+            
+            const mediaResponse = await axios.get(
+                `https://graph.facebook.com/v18.0/${mediaId}`,
+                { 
+                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                    timeout: 10000
+                }
+            );
+
+            if (!mediaResponse.data?.url) {
+                return { success: false, error: "URL non trouvée" };
+            }
+
+            const fileResponse = await axios.get(mediaResponse.data.url, { 
+                responseType: 'arraybuffer',
+                timeout: 15000,
                 headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
             });
-            const file = await axios.get(media.data.url, { responseType: 'arraybuffer' });
-            return { success: true, buffer: Buffer.from(file.data) };
+
+            log('info', `✅ Média téléchargé: ${(fileResponse.data.length / 1024).toFixed(2)}KB`);
+            
+            return { success: true, buffer: Buffer.from(fileResponse.data) };
+
         } catch (error) {
-            return { success: false, error: error.message };
+            log('error', `❌ Erreur téléchargement: ${error.message}`);
+            
+            if (error.code === 'ECONNABORTED') {
+                return { success: false, error: "Timeout (10s)" };
+            }
+            if (error.response?.status === 404) {
+                return { success: false, error: "Image expirée" };
+            }
+            if (error.response?.status === 403) {
+                return { success: false, error: "Accès non autorisé" };
+            }
+            
+            return { success: false, error: "Erreur technique" };
         }
     }
 
@@ -622,84 +780,121 @@ class FuseService {
 class VisionService {
     constructor() {
         this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
+        this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
+        this.model = "meta-llama/llama-4-scout-17b-16e-instruct";
+        this.maxSizeBytes = 4 * 1024 * 1024;
     }
 
     async analyzeImage(imageBuffer) {
-        if (!this.client) return { success: false, error: "Groq non configuré" };
+        if (!this.client) {
+            log('error', '❌ GROQ_API_KEY non configurée pour Vision');
+            return { type: "unknown", medicines: [] };
+        }
 
         try {
             const base64Image = imageBuffer.toString('base64');
-            if (base64Image.length > 4 * 1024 * 1024) {
-                return { success: false, error: "Image trop grande (max 4MB)" };
+            
+            if (base64Image.length > this.maxSizeBytes) {
+                log('warn', `⚠️ Image trop grande: ${(base64Image.length / 1024 / 1024).toFixed(2)}MB > 4MB`);
+                return { type: "unknown", medicines: [], error: "Image trop grande" };
             }
 
-            const prompt = `Tu es MARIAM-VISION, assistant médical.
-Analyse l'image et retourne UNIQUEMENT un JSON avec:
+            const prompt = `Tu es MARIAM-VISION. Analyse cette image de médicament.
+
+INSTRUCTIONS:
+1. C'est une boîte de médicament? Retourne "box"
+2. C'est une ordonnance? Retourne "prescription"
+3. Ni l'un ni l'autre? Retourne "unknown"
+
+Pour chaque médicament détecté, donne:
+- name: nom exact
+- dosage: dosage (ex: 500mg)
+- form: forme (comprimé, sirop, etc.)
+
+Format JSON OBLIGATOIRE:
 {
-  "type": "box|prescription",
+  "type": "box|prescription|unknown",
   "medicines": [
-    {
-      "name": "NOM_EXACT",
-      "dosage": "DOSAGE",
-      "form": "FORME"
-    }
+    {"name": "...", "dosage": "...", "form": "..."}
   ]
 }`;
 
             const response = await this.client.chat.completions.create({
-                model: VISION_MODEL,
+                model: this.model,
                 messages: [{
-                    role: 'user',
+                    role: "user",
                     content: [
-                        { type: 'text', text: prompt },
-                        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+                        { type: "text", text: prompt },
+                        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
                     ]
                 }],
                 temperature: 0.1,
-                max_tokens: 1024,
+                max_tokens: 500,
                 response_format: { type: "json_object" }
             });
 
-            return JSON.parse(response.choices[0].message.content);
+            const result = JSON.parse(response.choices[0].message.content);
+            this.cache.set(`vision:${imageBuffer.length}`, result);
+            log('info', `✅ Vision OK - Type: ${result.type}, Médicaments: ${result.medicines?.length || 0}`);
+            
+            return result;
+
         } catch (error) {
             log('error', `❌ Erreur Vision: ${error.message}`);
-            return { success: false, error: "Échec analyse" };
+            return { type: "unknown", medicines: [] };
         }
     }
 }
 
 // ===========================================
-// SERVICE LLM CONTRÔLÉ (GROQ)
+// SERVICE LLM (openai/gpt-oss-20b)
 // ===========================================
 class LLMService {
     constructor() {
         this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
         this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
-        this.model = "meta-llama/llama-3.3-70b-versatile";
+        this.model = "openai/gpt-oss-20b";
+        
+        this.systemPrompt = `Tu es MARIAM, un assistant pour pharmacie en ligne à San Pedro.
 
-        this.systemPrompt = `Tu es MARIAM, un assistant spécialisé UNIQUEMENT dans les médicaments.
+RÈGLES:
+1. Tu réponds TOUJOURS en français
+2. Tu retournes UNIQUEMENT du JSON
 
-RÈGLES ABSOLUES:
-1. Tu ne réponds QU'à des questions sur les MÉDICAMENTS.
-2. Tu ne dois JAMAIS appeler d'outils, fonctions, ou APIs.
-3. Tu réponds TOUJOURS en français au format JSON suivant:
+FORMAT JSON OBLIGATOIRE:
 {
-  "intention": "order_medicine|ask_price|search_info|greet|help|emergency|checkout|provide_info|unknown",
-  "medicine": "nom du médicament exact ou null",
-  "quantity": nombre (1 par défaut),
+  "intention": "greet|order|price|search|select|info|checkout|confirm|help|emergency|cart|unknown",
+  "medicine": "nom du médicament ou null",
+  "quantity": 1,
+  "selection": "numéro choisi (1,2,3) ou null",
   "field": "quartier|nom|age|genre|poids|taille|telephone|indications|null",
-  "value": "valeur extraite ou null",
-  "confiance": 0.0-1.0,
-  "reponse_directe": "réponse à envoyer à l'utilisateur ou null"
-}`;
+  "value": "valeur extraite ou null"
+}
+
+EXEMPLES:
+- "bonjour" → {"intention":"greet"}
+- "je veux 2 doliprane" → {"intention":"order","medicine":"doliprane","quantity":2}
+- "le 1" ou "1" → {"intention":"select","selection":"1"}
+- "le premier" → {"intention":"select","selection":"1"}
+- "combien coûte amox" → {"intention":"price","medicine":"amoxicilline"}
+- "je cherche acfran" → {"intention":"search","medicine":"acfran"}
+- "j'habite à cité" → {"intention":"info","field":"quartier","value":"cité"}
+- "je m'appelle jean" → {"intention":"info","field":"nom","value":"jean"}
+- "j'ai 30 ans" → {"intention":"info","field":"age","value":"30"}
+- "je suis un homme" → {"intention":"info","field":"genre","value":"M"}
+- "je pèse 70 kg" → {"intention":"info","field":"poids","value":"70"}
+- "je mesure 175 cm" → {"intention":"info","field":"taille","value":"175"}
+- "mon numéro 0758019727" → {"intention":"info","field":"telephone","value":"0758019727"}
+- "porte verte" → {"intention":"info","field":"indications","value":"porte verte"}
+- "commander" → {"intention":"checkout"}
+- "oui" → {"intention":"confirm"}
+- "mon panier" → {"intention":"cart"}`;
     }
 
-    async analyze(text, context = {}) {
-        if (!this.client) {
-            return { intention: "unknown", confiance: 0 };
-        }
+    async analyze(text) {
+        if (!this.client) return this.fallbackAnalyze(text);
 
-        const cacheKey = `llm:${text}:${JSON.stringify(context)}`;
+        const cacheKey = `llm:${text}`;
         const cached = this.cache.get(cacheKey);
         if (cached) return cached;
 
@@ -708,23 +903,74 @@ RÈGLES ABSOLUES:
                 model: this.model,
                 messages: [
                     { role: "system", content: this.systemPrompt },
-                    { role: "user", content: `Message: "${text}"\nContexte: ${JSON.stringify(context)}` }
+                    { role: "user", content: text }
                 ],
                 temperature: 0.1,
-                max_tokens: 200,
-                tool_choice: "none",
-                tools: [],
+                max_tokens: 150,
                 response_format: { type: "json_object" }
             });
 
             const result = JSON.parse(response.choices[0].message.content);
             this.cache.set(cacheKey, result);
+            log('info', `✅ LLM: "${text.substring(0,30)}..." → ${result.intention}`);
             return result;
 
         } catch (error) {
             log('error', `❌ Erreur LLM: ${error.message}`);
-            return { intention: "unknown", confiance: 0 };
+            return this.fallbackAnalyze(text);
         }
+    }
+
+    fallbackAnalyze(text) {
+        const lower = text.toLowerCase().trim();
+        
+        if (lower.match(/^\d+$/)) {
+            return { intention: "select", selection: lower };
+        }
+        
+        if (lower.match(/^(le |la |l'|)(premier|1er|1|première|1ère)$/)) {
+            return { intention: "select", selection: "1" };
+        }
+        if (lower.match(/^(le |la |l'|)(deuxième|2ème|2|second)$/)) {
+            return { intention: "select", selection: "2" };
+        }
+        if (lower.match(/^(le |la |l'|)(troisième|3ème|3)$/)) {
+            return { intention: "select", selection: "3" };
+        }
+        
+        if (lower.match(/bonjour|salut|bonsoir|hey|cc|coucou/)) {
+            return { intention: "greet" };
+        }
+        
+        if (lower.split(' ').length === 1 && lower.length > 2) {
+            return { intention: "search", medicine: lower };
+        }
+        
+        if (lower.includes('veux') || lower.includes('achète') || lower.includes('prends')) {
+            const words = lower.split(' ');
+            const lastWord = words[words.length - 1];
+            return { intention: "order", medicine: lastWord, quantity: 1 };
+        }
+        
+        if (lower.includes('prix') || lower.includes('combien') || lower.includes('tarif')) {
+            const words = lower.split(' ');
+            const lastWord = words[words.length - 1];
+            return { intention: "price", medicine: lastWord };
+        }
+        
+        if (lower === 'commander' || lower === 'valider') {
+            return { intention: "checkout" };
+        }
+        
+        if (lower === 'oui' || lower === 'yes' || lower === 'ok') {
+            return { intention: "confirm" };
+        }
+        
+        if (lower === 'mon panier' || lower === 'panier') {
+            return { intention: "cart" };
+        }
+        
+        return { intention: "unknown" };
     }
 }
 
@@ -817,6 +1063,14 @@ class OrderService {
 
         return { success: true, livreur };
     }
+
+    async notifySupport(order) {
+        const message = Utils.randomMessage(MESSAGES.SUPPORT_NOTIFICATION, order);
+        await this.whatsapp.sendInteractiveButtons(SUPPORT_PHONE, message, [
+            BUTTONS.VALIDATE_DELIVERY,
+            BUTTONS.CANCEL_ORDER
+        ]);
+    }
 }
 
 // ===========================================
@@ -833,7 +1087,7 @@ class AvisService {
             const message = Utils.randomMessage(MESSAGES.ASK_REVIEW, nom);
             await this.whatsapp.sendMessage(phone, message);
             this.pendingReviews.set(phone, { orderId, nom, etape: 'note' });
-        }, 30 * 60 * 1000); // 30 minutes
+        }, 30 * 60 * 1000);
     }
 
     async traiterNote(phone, note) {
@@ -863,10 +1117,17 @@ class AvisService {
             VALUES ($1, $2, $3, $4, $5)
         `, [review.orderId, phone, review.nom || 'Anonyme', review.note, commentaire]);
 
-        await this.whatsapp.sendMessage(SUPPORT_PHONE,
-            `📊 *Nouvel avis* #${review.orderId}\n👤 ${review.nom}\n⭐ ${review.note}/5\n💬 "${commentaire || 'Aucun'}"`);
-
+        const notificationMsg = Utils.randomMessage(MESSAGES.REVIEW_NOTIFICATION, {
+            orderId: review.orderId,
+            nom: review.nom,
+            phone: phone,
+            note: review.note,
+            commentaire: commentaire
+        });
+        
+        await this.whatsapp.sendMessage(SUPPORT_PHONE, notificationMsg);
         await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.THANK_REVIEW));
+        
         this.pendingReviews.delete(phone);
         return true;
     }
@@ -915,7 +1176,6 @@ class ConversationManager {
 
         const timers = [];
 
-        // 5 minutes
         timers.push(setTimeout(async () => {
             const conv = this.get(phone);
             if (conv.state !== ConversationStates.IDLE && conv.state !== 'ORDER_CONFIRMED') {
@@ -924,7 +1184,6 @@ class ConversationManager {
             }
         }, 5 * 60 * 1000));
 
-        // 10 minutes
         timers.push(setTimeout(async () => {
             const conv = this.get(phone);
             if (conv.state !== ConversationStates.IDLE && conv.state !== 'ORDER_CONFIRMED') {
@@ -933,7 +1192,6 @@ class ConversationManager {
             }
         }, 10 * 60 * 1000));
 
-        // 19 minutes
         timers.push(setTimeout(async () => {
             const conv = this.get(phone);
             if (conv.state !== ConversationStates.IDLE && conv.state !== 'ORDER_CONFIRMED') {
@@ -942,7 +1200,6 @@ class ConversationManager {
             }
         }, 19 * 60 * 1000));
 
-        // 20 minutes
         timers.push(setTimeout(async () => {
             const conv = this.get(phone);
             if (conv.state !== ConversationStates.IDLE && conv.state !== 'ORDER_CONFIRMED') {
@@ -982,13 +1239,13 @@ class ButtonHandler {
         }
 
         await this.orders.updateStatus(orderId, 'DELIVERED');
+        
         await this.whatsapp.sendMessage(order.client_phone,
             `🎉 *Commande #${orderId} livrée !*\nMerci d'avoir choisi MARIAM ! 😊`);
 
         await this.whatsapp.sendMessage(phone,
             Utils.randomMessage(MESSAGES.DELIVERY_VALIDATED, order));
 
-        // Demander avis après 30 minutes
         setTimeout(async () => {
             await this.avisService.demanderAvis(order.client_phone, order.client_name, orderId);
         }, 30 * 60 * 1000);
@@ -1003,12 +1260,12 @@ class ButtonHandler {
 
         await this.orders.updateStatus(orderId, 'CANCELED');
         await this.whatsapp.sendMessage(order.client_phone, `❌ Commande #${orderId} annulée.`);
-        await this.whatsapp.sendMessage(phone, `❌ Commande #${orderId} annulée.`);
+        await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ORDER_CANCELLED, order));
     }
 }
 
 // ===========================================
-// MOTEUR PRINCIPAL HYBRIDE
+// MOTEUR PRINCIPAL
 // ===========================================
 class MariamBot {
     constructor() {
@@ -1036,21 +1293,18 @@ class MariamBot {
 
         const conv = this.convManager.get(phone);
 
-        // Message audio
         if (mediaId && mediaId.startsWith('audio')) {
             await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.AUDIO_MESSAGE));
             this.logPerformance(start);
             return;
         }
 
-        // Image
         if (mediaId) {
             await this.handleImage(phone, mediaId, conv);
             this.logPerformance(start);
             return;
         }
 
-        // Première interaction
         if (conv.history.length === 0) {
             await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.FIRST_INTERACTION));
             conv.history.push({ time: Date.now(), text: 'first' });
@@ -1059,21 +1313,16 @@ class MariamBot {
             return;
         }
 
-        // Traitement LLM
-        const llmResult = await this.llm.analyze(text, {
-            state: conv.state,
-            cartLength: conv.cart?.length || 0
-        });
+        const llmResult = await this.llm.analyze(text);
 
-        // Réponse directe du LLM
         if (llmResult.reponse_directe) {
             await this.whatsapp.sendMessage(phone, llmResult.reponse_directe);
             this.logPerformance(start);
             return;
         }
 
-        // Gestion des intentions
         await this.routeIntent(phone, text, conv, llmResult);
+        
         conv.history.push({ time: Date.now(), text, intent: llmResult.intention });
         this.convManager.update(phone, conv);
         this.logPerformance(start);
@@ -1082,47 +1331,57 @@ class MariamBot {
     async routeIntent(phone, text, conv, llmResult) {
         const intention = llmResult.intention;
 
-        // RECHERCHE FUSE (toujours en parallèle)
-        const fuseResult = await this.fuse.findBestMatch(
-            llmResult.medicine || text
-        );
+        if (intention === 'select' && llmResult.selection) {
+            const selection = parseInt(llmResult.selection);
+            
+            if (conv.context.search_results && conv.context.search_results.length >= selection) {
+                const selectedMed = conv.context.search_results[selection - 1];
+                conv.context.pending_med = selectedMed;
+                conv.state = ConversationStates.WAITING_QUANTITY;
+                await this.whatsapp.sendMessage(phone,
+                    `💊 *${selectedMed.nom_commercial}*\n💰 ${selectedMed.prix} FCFA\n\nCombien de boîtes ?`);
+                return;
+            }
+            
+            if (conv.context.pending_image_options && conv.context.pending_image_options.length >= selection) {
+                const selectedMed = conv.context.pending_image_options[selection - 1];
+                conv.cart.push({ ...selectedMed, quantite: 1 });
+                await this.whatsapp.sendMessage(phone,
+                    `✅ ${selectedMed.nom_commercial} ajouté au panier !`);
+                delete conv.context.pending_image_options;
+                conv.state = ConversationStates.IDLE;
+                return;
+            }
+        }
 
-        // ORDRE MÉDICAMENT
-        if ((intention === 'order_medicine' || intention === 'add_to_cart') && fuseResult) {
+        const fuseResult = await this.fuse.findBestMatch(llmResult.medicine || text);
+
+        if ((intention === 'order' || intention === 'add_to_cart') && fuseResult) {
             const quantity = llmResult.quantity || 1;
-
             conv.cart.push({ ...fuseResult, quantite: quantity });
-
             await this.whatsapp.sendMessage(phone,
                 Utils.randomMessage(MESSAGES.ADDED_TO_CART, quantity, fuseResult.nom_commercial, fuseResult.prix * quantity));
-
             conv.state = ConversationStates.IDLE;
-
             setTimeout(async () => {
                 await this.whatsapp.sendMessage(phone, "👉 Autre chose ? (ou tape 'commander')");
             }, 1000);
         }
-        // DEMANDE DE PRIX
-        else if (intention === 'ask_price' && fuseResult) {
+        else if (intention === 'price' && fuseResult) {
             await this.whatsapp.sendMessage(phone,
                 `💰 *${fuseResult.nom_commercial}* : ${fuseResult.prix} FCFA`);
         }
-        // RECHERCHE D'INFO
-        else if (intention === 'search_info' && fuseResult) {
+        else if (intention === 'search' && fuseResult) {
             await this.whatsapp.sendMessage(phone,
                 `💊 *${fuseResult.nom_commercial}*\n💰 Prix: ${fuseResult.prix} FCFA\n📦 DCI: ${fuseResult.dci || 'Non spécifié'}\n\nCombien de boîtes ?`);
             conv.context.pending_med = fuseResult;
             conv.state = ConversationStates.WAITING_QUANTITY;
         }
-        // FOURNITURE D'INFOS
-        else if (intention === 'provide_info' && llmResult.field) {
+        else if (intention === 'info' && llmResult.field) {
             const field = llmResult.field;
             const value = llmResult.value;
 
-            // Validation
             let valid = true;
-            let errorMsg = null;
-
+            
             if (field === 'quartier') valid = Utils.validateQuartier(value);
             else if (field === 'nom') valid = Utils.validateName(value);
             else if (field === 'age') valid = Utils.validateAge(value);
@@ -1150,8 +1409,7 @@ class MariamBot {
                 this.convManager.scheduleReminders(phone, conv.context.nom);
             }
         }
-        // CHECKOUT
-        else if (intention === 'checkout' || text.toLowerCase() === 'commander') {
+        else if (intention === 'checkout') {
             if (!conv.cart || conv.cart.length === 0) {
                 await this.whatsapp.sendMessage(phone, Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY));
                 return;
@@ -1167,45 +1425,29 @@ class MariamBot {
             conv.state = ConversationStates.WAITING_CONFIRMATION;
             this.convManager.scheduleReminders(phone, conv.context.nom);
         }
-        // CONFIRMATION
-        else if ((intention === 'confirm_order' || text.toLowerCase() === 'oui') && conv.state === ConversationStates.WAITING_CONFIRMATION) {
+        else if (intention === 'confirm' && conv.state === ConversationStates.WAITING_CONFIRMATION) {
             try {
                 const order = await this.orders.createOrder(phone, conv.cart, conv.context);
-
                 await this.whatsapp.sendMessage(phone,
                     Utils.randomMessage(MESSAGES.CONFIRM_ORDER, order, conv.context.nom));
-
-                // Notification support avec boutons
-                const supportMsg = Utils.randomMessage(MESSAGES.SUPPORT_NOTIFICATION, order);
-                await this.whatsapp.sendInteractiveButtons(SUPPORT_PHONE, supportMsg, [
-                    BUTTONS.VALIDATE_DELIVERY,
-                    BUTTONS.CANCEL_ORDER
-                ]);
-
-                // Assigner livreur
+                await this.orders.notifySupport(order);
                 await this.orders.assignLivreur(order.id);
-
                 this.convManager.delete(phone);
-
             } catch (error) {
                 log('error', `❌ Erreur création commande: ${error.message}`);
                 await this.whatsapp.sendMessage(phone, "❌ Erreur lors de la commande. Réessaie.");
             }
         }
-        // SALUTATIONS
         else if (intention === 'greet') {
             await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.GREETINGS));
         }
-        // AIDE
-        else if (intention === 'help' || text.toLowerCase() === 'aide') {
+        else if (intention === 'help') {
             await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.HELP));
         }
-        // URGENCE
         else if (intention === 'emergency') {
             await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.EMERGENCY));
         }
-        // PANIER
-        else if (text.toLowerCase() === 'mon panier') {
+        else if (intention === 'cart') {
             if (!conv.cart || conv.cart.length === 0) {
                 await this.whatsapp.sendMessage(phone, Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY));
             } else {
@@ -1215,17 +1457,13 @@ class MariamBot {
                     `🛒 *Ton panier* :\n${items}\n💰 Sous-total: ${subtotal} FCFA`);
             }
         }
-        // NOTE AVIS
         else if (conv.state === ConversationStates.WAITING_REVIEW_NOTE) {
             await this.avisService.traiterNote(phone, text);
         }
-        // COMMENTAIRE AVIS
         else if (conv.state === ConversationStates.WAITING_REVIEW_COMMENT) {
             await this.avisService.traiterCommentaire(phone, text);
         }
-        // RIEN COMPRIS
         else {
-            // Dernier recours: recherche générique
             const results = await this.fuse.search(text, 3);
             if (results.length > 0) {
                 await this.whatsapp.sendMessage(phone,
@@ -1239,15 +1477,22 @@ class MariamBot {
     }
 
     async handleImage(phone, mediaId, conv) {
+        await this.whatsapp.sendMessage(phone, "📸 Téléchargement de l'image en cours...");
+        
         const media = await this.whatsapp.downloadMedia(mediaId);
         if (!media.success) {
-            await this.whatsapp.sendMessage(phone, "❌ Impossible de télécharger l'image.");
+            await this.whatsapp.sendMessage(phone, 
+                `❌ ${media.error || "Impossible de télécharger l'image"}`);
             return;
         }
 
+        await this.whatsapp.sendMessage(phone, "🔍 Analyse de l'image...");
+        
         const visionResult = await this.vision.analyzeImage(media.buffer);
-        if (!visionResult || visionResult.type === 'unknown') {
-            await this.whatsapp.sendMessage(phone, "🔍 Aucun médicament détecté.");
+        
+        if (visionResult.type === 'unknown' || !visionResult.medicines?.length) {
+            await this.whatsapp.sendMessage(phone, 
+                "🔍 Aucun médicament détecté. Envoie une photo nette d'une boîte ou d'une ordonnance.");
             return;
         }
 
@@ -1256,11 +1501,12 @@ class MariamBot {
             const results = await this.fuse.search(med.name, 1);
             if (results.length > 0) {
                 medicines.push(results[0]);
+                log('info', `✅ Médicament trouvé en base: ${results[0].nom_commercial} pour "${med.name}"`);
             }
         }
 
         if (medicines.length === 0) {
-            await this.whatsapp.sendMessage(phone,
+            await this.whatsapp.sendMessage(phone, 
                 `🔍 Aucun médicament trouvé en stock.`);
             return;
         }
@@ -1301,7 +1547,7 @@ class MariamBot {
 }
 
 // ===========================================
-// INSTANCE UNIQUE PERSISTANTE
+// INSTANCE UNIQUE
 // ===========================================
 let botInstance = null;
 
@@ -1347,6 +1593,7 @@ app.post('/webhook', async (req, res) => {
             await bot.process(msg.from, msg.text.body);
         }
         else if (msg.type === 'image') {
+            log('info', `📸 Image reçue de ${msg.from}, ID: ${msg.image.id}`);
             await bot.process(msg.from, null, msg.image.id);
         }
         else if (msg.type === 'audio' || msg.type === 'voice') {
@@ -1376,6 +1623,7 @@ app.get('/debug/stats', (req, res) => {
         conversations: botInstance?.convManager.conversations.size || 0,
         fuseCache: botInstance?.fuse.cache.getStats(),
         llmCache: botInstance?.llm.cache.getStats(),
+        visionCache: botInstance?.vision.cache.getStats(),
         performance: botInstance?.stats
     });
 });
@@ -1453,13 +1701,15 @@ async function start() {
 ║   📱 Port: ${PORT}                                         ║
 ║                                                           ║
 ║   ✅ Fuse.js (6000+ médicaments)                          ║
-║   ✅ LLM Groq (Llama 3.3-70B)                             ║
-║   ✅ Vision pour photos                                    ║
+║   ✅ LLM openai/gpt-oss-20b (1000 t/s)                    ║
+║   ✅ Vision meta-llama/llama-4-scout                      ║
 ║   ✅ Gestion livreurs                                      ║
 ║   ✅ Avis clients                                          ║
 ║   ✅ Rappels automatiques                                  ║
 ║   ✅ Messages variés (3x)                                  ║
-║   ✅ Cache 24h pour LLM                                    ║
+║   ✅ Cache 24h pour LLM & Vision                           ║
+║   ✅ 12 intentions comprises                               ║
+║   ✅ Support avec TOUTES les infos patient                 ║
 ║                                                           ║
 ║   👨‍💻 Créé par Youssef - UPSP (Licence 2, 2026)           ║
 ║                                                           ║

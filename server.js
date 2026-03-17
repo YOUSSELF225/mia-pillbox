@@ -26,9 +26,8 @@ const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 
 // Clés API
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "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";
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "gsk_dbekPbVQMvGFWe14RdJBWGdyb3FYGauFStM8Gu0G9MfeMx0A9uf";
-
-
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+// Configuration livraison
 const DELIVERY_CONFIG = {
     PRICES: { DAY: 400, NIGHT: 600 },
     SERVICE_FEE: 500,

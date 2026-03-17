@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const { Pool } = require('pg');
 const NodeCache = require('node-cache');
-const Groq = require('groq-sdk');
+const Groq = require('groq-sdk'); // On garde pour la compatibilité OpenAI
 const Fuse = require('fuse.js');
 const winston = require('winston');
 const path = require('path');
@@ -13,7 +13,7 @@ const fs = require('fs');
 // CONFIGURATION DES LOGS
 // ===========================================
 const logger = winston.createLogger({
-    level: 'info',
+    level: 'debug',
     format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
         winston.format.printf(info => {
@@ -34,6 +34,32 @@ function log(level, message) {
 }
 
 // ===========================================
+// LOGS DÉTAILLÉS POUR LA CONVERSATION
+// ===========================================
+function logConversation(phone, message, type = 'IN') {
+    const emoji = type === 'IN' ? '📩' : '📤';
+    const timestamp = new Date().toLocaleTimeString('fr-FR');
+    const logMessage = `${emoji} [${timestamp}] ${type === 'IN' ? 'CLIENT' : 'BOT'} (${phone}): ${message}`;
+    
+    // IMPORTANT: Utiliser console.log pour que Render le capture
+    console.log(logMessage);
+    
+    // Aussi via Winston
+    log('info', logMessage);
+}
+
+function logState(phone, conv) {
+    const stateMessage = `📊 ÉTAT: ${conv.state} | Panier: ${conv.cart?.length || 0} article(s) | Contexte: ${JSON.stringify(conv.context)}`;
+    console.log(stateMessage);
+    log('debug', stateMessage);
+}
+
+function logLLMResult(phone, text, llmResult) {
+    console.log(`🧠 IA: "${text}" → ${JSON.stringify(llmResult)}`);
+    log('info', `IA: ${llmResult.intention} ${llmResult.medicine || ''}`);
+}
+
+// ===========================================
 // CONFIGURATION PRINCIPALE
 // ===========================================
 const PORT = process.env.PORT || 10000;
@@ -43,18 +69,19 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 
-// SiliconFlow pour le LLM
+// SiliconFlow pour le LLM (UN SEUL MODÈLE)
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
 
-// Groq pour la Vision (conservé)
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+// Plus besoin de Groq (tout passe par SiliconFlow)
 
 const DELIVERY_CONFIG = {
     PRICES: { DAY: 400, NIGHT: 600 },
     SERVICE_FEE: 500,
     DELIVERY_TIME: 45
 };
+
+// Cache pour éviter les doublons de messages WhatsApp
+const processedMessages = new NodeCache({ stdTTL: 600 }); // 10 minutes
 
 // ===========================================
 // ÉTATS DE CONVERSATION
@@ -814,83 +841,23 @@ class FuseService {
 }
 
 // ===========================================
-// SERVICE VISION GROQ (CONSERVÉ)
+// SERVICE QWEN3-VL UNIFIÉ (TEXTE + VISION)
 // ===========================================
-class VisionService {
-    constructor() {
-        this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
-        this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
-        this.model = VISION_MODEL;
-        this.maxSizeBytes = 4 * 1024 * 1024;
-    }
-
-    async analyzeImage(imageBuffer) {
-        if (!this.client) {
-            log('error', '❌ GROQ_API_KEY non configurée pour Vision');
-            return { type: "unknown", medicines: [] };
-        }
-
-        try {
-            const base64Image = imageBuffer.toString('base64');
-            
-            if (base64Image.length > this.maxSizeBytes) {
-                log('warn', `⚠️ Image trop grande: ${(base64Image.length / 1024 / 1024).toFixed(2)}MB > 4MB`);
-                return { type: "unknown", medicines: [], error: "Image trop grande" };
-            }
-
-            const prompt = `You are MARIAM-VISION, a medical image analyzer.
-Analyze the image and return a JSON with:
-- type: "box"|"prescription"|"unknown"
-- medicines: array of {name, dosage, form}
-
-Examples:
-{"type":"box","medicines":[{"name":"DOLIPRANE","dosage":"500mg","form":"comprimé"}]}`;
-
-            const response = await this.client.chat.completions.create({
-                model: this.model,
-                messages: [{
-                    role: "user",
-                    content: [
-                        { type: "text", text: prompt },
-                        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-                    ]
-                }],
-                temperature: 0,
-                max_tokens: 300,
-                response_format: { type: "json_object" }
-            });
-
-            const content = response.choices[0].message.content;
-            const jsonMatch = content.match(/\{.*\}/s);
-            const result = JSON.parse(jsonMatch ? jsonMatch[0] : content);
-            
-            this.cache.set(`vision:${imageBuffer.length}`, result);
-            log('info', `✅ Vision OK - Type: ${result.type}, Médicaments: ${result.medicines?.length || 0}`);
-            
-            return result;
-
-        } catch (error) {
-            log('error', `❌ Erreur Vision: ${error.message}`);
-            return { type: "unknown", medicines: [] };
-        }
-    }
-}
-
-// ===========================================
-// SERVICE LLM - DEEPSEEK-V2.5 SUR SILICONFLOW
-// ===========================================
-class LLMService {
+class QwenService {
     constructor() {
         this.apiKey = SILICONFLOW_API_KEY;
         this.client = this.apiKey ? new Groq({
             apiKey: this.apiKey,
-            baseURL: "https://api.siliconflow.com/v1" // URL correcte
+            baseURL: "https://api.siliconflow.com/v1"
         }) : null;
 
         this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
-        this.model = "deepseek-ai/DeepSeek-V2.5"; // Modèle fiable avec JSON mode
         
-        this.systemPrompt = `You are MARIAM, a helpful pharmacy assistant in San Pedro, Côte d'Ivoire.
+        // MODÈLE UNIQUE pour TEXTE et VISION
+        this.model = "Qwen/Qwen3-VL-32B-Instruct";
+        
+        // Prompt pour l'analyse de texte (intention)
+        this.textPrompt = `You are MARIAM, a helpful pharmacy assistant in San Pedro, Côte d'Ivoire.
 Your task is to analyze user messages and return a valid JSON object.
 
 RULES:
@@ -914,9 +881,19 @@ User: "je veux 2 doliprane" → {"intention":"order","medicine":"doliprane","qua
 User: "1" → {"intention":"select","selection":"1"}
 User: "j'habite à cité" → {"intention":"info","field":"quartier","value":"cité"}
 User: "commander" → {"intention":"checkout"}`;
+
+        // Prompt pour l'analyse d'image (vision)
+        this.visionPrompt = `You are MARIAM-VISION, a medical image analyzer.
+Analyze the image and return a JSON with:
+- type: "box"|"prescription"|"unknown"
+- medicines: array of {name, dosage, form}
+
+Examples:
+{"type":"box","medicines":[{"name":"DOLIPRANE","dosage":"500mg","form":"comprimé"}]}`;
     }
 
-    async analyze(text) {
+    // Analyse de texte (comme avant)
+    async analyzeText(text) {
         if (!this.client) {
             log('error', '❌ SILICONFLOW_API_KEY non configurée');
             return this.smartFallback(text);
@@ -930,17 +907,17 @@ User: "commander" → {"intention":"checkout"}`;
         if (cached) return cached;
 
         try {
-            log('info', `🧠 DeepSeek-V2.5 analyse: "${text.substring(0, 50)}..."`);
+            log('info', `🧠 Qwen3-VL (texte) analyse: "${text.substring(0, 50)}..."`);
             
             const response = await this.client.chat.completions.create({
                 model: this.model,
                 messages: [
-                    { role: "system", content: this.systemPrompt },
+                    { role: "system", content: this.textPrompt },
                     { role: "user", content: text }
                 ],
                 temperature: 0.1,
                 max_tokens: 150,
-                response_format: { type: "json_object" } // Supporté par V2.5
+                response_format: { type: "json_object" }
             });
 
             const content = response.choices[0].message.content;
@@ -958,12 +935,59 @@ User: "commander" → {"intention":"checkout"}`;
             };
 
             this.cache.set(cacheKey, validated);
-            log('info', `✅ DeepSeek-V2.5: ${validated.intention} ${validated.medicine || ''}`);
+            log('info', `✅ Qwen3-VL: ${validated.intention} ${validated.medicine || ''}`);
             return validated;
 
         } catch (error) {
-            log('error', `❌ Erreur DeepSeek-V2.5: ${error.message}`);
+            log('error', `❌ Erreur Qwen3-VL (texte): ${error.message}`);
             return this.smartFallback(text);
+        }
+    }
+
+    // Analyse d'image (remplace Groq Vision)
+    async analyzeImage(imageBuffer) {
+        if (!this.client) {
+            log('error', '❌ SILICONFLOW_API_KEY non configurée pour Vision');
+            return { type: "unknown", medicines: [] };
+        }
+
+        try {
+            const base64Image = imageBuffer.toString('base64');
+            
+            // Limite de taille (4MB)
+            if (base64Image.length > 4 * 1024 * 1024) {
+                log('warn', `⚠️ Image trop grande: ${(base64Image.length / 1024 / 1024).toFixed(2)}MB > 4MB`);
+                return { type: "unknown", medicines: [], error: "Image trop grande" };
+            }
+
+            log('info', `📸 Qwen3-VL (vision) analyse image...`);
+
+            const response = await this.client.chat.completions.create({
+                model: this.model,
+                messages: [{
+                    role: "user",
+                    content: [
+                        { type: "text", text: this.visionPrompt },
+                        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+                    ]
+                }],
+                temperature: 0,
+                max_tokens: 300,
+                response_format: { type: "json_object" }
+            });
+
+            const content = response.choices[0].message.content;
+            const jsonMatch = content.match(/\{.*\}/s);
+            const result = JSON.parse(jsonMatch ? jsonMatch[0] : content);
+            
+            this.cache.set(`vision:${imageBuffer.length}`, result);
+            log('info', `✅ Qwen3-VL vision OK - Type: ${result.type}, Médicaments: ${result.medicines?.length || 0}`);
+            
+            return result;
+
+        } catch (error) {
+            log('error', `❌ Erreur Qwen3-VL (vision): ${error.message}`);
+            return { type: "unknown", medicines: [] };
         }
     }
 
@@ -1351,8 +1375,7 @@ class MariamBot {
     constructor() {
         this.whatsapp = new WhatsAppService();
         this.fuse = new FuseService();
-        this.llm = new LLMService();
-        this.vision = new VisionService();
+        this.qwen = new QwenService(); // Un seul service pour texte et vision
         this.orders = new OrderService(this.whatsapp);
         this.avisService = new AvisService(this.whatsapp);
         this.convManager = new ConversationManager();
@@ -1369,12 +1392,18 @@ class MariamBot {
         const start = Date.now();
         this.stats.total++;
 
-        console.log(`\n📩 [${new Date().toLocaleTimeString()}] ${phone}: "${text || (mediaId ? '[IMAGE]' : '')}"`);
+        // LOG DU MESSAGE ENTRANT
+        logConversation(phone, text || (mediaId ? '[IMAGE]' : ''), 'IN');
 
         const conv = this.convManager.get(phone);
+        
+        // LOG DE L'ÉTAT ACTUEL
+        logState(phone, conv);
 
         if (mediaId && mediaId.startsWith('audio')) {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.AUDIO_MESSAGE));
+            const response = Utils.randomMessage(MESSAGES.AUDIO_MESSAGE);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             this.logPerformance(start);
             return;
         }
@@ -1386,22 +1415,30 @@ class MariamBot {
         }
 
         if (conv.history.length === 0) {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.FIRST_INTERACTION));
+            const response = Utils.randomMessage(MESSAGES.FIRST_INTERACTION);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             conv.history.push({ time: Date.now(), text: 'first' });
             this.convManager.update(phone, { history: conv.history });
             this.logPerformance(start);
             return;
         }
 
-        const llmResult = await this.llm.analyze(text);
+        const llmResult = await this.qwen.analyzeText(text);
+        
+        // LOG DU RÉSULTAT LLM
+        logLLMResult(phone, text, llmResult);
 
         if (llmResult.intention === "unknown") {
-            log('info', `🤔 IA n'a pas compris: "${text}"`);
+            console.log(`🤔 IA n'a pas compris: "${text}"`);
             
             const results = await this.fuse.search(text, 3);
             if (results.length > 0) {
-                await this.whatsapp.sendMessage(phone,
-                    `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+                const response = `🔍 *Résultats* :\n${
+                    results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')
+                }\n👉 Choisis le numéro.`;
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 conv.context.search_results = results;
                 conv.state = ConversationStates.WAITING_QUANTITY;
                 this.convManager.update(phone, { 
@@ -1409,7 +1446,9 @@ class MariamBot {
                     context: conv.context 
                 });
             } else {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ERROR));
+                const response = Utils.randomMessage(MESSAGES.ERROR);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
             }
             this.logPerformance(start);
             return;
@@ -1435,13 +1474,16 @@ class MariamBot {
             const currentQuestion = this.getCurrentQuestionFromState(conv.state);
             if (currentQuestion) {
                 await this.whatsapp.sendMessage(phone, currentQuestion);
+                logConversation(phone, currentQuestion, 'OUT');
                 return;
             }
         }
 
         // CAS 1: Recherche sans nom
         if (llmResult.intention === 'search_needs_name') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ASK_MEDICINE));
+            const response = Utils.randomMessage(MESSAGES.ASK_MEDICINE);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             conv.state = ConversationStates.WAITING_MEDICINE;
             this.convManager.update(phone, { state: ConversationStates.WAITING_MEDICINE });
             return;
@@ -1453,10 +1495,11 @@ class MariamBot {
             if (medicineName && medicineName.length > 2) {
                 const results = await this.fuse.search(medicineName, 5);
                 if (results.length > 0) {
-                    await this.whatsapp.sendMessage(phone,
-                        `🔍 *Résultats pour "${medicineName}"* :\n${
-                            results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')
-                        }\n👉 Choisis le numéro.`);
+                    const response = `🔍 *Résultats pour "${medicineName}"* :\n${
+                        results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')
+                    }\n👉 Choisis le numéro.`;
+                    await this.whatsapp.sendMessage(phone, response);
+                    logConversation(phone, response, 'OUT');
                     conv.context.search_results = results;
                     conv.state = ConversationStates.WAITING_QUANTITY;
                     this.convManager.update(phone, { 
@@ -1464,10 +1507,14 @@ class MariamBot {
                         context: conv.context 
                     });
                 } else {
-                    await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.NOT_FOUND, medicineName));
+                    const response = Utils.randomMessage(MESSAGES.NOT_FOUND, medicineName);
+                    await this.whatsapp.sendMessage(phone, response);
+                    logConversation(phone, response, 'OUT');
                 }
             } else {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ASK_MEDICINE));
+                const response = Utils.randomMessage(MESSAGES.ASK_MEDICINE);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
             }
             return;
         }
@@ -1484,8 +1531,9 @@ class MariamBot {
                     state: ConversationStates.WAITING_QUANTITY,
                     context: conv.context 
                 });
-                await this.whatsapp.sendMessage(phone,
-                    Utils.randomMessage(MESSAGES.ASK_QUANTITY, med.nom_commercial));
+                const response = Utils.randomMessage(MESSAGES.ASK_QUANTITY, med.nom_commercial);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 return;
             }
             
@@ -1499,7 +1547,9 @@ class MariamBot {
                     cart: conv.cart,
                     context: conv.context 
                 });
-                await this.whatsapp.sendMessage(phone, `✅ ${med.nom_commercial} ajouté au panier !`);
+                const response = `✅ ${med.nom_commercial} ajouté au panier !`;
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 return;
             }
         }
@@ -1518,42 +1568,54 @@ class MariamBot {
                 context: conv.context 
             });
             
-            await this.whatsapp.sendMessage(phone,
-                Utils.randomMessage(MESSAGES.ADDED_TO_CART, qty, med.nom_commercial, med.prix * qty));
+            const response = Utils.randomMessage(MESSAGES.ADDED_TO_CART, qty, med.nom_commercial, med.prix * qty);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             
             setTimeout(async () => {
-                await this.whatsapp.sendMessage(phone, "👉 Autre chose ? (ou tape 'commander')");
+                const followUp = "👉 Autre chose ? (ou tape 'commander')";
+                await this.whatsapp.sendMessage(phone, followUp);
+                logConversation(phone, followUp, 'OUT');
             }, 1000);
             return;
         }
 
         // CAS 5: Greet
         if (llmResult.intention === 'greet') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.GREETINGS));
+            const response = Utils.randomMessage(MESSAGES.GREETINGS);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
         // CAS 6: Help
         if (llmResult.intention === 'help') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.HELP));
+            const response = Utils.randomMessage(MESSAGES.HELP);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
         // CAS 7: Emergency
         if (llmResult.intention === 'emergency') {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.EMERGENCY));
+            const response = Utils.randomMessage(MESSAGES.EMERGENCY);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
         // CAS 8: Cart
         if (llmResult.intention === 'cart') {
             if (!conv.cart?.length) {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY));
+                const response = Utils.randomMessage(VALIDATION_ERRORS.CART_EMPTY);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
             } else {
                 const items = conv.cart.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n');
                 const subtotal = conv.cart.reduce((s, i) => s + (i.prix * i.quantite), 0);
-                await this.whatsapp.sendMessage(phone,
-                    `🛒 *Ton panier* :\n${items}\n💰 Sous-total: ${subtotal} FCFA`);
+                const response = `🛒 *Ton panier* :\n${items}\n💰 Sous-total: ${subtotal} FCFA`;
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
             }
             return;
         }
@@ -1566,8 +1628,9 @@ class MariamBot {
             if (!fuseResult) {
                 const suggestions = await this.fuse.search(medicineName, 5);
                 if (suggestions.length > 0) {
-                    await this.whatsapp.sendMessage(phone,
-                        Utils.randomMessage(MESSAGES.SUGGESTIONS, suggestions));
+                    const response = Utils.randomMessage(MESSAGES.SUGGESTIONS, suggestions);
+                    await this.whatsapp.sendMessage(phone, response);
+                    logConversation(phone, response, 'OUT');
                     conv.context.search_results = suggestions;
                     conv.state = ConversationStates.WAITING_QUANTITY;
                     this.convManager.update(phone, { 
@@ -1575,19 +1638,22 @@ class MariamBot {
                         context: conv.context 
                     });
                 } else {
-                    await this.whatsapp.sendMessage(phone,
-                        Utils.randomMessage(MESSAGES.NOT_FOUND, medicineName));
+                    const response = Utils.randomMessage(MESSAGES.NOT_FOUND, medicineName);
+                    await this.whatsapp.sendMessage(phone, response);
+                    logConversation(phone, response, 'OUT');
                 }
                 return;
             }
 
             if (llmResult.intention === 'price') {
-                await this.whatsapp.sendMessage(phone,
-                    `💰 *${fuseResult.nom_commercial}* : ${fuseResult.prix} FCFA`);
+                const response = `💰 *${fuseResult.nom_commercial}* : ${fuseResult.prix} FCFA`;
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
             }
             else if (llmResult.intention === 'search') {
-                await this.whatsapp.sendMessage(phone,
-                    `💊 *${fuseResult.nom_commercial}*\n💰 Prix: ${fuseResult.prix} FCFA\n📦 DCI: ${fuseResult.dci || 'Non spécifié'}\n\n👉 Combien de boîtes veux-tu ?`);
+                const response = `💊 *${fuseResult.nom_commercial}*\n💰 Prix: ${fuseResult.prix} FCFA\n📦 DCI: ${fuseResult.dci || 'Non spécifié'}\n\n👉 Combien de boîtes veux-tu ?`;
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 conv.context.pending_med = fuseResult;
                 conv.state = ConversationStates.WAITING_QUANTITY;
                 this.convManager.update(phone, { 
@@ -1599,12 +1665,14 @@ class MariamBot {
                 const quantity = llmResult.quantity || 1;
                 conv.cart.push({ ...fuseResult, quantite: quantity });
                 this.convManager.update(phone, { cart: conv.cart });
-                await this.whatsapp.sendMessage(phone,
-                    Utils.randomMessage(MESSAGES.ADDED_TO_CART, quantity, fuseResult.nom_commercial, fuseResult.prix * quantity));
+                const response = Utils.randomMessage(MESSAGES.ADDED_TO_CART, quantity, fuseResult.nom_commercial, fuseResult.prix * quantity);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 
                 setTimeout(async () => {
-                    await this.whatsapp.sendMessage(phone,
-                        "👉 Autre chose ? (ou tape 'commander' pour finaliser)");
+                    const followUp = "👉 Autre chose ? (ou tape 'commander' pour finaliser)";
+                    await this.whatsapp.sendMessage(phone, followUp);
+                    logConversation(phone, followUp, 'OUT');
                 }, 1000);
             }
             return;
@@ -1619,13 +1687,16 @@ class MariamBot {
         // CAS 11: Checkout
         if (llmResult.intention === 'checkout') {
             if (!conv.cart?.length) {
-                await this.whatsapp.sendMessage(phone,
-                    "🛒 Ton panier est vide. Ajoute d'abord des médicaments.");
+                const response = "🛒 Ton panier est vide. Ajoute d'abord des médicaments.";
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 return;
             }
 
             if (!conv.context.quartier) {
-                await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ASK_QUARTIER));
+                const response = Utils.randomMessage(MESSAGES.ASK_QUARTIER);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 conv.state = ConversationStates.WAITING_QUARTIER;
                 this.convManager.update(phone, { state: ConversationStates.WAITING_QUARTIER });
                 return;
@@ -1643,8 +1714,9 @@ class MariamBot {
             try {
                 const order = await this.orders.createOrder(phone, conv.cart, conv.context);
                 
-                await this.whatsapp.sendMessage(phone,
-                    Utils.randomMessage(MESSAGES.CONFIRM_ORDER, order, conv.context.nom));
+                const response = Utils.randomMessage(MESSAGES.CONFIRM_ORDER, order, conv.context.nom);
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
                 
                 await this.orders.notifySupport(order);
                 await this.orders.assignLivreur(order.id);
@@ -1653,8 +1725,9 @@ class MariamBot {
                 
             } catch (error) {
                 log('error', `❌ Erreur commande: ${error.message}`);
-                await this.whatsapp.sendMessage(phone,
-                    "❌ Désolé, une erreur est survenue. Réessaie ou contacte le support.");
+                const response = "❌ Désolé, une erreur est survenue. Réessaie ou contacte le support.";
+                await this.whatsapp.sendMessage(phone, response);
+                logConversation(phone, response, 'OUT');
             }
             return;
         }
@@ -1662,8 +1735,9 @@ class MariamBot {
         // Fallback
         const results = await this.fuse.search(text, 3);
         if (results.length > 0) {
-            await this.whatsapp.sendMessage(phone,
-                `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+            const response = `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`;
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             conv.context.search_results = results;
             conv.state = ConversationStates.WAITING_QUANTITY;
             this.convManager.update(phone, { 
@@ -1671,7 +1745,9 @@ class MariamBot {
                 context: conv.context 
             });
         } else {
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ERROR));
+            const response = Utils.randomMessage(MESSAGES.ERROR);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
         }
     }
 
@@ -1680,7 +1756,9 @@ class MariamBot {
         const value = llmResult.value;
 
         if (!field || !value) {
-            await this.whatsapp.sendMessage(phone, "🤔 Je n'ai pas compris. Peux-tu reformuler ?");
+            const response = "🤔 Je n'ai pas compris. Peux-tu reformuler ?";
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
@@ -1696,8 +1774,9 @@ class MariamBot {
 
         if (!isValid) {
             const errorKey = field.toUpperCase();
-            await this.whatsapp.sendMessage(phone,
-                Utils.randomMessage(VALIDATION_ERRORS[errorKey] || VALIDATION_ERRORS.GENERAL));
+            const response = Utils.randomMessage(VALIDATION_ERRORS[errorKey] || VALIDATION_ERRORS.GENERAL);
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
@@ -1707,6 +1786,7 @@ class MariamBot {
         const nextStep = this.getNextQuestion(conv);
         if (nextStep) {
             await this.whatsapp.sendMessage(phone, nextStep);
+            logConversation(phone, nextStep, 'OUT');
             const nextState = Utils.getStateFromQuestion(nextStep);
             conv.state = nextState;
             this.convManager.update(phone, { state: nextState });
@@ -1751,8 +1831,9 @@ class MariamBot {
         const delivery = Utils.getDeliveryPrice();
         const total = subtotal + delivery.price + DELIVERY_CONFIG.SERVICE_FEE;
 
-        await this.whatsapp.sendMessage(phone,
-            Utils.randomMessage(MESSAGES.ORDER_SUMMARY, conv, total));
+        const response = Utils.randomMessage(MESSAGES.ORDER_SUMMARY, conv, total);
+        await this.whatsapp.sendMessage(phone, response);
+        logConversation(phone, response, 'OUT');
     }
 
     async handleImage(phone, mediaId, conv) {
@@ -1760,18 +1841,20 @@ class MariamBot {
         
         const media = await this.whatsapp.downloadMedia(mediaId);
         if (!media.success) {
-            await this.whatsapp.sendMessage(phone, 
-                `❌ ${media.error || "Impossible de télécharger l'image"}`);
+            const errorMsg = `❌ ${media.error || "Impossible de télécharger l'image"}`;
+            await this.whatsapp.sendMessage(phone, errorMsg);
+            logConversation(phone, errorMsg, 'OUT');
             return;
         }
 
         await this.whatsapp.sendMessage(phone, "🔍 Analyse de l'image...");
         
-        const visionResult = await this.vision.analyzeImage(media.buffer);
+        const visionResult = await this.qwen.analyzeImage(media.buffer);
         
         if (visionResult.type === 'unknown' || !visionResult.medicines?.length) {
-            await this.whatsapp.sendMessage(phone, 
-                "🔍 Aucun médicament détecté. Envoie une photo nette d'une boîte ou d'une ordonnance.");
+            const response = "🔍 Aucun médicament détecté. Envoie une photo nette d'une boîte ou d'une ordonnance.";
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
@@ -1785,12 +1868,15 @@ class MariamBot {
         }
 
         if (medicines.length === 0) {
-            await this.whatsapp.sendMessage(phone, 
-                `🔍 Aucun médicament trouvé en stock.`);
+            const response = `🔍 Aucun médicament trouvé en stock.`;
+            await this.whatsapp.sendMessage(phone, response);
+            logConversation(phone, response, 'OUT');
             return;
         }
 
-        await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.IMAGE_RESULTS, medicines));
+        const response = Utils.randomMessage(MESSAGES.IMAGE_RESULTS, medicines);
+        await this.whatsapp.sendMessage(phone, response);
+        logConversation(phone, response, 'OUT');
 
         conv.context.pending_image_options = medicines;
         conv.state = ConversationStates.WAITING_IMAGE_SELECTION;
@@ -1826,6 +1912,9 @@ async function getBot() {
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// Cache pour éviter les doublons de messages
+const processedMessages = new NodeCache({ stdTTL: 600 }); // 10 minutes
+
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
         res.send(req.query['hub.challenge']);
@@ -1844,6 +1933,13 @@ app.post('/webhook', async (req, res) => {
         const msg = changes?.value?.messages?.[0];
 
         if (!msg) return;
+
+        // ÉVITER LES DOUBLONS DE MESSAGES
+        if (processedMessages.has(msg.id)) {
+            console.log(`⏭️ Message déjà traité: ${msg.id}`);
+            return;
+        }
+        processedMessages.set(msg.id, true);
 
         const whatsapp = new WhatsAppService();
         await whatsapp.markAsRead(msg.id);
@@ -1883,8 +1979,7 @@ app.get('/debug/stats', (req, res) => {
     res.json({
         conversations: botInstance?.convManager.conversations.size || 0,
         fuseCache: botInstance?.fuse.cache.getStats(),
-        llmCache: botInstance?.llm.cache.getStats(),
-        visionCache: botInstance?.vision.cache.getStats(),
+        llmCache: botInstance?.qwen.cache.getStats(),
         performance: botInstance?.stats
     });
 });
@@ -1961,17 +2056,15 @@ async function start() {
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║   📱 Port: ${PORT}                                         ║
 ║                                                           ║
-║   ✅ LLM: DeepSeek-V2.5 (SiliconFlow)                     ║
-║   ✅ Vision: Groq (conservé)                              ║
-║   ✅ Architecture hybride (IA analyse, code répond)       ║
-║   ✅ Gestion des recherches sans nom                      ║
-║   ✅ États de conversation corrigés                        ║
+║   ✅ IA HYBRIDE (LLM analyse, code répond)                ║
+║   ✅ Modèle unique: Qwen3-VL-32B (texte + vision)         ║
+║   ✅ Vision intégrée (plus besoin de Groq)                ║
 ║   ✅ Fuse.js (6000+ médicaments)                          ║
 ║   ✅ Gestion livreurs                                      ║
 ║   ✅ Avis clients                                          ║
 ║   ✅ Rappels automatiques                                  ║
 ║   ✅ Messages variés (3x)                                  ║
-║   ✅ Cache 24h pour IA & Vision                            ║
+║   ✅ Cache 24h pour IA                                     ║
 ║   ✅ Support avec TOUTES les infos patient                 ║
 ║                                                           ║
 ║   👨‍💻 Créé par Youssef - UPSP (Licence 2, 2026)           ║

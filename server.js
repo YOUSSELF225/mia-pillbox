@@ -42,7 +42,13 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
+
+// SiliconFlow pour le LLM
+const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY;
+
+// Groq pour la Vision (conservé)
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 const DELIVERY_CONFIG = {
     PRICES: { DAY: 400, NIGHT: 600 },
@@ -96,20 +102,21 @@ const MESSAGES = {
         `👋 *Bienvenue sur MARIAM* ! 
 Je suis ton assistante santé 24h/24 à San Pedro. 💊
 *Exemples* :
-• "2 doliprane" → commander
+• "doliprane" → chercher un médicament
+• "2 doliprane" → commander directement
 • Envoie une photo → scan automatique
 • "aide" → voir les options
 📍 *Livraison uniquement à San Pedro*`,
         
         `🌟 *MARIAM - Pharmacie en ligne* 🌟
 Commande en 2 minutes, livraison en 45 min !
-💊 "doliprane" → rechercher
-📸 Photo → scan automatique
+💊 Tape le nom du médicament (ex: "doliprane")
+📸 Envoie une photo de ta boîte
 📍 "cité" → donner ton quartier`,
         
         `👋 *Bienvenue* ! Je suis MARIAM.
-💊 Pour commander : "2 doliprane"
-📸 Pour une ordonnance : envoie la photo
+💊 Exemples : "doliprane", "2 amoxicilline", "acfran"
+📸 Photo de boîte ou ordonnance
 ❓ "aide" pour plus d'infos`
     ],
 
@@ -807,13 +814,13 @@ class FuseService {
 }
 
 // ===========================================
-// SERVICE VISION GROQ
+// SERVICE VISION GROQ (CONSERVÉ)
 // ===========================================
 class VisionService {
     constructor() {
         this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
         this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
-        this.model = "meta-llama/llama-4-scout-17b-16e-instruct";
+        this.model = VISION_MODEL;
         this.maxSizeBytes = 4 * 1024 * 1024;
     }
 
@@ -870,40 +877,60 @@ Examples:
 }
 
 // ===========================================
-// SERVICE LLM - PROMPT ULTRA-SIMPLIFIÉ
+// SERVICE LLM - DEEPSEEK-V3 SUR SILICONFLOW
 // ===========================================
 class LLMService {
     constructor() {
-        this.client = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
+        this.apiKey = SILICONFLOW_API_KEY;
+        this.client = this.apiKey ? new Groq({ // Groq SDK est compatible OpenAI
+            apiKey: this.apiKey,
+            baseURL: "https://api.siliconflow.cn/v1" // URL de base de SiliconFlow
+        }) : null;
+
         this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
-        this.model = "openai/gpt-oss-20b";
+        this.model = "deepseek-ai/DeepSeek-V3";
         
-        this.systemPrompt = `You are MARIAM, a pharmacy assistant.
-Return ONLY a JSON object with:
-- intention: "greet"|"order"|"price"|"search"|"search_needs_name"|"select"|"info"|"checkout"|"confirm"|"unknown"
-- medicine: string or null
-- quantity: number (default 1)
-- selection: "1"|"2"|"3"|null
-- field: "quartier"|"nom"|"age"|"genre"|null
-- value: string or null
+        this.systemPrompt = `You are MARIAM, a helpful pharmacy assistant in San Pedro, Côte d'Ivoire.
+Your task is to analyze user messages and return a valid JSON object.
+
+RULES:
+- Return ONLY valid JSON, no other text.
+- Use the exact field names specified.
+
+JSON FORMAT:
+{
+  "intention": "greet" | "order" | "price" | "search" | "search_needs_name" | "select" | "info" | "checkout" | "confirm" | "unknown",
+  "medicine": string | null,
+  "quantity": number (default 1),
+  "selection": "1" | "2" | "3" | null,
+  "field": "quartier" | "nom" | "age" | "genre" | null,
+  "value": string | null
+}
 
 EXAMPLES:
 User: "bonjour" → {"intention":"greet"}
 User: "je cherche un médicament" → {"intention":"search_needs_name"}
 User: "je veux 2 doliprane" → {"intention":"order","medicine":"doliprane","quantity":2}
 User: "1" → {"intention":"select","selection":"1"}
-User: "cité" → {"intention":"info","field":"quartier","value":"cité"}`;
+User: "j'habite à cité" → {"intention":"info","field":"quartier","value":"cité"}
+User: "commander" → {"intention":"checkout"}`;
     }
 
     async analyze(text) {
-        if (!this.client) return this.smartFallback(text);
+        if (!this.client) {
+            log('error', '❌ SILICONFLOW_API_KEY non configurée');
+            return this.smartFallback(text);
+        }
+
+        const simpleCase = this.checkSimpleCases(text);
+        if (simpleCase) return simpleCase;
 
         const cacheKey = `llm:${text}`;
         const cached = this.cache.get(cacheKey);
         if (cached) return cached;
 
         try {
-            log('info', `🧠 IA analyse: "${text.substring(0, 30)}..."`);
+            log('info', `🧠 DeepSeek-V3 analyse: "${text.substring(0, 50)}..."`);
             
             const response = await this.client.chat.completions.create({
                 model: this.model,
@@ -911,8 +938,8 @@ User: "cité" → {"intention":"info","field":"quartier","value":"cité"}`;
                     { role: "system", content: this.systemPrompt },
                     { role: "user", content: text }
                 ],
-                temperature: 0,
-                max_tokens: 100,
+                temperature: 0.1,
+                max_tokens: 150,
                 response_format: { type: "json_object" }
             });
 
@@ -931,47 +958,68 @@ User: "cité" → {"intention":"info","field":"quartier","value":"cité"}`;
             };
 
             this.cache.set(cacheKey, validated);
-            log('info', `✅ IA: ${validated.intention} ${validated.medicine || ''}`);
+            log('info', `✅ DeepSeek-V3: ${validated.intention} ${validated.medicine || ''}`);
             return validated;
 
         } catch (error) {
-            log('error', `❌ Erreur IA: ${error.message}`);
+            log('error', `❌ Erreur DeepSeek-V3: ${error.message}`);
             return this.smartFallback(text);
         }
+    }
+
+    checkSimpleCases(text) {
+        const lower = text.toLowerCase().trim();
+        
+        if (lower.length > 2 && !lower.includes(' ') && 
+            !lower.match(/bonjour|salut|hey|hello|cc|aide/)) {
+            return { intention: "search", medicine: lower };
+        }
+        
+        if (lower.match(/^(bonjour|salut|hey|hello|cc|bonsoir)$/)) {
+            return { intention: "greet" };
+        }
+        
+        if (lower === 'commander' || lower === 'valider' || lower === 'finaliser') {
+            return { intention: "checkout" };
+        }
+        
+        if (lower.match(/^[0-9]+$/)) {
+            return { intention: "select", selection: lower };
+        }
+        
+        return null;
     }
 
     smartFallback(text) {
         const lower = text.toLowerCase().trim();
         
-        // Recherche sans nom
-        if (lower.match(/cherche|veux|besoin|acheter/) && 
-            !lower.match(/doliprane|acfran|amox|doli|acf|amoxicilline/)) {
+        if (lower.match(/cherche|veux|besoin|acheter|médicament/) && 
+            !lower.match(/doliprane|acfran|amox|doli|acf|amoxicilline|acuitel|paracétamol|ibuprofène/)) {
             return { intention: "search_needs_name" };
         }
         
-        // Commander
-        if (lower === 'commander' || lower === 'valider') {
+        if (lower.length > 2 && !lower.includes(' ')) {
+            return { intention: "search", medicine: lower };
+        }
+        
+        if (lower === 'commander' || lower === 'valider' || lower === 'finaliser') {
             return { intention: "checkout" };
         }
         
-        // Sélection par numéro
         if (lower.match(/^[0-9]+$/)) {
             return { intention: "select", selection: lower };
         }
         
-        // Salutations
-        if (lower.match(/bonjour|salut|hey|bonsoir/)) {
+        if (lower.match(/bonjour|salut|hey|bonsoir|hello|cc/)) {
             return { intention: "greet" };
         }
         
-        // Demande de prix
-        if (lower.match(/prix|combien|tarif|coûte/)) {
+        if (lower.match(/prix|combien|tarif|coûte|coute/)) {
             const words = lower.split(' ');
             return { intention: "price", medicine: words[words.length - 1] };
         }
         
-        // Commande
-        if (lower.match(/veux|achète|prends|donne/)) {
+        if (lower.match(/veux|achète|prends|donne|voudrais/)) {
             const words = lower.split(' ');
             return { 
                 intention: "order", 
@@ -980,9 +1028,26 @@ User: "cité" → {"intention":"info","field":"quartier","value":"cité"}`;
             };
         }
         
-        // Par défaut, chercher comme médicament
-        if (lower.length > 2) {
-            return { intention: "search", medicine: lower };
+        if (lower.includes('cité') || lower.includes('balmer') || lower.includes('yopougon') || 
+            lower.includes('koumassi') || lower.includes('marcory') || lower.includes('adjamé')) {
+            return { intention: "info", field: "quartier", value: lower };
+        }
+        
+        if (lower.includes('appelle') || lower.includes('nom') || lower.includes('prénom')) {
+            const match = lower.match(/(?:appelle|nom|prénom)\s+([a-zéèêàùç\s]+)/i);
+            if (match) return { intention: "info", field: "nom", value: match[1].trim() };
+        }
+        
+        const ageMatch = lower.match(/(\d+)\s*(?:ans|an)/);
+        if (ageMatch) {
+            return { intention: "info", field: "age", value: ageMatch[1] };
+        }
+        
+        if (lower.includes('homme') || lower.includes('masculin') || lower === 'm') {
+            return { intention: "info", field: "genre", value: "M" };
+        }
+        if (lower.includes('femme') || lower.includes('féminin') || lower === 'f') {
+            return { intention: "info", field: "genre", value: "F" };
         }
         
         return { intention: "unknown" };
@@ -1332,7 +1397,20 @@ class MariamBot {
 
         if (llmResult.intention === "unknown") {
             log('info', `🤔 IA n'a pas compris: "${text}"`);
-            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ERROR));
+            
+            const results = await this.fuse.search(text, 3);
+            if (results.length > 0) {
+                await this.whatsapp.sendMessage(phone,
+                    `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+                conv.context.search_results = results;
+                conv.state = ConversationStates.WAITING_QUANTITY;
+                this.convManager.update(phone, { 
+                    state: ConversationStates.WAITING_QUANTITY,
+                    context: conv.context 
+                });
+            } else {
+                await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ERROR));
+            }
             this.logPerformance(start);
             return;
         }
@@ -1350,12 +1428,10 @@ class MariamBot {
         // Gestion des états d'attente
         if (conv.state !== ConversationStates.IDLE) {
             if (llmResult.intention === 'info' && llmResult.field && llmResult.value) {
-                // Traiter comme info
                 await this.handleInfo(phone, conv, llmResult);
                 return;
             }
             
-            // Rappeler la question en cours
             const currentQuestion = this.getCurrentQuestionFromState(conv.state);
             if (currentQuestion) {
                 await this.whatsapp.sendMessage(phone, currentQuestion);
@@ -1378,7 +1454,9 @@ class MariamBot {
                 const results = await this.fuse.search(medicineName, 5);
                 if (results.length > 0) {
                     await this.whatsapp.sendMessage(phone,
-                        `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+                        `🔍 *Résultats pour "${medicineName}"* :\n${
+                            results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')
+                        }\n👉 Choisis le numéro.`);
                     conv.context.search_results = results;
                     conv.state = ConversationStates.WAITING_QUANTITY;
                     this.convManager.update(phone, { 
@@ -1407,7 +1485,7 @@ class MariamBot {
                     context: conv.context 
                 });
                 await this.whatsapp.sendMessage(phone,
-                    `💊 *${med.nom_commercial}*\n💰 ${med.prix} FCFA\n\nCombien de boîtes ?`);
+                    Utils.randomMessage(MESSAGES.ASK_QUANTITY, med.nom_commercial));
                 return;
             }
             
@@ -1582,7 +1660,19 @@ class MariamBot {
         }
 
         // Fallback
-        await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ERROR));
+        const results = await this.fuse.search(text, 3);
+        if (results.length > 0) {
+            await this.whatsapp.sendMessage(phone,
+                `🔍 *Résultats* :\n${results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n')}\n👉 Choisis le numéro.`);
+            conv.context.search_results = results;
+            conv.state = ConversationStates.WAITING_QUANTITY;
+            this.convManager.update(phone, { 
+                state: ConversationStates.WAITING_QUANTITY,
+                context: conv.context 
+            });
+        } else {
+            await this.whatsapp.sendMessage(phone, Utils.randomMessage(MESSAGES.ERROR));
+        }
     }
 
     async handleInfo(phone, conv, llmResult) {
@@ -1594,7 +1684,6 @@ class MariamBot {
             return;
         }
 
-        // Validation
         let isValid = true;
         if (field === 'quartier') isValid = Utils.validateQuartier(value);
         else if (field === 'nom') isValid = Utils.validateName(value);
@@ -1612,11 +1701,9 @@ class MariamBot {
             return;
         }
 
-        // Stocker l'info
         conv.context[field] = value;
         this.convManager.update(phone, { context: conv.context });
 
-        // Prochaine question
         const nextStep = this.getNextQuestion(conv);
         if (nextStep) {
             await this.whatsapp.sendMessage(phone, nextStep);
@@ -1874,12 +1961,12 @@ async function start() {
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║   📱 Port: ${PORT}                                         ║
 ║                                                           ║
-║   ✅ IA PURE (openai/gpt-oss-20b)                         ║
-║   ✅ Prompt ultra-simplifié (pas d'erreur JSON)           ║
+║   ✅ LLM: DeepSeek-V3 (SiliconFlow)                       ║
+║   ✅ Vision: Groq (conservé)                              ║
+║   ✅ Prompt structuré en anglais                          ║
 ║   ✅ Gestion des recherches sans nom                      ║
 ║   ✅ États de conversation corrigés                        ║
 ║   ✅ Fuse.js (6000+ médicaments)                          ║
-║   ✅ Vision (meta-llama/llama-4-scout)                    ║
 ║   ✅ Gestion livreurs                                      ║
 ║   ✅ Avis clients                                          ║
 ║   ✅ Rappels automatiques                                  ║

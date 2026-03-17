@@ -1,7 +1,7 @@
 // ===========================================
-// MARIAM BOT - PRODUCTION READY
+// MARIAM BOT - PRODUCTION FINALE
 // San Pedro, Côte d'Ivoire
-// 100% IA avec Groq (Llama-3.3-70b + Llama-4-Scout)
+// 100% IA - Style PayParrot
 // ===========================================
 
 require('dotenv').config();
@@ -23,9 +23,7 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
-
-// Clés API Groq
-const GROQ_API_KEY = process.env.GROQ_API_KEY ;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Configuration livraison
 const DELIVERY_CONFIG = {
@@ -34,28 +32,27 @@ const DELIVERY_CONFIG = {
     DELIVERY_TIME: 45
 };
 
-// États de conversation
+// États de conversation (inspirés de PayParrot)
 const ConversationStates = {
     IDLE: 'IDLE',
-    WAITING_MEDICINE: 'WAITING_MEDICINE',
+    MAIN_MENU: 'MAIN_MENU',
+    WAITING_SEARCH: 'WAITING_SEARCH',
+    WAITING_SELECTION: 'WAITING_SELECTION',
     WAITING_QUANTITY: 'WAITING_QUANTITY',
     WAITING_ADD_CONFIRMATION: 'WAITING_ADD_CONFIRMATION',
-    WAITING_SELECTION: 'WAITING_SELECTION',
-    WAITING_POST_ADD: 'WAITING_POST_ADD',
-    WAITING_QUARTIER: 'WAITING_QUARTIER',
-    WAITING_NAME: 'WAITING_NAME',
-    WAITING_AGE: 'WAITING_AGE',
-    WAITING_GENDER: 'WAITING_GENDER',
-    WAITING_WEIGHT: 'WAITING_WEIGHT',
-    WAITING_HEIGHT: 'WAITING_HEIGHT',
-    WAITING_PHONE: 'WAITING_PHONE',
-    WAITING_INDICATIONS: 'WAITING_INDICATIONS',
-    WAITING_CONFIRMATION: 'WAITING_CONFIRMATION',
-    WAITING_IMAGE_SELECTION: 'WAITING_IMAGE_SELECTION',
-    CHECKOUT: 'CHECKOUT'
+    CART_VIEW: 'CART_VIEW',
+    CART_MODIFY: 'CART_MODIFY',
+    CHECKOUT_QUARTIER: 'CHECKOUT_QUARTIER',
+    CHECKOUT_NOM: 'CHECKOUT_NOM',
+    CHECKOUT_AGE: 'CHECKOUT_AGE',
+    CHECKOUT_GENRE: 'CHECKOUT_GENRE',
+    CHECKOUT_PHONE: 'CHECKOUT_PHONE',
+    CHECKOUT_CONFIRMATION: 'CHECKOUT_CONFIRMATION',
+    ORDER_CONFIRMED: 'ORDER_CONFIRMED',
+    HELP_MENU: 'HELP_MENU'
 };
 
-// Cache pour éviter les doublons
+// Cache pour éviter les doublons de messages WhatsApp
 const processedMessages = new NodeCache({ stdTTL: 600 });
 
 // ===========================================
@@ -75,7 +72,6 @@ const logger = winston.createLogger({
 
 function log(level, message) {
     logger.log(level, message);
-    console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
 // ===========================================
@@ -148,37 +144,28 @@ class ValidationService {
         switch(field) {
             case 'nom':
                 return value.trim().length >= 2 && /^[a-zA-ZÀ-ÿ\s-]+$/.test(value);
-            
             case 'age':
                 const age = parseInt(value);
                 return !isNaN(age) && age >= 1 && age <= 120;
-            
             case 'genre':
                 const g = value.trim().toUpperCase();
                 return g === 'M' || g === 'F' || g === 'HOMME' || g === 'FEMME';
-            
             case 'poids':
                 const poids = parseFloat(value);
                 return !isNaN(poids) && poids >= 20 && poids <= 200;
-            
             case 'taille':
                 const taille = parseInt(value);
                 return !isNaN(taille) && taille >= 100 && taille <= 250;
-            
             case 'telephone':
                 const clean = value.replace(/\D/g, '');
                 return clean.length === 10 && /^(07|01|05)\d{8}$/.test(clean);
-            
             case 'quartier':
                 return value.trim().length >= 2;
-            
             case 'quantite':
                 const qty = parseInt(value);
                 return !isNaN(qty) && qty >= 1 && qty <= 100;
-            
             case 'indications':
                 return true;
-            
             default:
                 return true;
         }
@@ -186,24 +173,20 @@ class ValidationService {
 
     static normalize(field, value) {
         if (!value) return value;
-
         switch(field) {
             case 'genre':
                 const g = value.trim().toUpperCase();
                 if (g === 'M' || g === 'HOMME' || g === 'H') return 'M';
                 if (g === 'F' || g === 'FEMME' || g === 'F') return 'F';
                 return value;
-            
             case 'telephone':
                 return value.replace(/\D/g, '');
-            
             case 'age':
             case 'poids':
             case 'taille':
             case 'quantite':
                 const num = parseFloat(value);
                 return isNaN(num) ? value : num;
-            
             default:
                 return value.trim();
         }
@@ -219,9 +202,7 @@ class WhatsAppService {
             if (!text || typeof text !== 'string') {
                 text = "Bonjour ! Je suis MARIAM. Comment puis-je t'aider ?";
             }
-            
             const safeText = text.substring(0, 4096);
-            
             await axios.post(WHATSAPP_API_URL, {
                 messaging_product: 'whatsapp',
                 to: to,
@@ -231,7 +212,6 @@ class WhatsAppService {
                 headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
                 timeout: 10000
             });
-            
             return true;
         } catch (error) {
             log('error', `Erreur envoi: ${error.message}`);
@@ -284,12 +264,10 @@ class WhatsAppService {
                 `https://graph.facebook.com/v18.0/${mediaId}`,
                 { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } }
             );
-
             const fileResponse = await axios.get(mediaResponse.data.url, { 
                 responseType: 'arraybuffer',
                 headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
             });
-
             return { success: true, buffer: Buffer.from(fileResponse.data) };
         } catch (error) {
             log('error', `Erreur téléchargement: ${error.message}`);
@@ -322,18 +300,15 @@ class FuseService {
 
     async initialize() {
         log('info', 'Chargement des médicaments...');
-        
         const result = await pool.query(`
             SELECT code_produit, nom_commercial, dci, prix, categorie
             FROM medicaments
         `);
-
         this.medicaments = result.rows.map(med => ({
             ...med,
             normalized: Utils.normalizeText(med.nom_commercial),
             searchable: `${med.nom_commercial} ${med.dci || ''}`.toLowerCase()
         }));
-
         this.fuse = new Fuse(this.medicaments, {
             keys: [
                 { name: 'nom_commercial', weight: 0.8 },
@@ -347,22 +322,18 @@ class FuseService {
             includeScore: true,
             ignoreLocation: true
         });
-
         log('info', `${this.medicaments.length} médicaments chargés`);
     }
 
     async search(query, limit = 5) {
         if (!query || query.length < 2) return [];
-
         const cacheKey = `search:${Utils.normalizeText(query)}`;
         const cached = this.cache.get(cacheKey);
         if (cached) return cached.slice(0, limit);
-
         const results = this.fuse.search(query)
             .filter(r => r.score < 0.4)
             .slice(0, limit)
             .map(r => r.item);
-
         if (results.length > 0) {
             this.cache.set(cacheKey, results);
         }
@@ -384,17 +355,13 @@ class LLMService {
         this.baseURL = "https://api.groq.com/openai/v1";
         this.model = "llama-3.3-70b-versatile";
         this.cache = new NodeCache({ stdTTL: 300 });
-        
         log('info', `🤖 LLM prêt (${this.model})`);
     }
 
     async analyzeMessage(userMessage, conversation) {
         const cacheKey = `llm:${userMessage.substring(0, 50)}:${conversation?.state || 'IDLE'}`;
         const cached = this.cache.get(cacheKey);
-        if (cached) {
-            console.log('📦 Réponse du cache');
-            return cached;
-        }
+        if (cached) return cached;
 
         try {
             const response = await fetch(`${this.baseURL}/chat/completions`, {
@@ -406,39 +373,24 @@ class LLMService {
                 body: JSON.stringify({
                     model: this.model,
                     messages: [
-                        {
-                            role: "system",
-                            content: this.getSystemPrompt(conversation)
-                        },
+                        { role: "system", content: this.getSystemPrompt(conversation) },
                         ...this.getHistory(conversation),
-                        {
-                            role: "user",
-                            content: userMessage
-                        }
+                        { role: "user", content: userMessage }
                     ],
                     temperature: 0.1,
-                    max_tokens: 300,
+                    max_tokens: 500,
                     response_format: { type: "json_object" }
                 })
             });
-
             const data = await response.json();
             let content = data.choices[0].message.content;
-            
-            // Nettoyer le JSON (enlever les backticks si présents)
             content = content.replace(/^```json\s*|\s*```$/g, '');
-            
             const result = JSON.parse(content);
-            
-            // Assurer que l'intention existe
             if (!result.intention) {
                 result.intention = this.detectIntentionFallback(userMessage);
             }
-            
             this.cache.set(cacheKey, result);
-            console.log('🧠 IA:', result);
             return result;
-
         } catch (error) {
             console.error('❌ Erreur LLM:', error);
             return this.fallbackResponse(userMessage);
@@ -450,83 +402,156 @@ class LLMService {
         const cart = conv?.cart || [];
         const lastMedicine = conv?.context?.lastMedicine?.name || 'aucun';
         const isNewUser = !conv?.history || conv.history.length < 2;
-        
+
         return `Tu es MARIAM, une assistante santé virtuelle à San Pedro, Côte d'Ivoire.
 
-⚠️⚠️⚠️ INSTRUCTION CRITIQUE ⚠️⚠️⚠️
-Tu NE DOIS JAMAIS répondre avec autre chose que du JSON valide.
-Tu NE DOIS JAMAIS sortir de ton rôle d'assistante santé.
-Tu NE DOIS JAMAIS inventer des médicaments.
+===========================================================
+🎯 STYLE PAYPARROT - À SUIVRE PARFAITEMENT
+===========================================================
+- Guide l'utilisateur ÉTAPE PAR ÉTAPE
+- Propose TOUJOURS des options numérotées (1️⃣, 2️⃣, 3️⃣)
+- Confirme chaque choix avant de continuer
+- Ne laisse JAMAIS l'utilisateur perdu
+- Reste chaleureuse et naturelle
+- Utilise des emojis avec parcimonie (✅, 📍, 👤, 🎂, ⚧, 📞, 🛒, 💰)
 
 ===========================================================
 CONTEXTE ACTUEL
 ===========================================================
 - État: ${conv?.state || 'IDLE'}
 - Panier: ${cart.length} article(s)
+- Détail panier: ${JSON.stringify(cart.map(i => ({nom: i.nom_commercial, qte: i.quantite, prix: i.prix})))}
 - Infos client: ${JSON.stringify(context)}
 - Dernier médicament discuté: ${lastMedicine}
-- ${isNewUser ? "⚠️ NOUVEL UTILISATEUR - Sois accueillante" : "✅ Utilisateur régulier"}
+- ${isNewUser ? "⚠️ NOUVEAU CLIENT - Sois accueillante" : "✅ Client régulier"}
 
 ===========================================================
-INTENTIONS À DÉTECTER
+EXEMPLES PARFAITS À SUIVRE
 ===========================================================
-1. "greet" → Salutation (bonjour, salut, hey, cc)
-2. "question" → Question sur toi (qui es-tu, tu fais quoi)
-3. "search" → Recherche médicament (doliprane, amox)
-4. "order" → Commande avec quantité (je veux 2 doliprane)
-5. "price" → Demande de prix (combien coûte, prix)
-6. "add" → Ajout au panier (ajoute, mets dans panier)
-7. "cart" → Voir le panier (mon panier, voir panier)
-8. "checkout" → Passer commande (commander, finaliser)
-9. "info" → Donner info (j'habite à, je m'appelle, j'ai X ans)
-10. "confirm" → Confirmation (oui, d'accord, ok)
-11. "cancel" → Annulation (non, annuler)
-12. "unknown" → Pas compris
+1️⃣ PREMIER CONTACT:
+   User: "Salut"
+   Toi: "👋 Salut ! Je suis MARIAM, ton assistante santé à San Pedro.
+         Tu veux :
+         1️⃣ Chercher un médicament 💊
+         2️⃣ Connaître un prix 💰
+         3️⃣ Voir ce que je peux faire 🤔
+         Dis-moi ce qui te ferait plaisir !"
 
-===========================================================
-EXEMPLES PRÉCIS
-===========================================================
-1. "salut" → {"intention":"greet","entites":{},"reponse":"Salut ! Je suis MARIAM. Tu cherches un médicament ?"}
-2. "qui es tu" → {"intention":"question","entites":{},"reponse":"Je suis MARIAM, ton assistante santé à San Pedro."}
-3. "doliprane" → {"intention":"search","entites":{"medicament":"doliprane"},"reponse":"Je cherche le doliprane..."}
-4. "je veux 2 doliprane" → {"intention":"order","entites":{"medicament":"doliprane","quantite":2},"reponse":"D'accord pour 2 doliprane."}
-5. "combien coûte l'amox" → {"intention":"price","entites":{"medicament":"amoxicilline"},"reponse":"L'amoxicilline est à 2500 FCFA."}
-6. "ajoute au panier" → {"intention":"add","entites":{},"reponse":"Quel médicament veux-tu ajouter ?"}
-7. "voir mon panier" → {"intention":"cart","entites":{},"reponse":"Voici ton panier..."}
-8. "commander" → {"intention":"checkout","entites":{},"reponse":"Je prépare ta commande."}
-9. "j'habite à cité" → {"intention":"info","entites":{"champ":"quartier","valeur":"cité"},"reponse":"Cité, c'est noté !"}
-10. "oui" → {"intention":"confirm","entites":{},"reponse":"D'accord, je continue."}
-11. "non" → {"intention":"cancel","entites":{},"reponse":"Pas de problème."}
+2️⃣ RECHERCHE DE MÉDICAMENT:
+   User: "doliprane"
+   Toi: "🔍 Je cherche le doliprane...
+         J'ai trouvé plusieurs options :
+         1️⃣ Doliprane 500mg - 1 000 FCFA (comprimés)
+         2️⃣ Doliprane 1000mg - 1 500 FCFA (comprimés)
+         3️⃣ Doliprane effervescent 500mg - 1 200 FCFA
+         Lequel te conviendrait ? (réponds avec le numéro)"
+
+3️⃣ APRÈS SÉLECTION:
+   User: "1"
+   Toi: "✅ Bon choix ! Doliprane 500mg - 1 000 FCFA la boîte.
+         Combien de boîtes veux-tu ? (exemple: 2)"
+
+4️⃣ APRÈS QUANTITÉ:
+   User: "2"
+   Toi: "✅ 2x Doliprane 500mg ajouté à ton panier (2 000 FCFA)
+         🛒 Ton panier contient maintenant : 2x Doliprane 500mg
+         💰 Total actuel: 2 000 FCFA
+         Tu veux :
+         1️⃣ Ajouter un autre médicament
+         2️⃣ Voir le détail de mon panier
+         3️⃣ Commander maintenant
+         4️⃣ Terminer et partir"
+
+5️⃣ VOIR LE PANIER:
+   User: "2"
+   Toi: "🛒 DÉTAIL DE TON PANIER:
+         • 2x Doliprane 500mg - 2 000 FCFA
+         💰 TOTAL: 2 000 FCFA
+         Frais de livraison: 400 FCFA (jour) / 600 FCFA (nuit)
+         Frais de service: 500 FCFA
+         💵 TOTAL AVEC FRAIS: ${conv.cart ? this.calculateTotalWithFees(conv.cart) : 'à calculer'} FCFA
+         Tu veux :
+         1️⃣ Modifier la quantité d'un article
+         2️⃣ Supprimer un article
+         3️⃣ Continuer vers la livraison
+         4️⃣ Retour"
+
+6️⃣ COMMANDER:
+   User: "3"
+   Toi: "📍 Super ! Pour te livrer à San Pedro, j'ai besoin de quelques informations.
+         D'abord, dans quel quartier habites-tu ? (exemple: Cité, Balmer, Krodji...)"
+
+7️⃣ APRÈS QUARTIER:
+   User: "Cité"
+   Toi: "📍 Cité, parfait ! Je connais bien ce quartier.
+         👤 Quel est ton nom complet ?"
+
+8️⃣ APRÈS NOM:
+   User: "Youssef"
+   Toi: "👤 Enchanté Youssef ! 🎂 Quel âge as-tu ?"
+
+9️⃣ APRÈS ÂGE:
+   User: "25"
+   Toi: "🎂 25 ans, d'accord ! ⚧ Genre ? (M ou F)"
+
+🔟 APRÈS GENRE:
+   User: "M"
+   Toi: "⚧ Parfait ! 📞 Ton numéro de téléphone ? (exemple: 0701234567)"
+
+1️⃣1️⃣ APRÈS TÉLÉPHONE:
+   User: "0701234567"
+   Toi: "📞 07******67, merci !
+         📋 *RÉCAPITULATIF COMPLET DE TA COMMANDE*
+         ARTICLES:
+         • 2x Doliprane 500mg - 2 000 FCFA
+         LIVRAISON:
+         📍 Quartier: Cité
+         👤 Client: Youssef, 25 ans, M
+         📞 Téléphone: 0701234567
+         TOTAUX:
+         💰 Sous-total: 2 000 FCFA
+         🛵 Livraison: 400 FCFA
+         💎 Frais de service: 500 FCFA
+         💵 TOTAL À PAYER: 2 900 FCFA
+         ✅ Tout est correct ? (oui/non)"
+
+1️⃣2️⃣ CONFIRMATION:
+   User: "oui"
+   Toi: "🎉 *COMMANDE CONFIRMÉE #CMD1234*
+         🔑 CODE DE CONFIRMATION: 123456
+         🛵 Livraison prévue dans 45 minutes environ
+         📍 Destination: Cité, San Pedro
+         ⚠️ IMPORTANT: Le livreur te demandera ce code. Ne le partage pas !
+         💝 Merci pour ta confiance Youssef !"
 
 ===========================================================
 FORMAT DE RÉPONSE OBLIGATOIRE
 ===========================================================
 {
-    "intention": "greet|question|search|order|price|add|cart|checkout|info|confirm|cancel|unknown",
+    "intention": "greet|search|select|quantity|add|cart|checkout|info|confirm|modify|help",
     "entites": {
         "medicament": null,
         "quantite": 1,
+        "selection": null,
         "champ": null,
         "valeur": null
     },
-    "reponse": "ta réponse naturelle ici (1-2 phrases)"
+    "reponse": "ta réponse naturelle avec emojis et options numérotées"
 }`;
     }
 
     getHistory(conv) {
         if (!conv?.history) return [];
-        return conv.history
-            .slice(-6)
-            .map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.content
-            }));
+        return conv.history.slice(-6).map(msg => ({
+            role: msg.role === 'user' ? 'user' : 'assistant',
+            content: msg.content
+        }));
     }
 
     detectIntentionFallback(message) {
         const lower = message.toLowerCase();
         if (lower.match(/bonjour|salut|hey|cc/)) return 'greet';
-        if (lower.match(/qui es tu|comment tu t'appelles/)) return 'question';
+        if (lower.match(/qui es tu|comment tu t'appelles/)) return 'info';
         if (lower.match(/\d+\s*[a-z]/)) return 'order';
         if (lower.match(/prix|combien|coûte/)) return 'price';
         if (lower.match(/ajoute|panier/)) return 'add';
@@ -541,8 +566,15 @@ FORMAT DE RÉPONSE OBLIGATOIRE
         return {
             intention: this.detectIntentionFallback(message),
             entites: {},
-            reponse: "Bonjour ! Je suis MARIAM. Comment puis-je t'aider ?"
+            reponse: "👋 Salut ! Je suis MARIAM. Tu veux :\n1️⃣ Chercher un médicament 💊\n2️⃣ Connaître un prix 💰\n3️⃣ Voir ce que je peux faire 🤔\nDis-moi ce qui te ferait plaisir !"
         };
+    }
+
+    calculateTotalWithFees(cart) {
+        if (!cart || cart.length === 0) return 0;
+        const subtotal = cart.reduce((sum, i) => sum + (i.prix * i.quantite), 0);
+        const delivery = Utils.getDeliveryPrice();
+        return subtotal + delivery.price + DELIVERY_CONFIG.SERVICE_FEE;
     }
 }
 
@@ -554,19 +586,16 @@ class VisionService {
         this.apiKey = GROQ_API_KEY;
         this.baseURL = "https://api.groq.com/openai/v1";
         this.model = "meta-llama/llama-4-scout-17b-16e-instruct";
-        
         log('info', '📸 Vision Service prêt');
     }
 
     async analyzeImage(imageBuffer) {
         try {
             const base64Image = imageBuffer.toString('base64');
-            
             const sizeInMB = base64Image.length / 1024 / 1024;
             if (sizeInMB > 4) {
                 return { type: "inconnu", medicaments: [] };
             }
-
             const response = await fetch(`${this.baseURL}/chat/completions`, {
                 method: 'POST',
                 headers: {
@@ -599,13 +628,10 @@ class VisionService {
                     response_format: { type: "json_object" }
                 })
             });
-
             const data = await response.json();
             const content = data.choices[0].message.content;
             const cleanContent = content.replace(/^```json\s*|\s*```$/g, '');
-            
             return JSON.parse(cleanContent);
-
         } catch (error) {
             console.error('❌ Erreur vision:', error);
             return { type: "inconnu", medicaments: [] };
@@ -688,15 +714,10 @@ class OrderService {
             ORDER BY commandes_livrees ASC
             LIMIT 1
         `);
-
-        if (livreurResult.rows.length === 0) {
-            return { success: false };
-        }
-
+        if (livreurResult.rows.length === 0) return { success: false };
         const livreur = livreurResult.rows[0];
         const order = await this.getOrder(orderId);
         await this.updateStatus(orderId, 'ASSIGNED');
-
         const items = order.items.map(i => `${i.quantite}x ${i.nom_commercial}`).join(', ');
         const message = `🛵 NOUVELLE LIVRAISON #${order.id}
 👤 Client: ${order.client_name} (${order.client_phone})
@@ -704,7 +725,6 @@ class OrderService {
 📦 ${items}
 💰 ${order.total} FCFA
 🔑 CODE: ${order.confirmation_code}`;
-
         await this.whatsapp.sendMessage(livreur.whatsapp || livreur.telephone, message);
         return { success: true, livreur };
     }
@@ -717,7 +737,6 @@ class OrderService {
 📦\n${items}
 💰 TOTAL: ${order.total} FCFA
 🔑 CODE: ${order.confirmation_code}`;
-
         await this.whatsapp.sendInteractiveButtons(SUPPORT_PHONE, message, [
             '✅ Valider livraison',
             '❌ Annuler commande'
@@ -736,7 +755,6 @@ class ConversationManager {
         this.llm = null;
         this.vision = null;
         this.orders = null;
-        this.reminders = new Map();
     }
 
     async init() {
@@ -776,30 +794,14 @@ class ConversationManager {
         return null;
     }
 
-    getExpectedField(state) {
-        const map = {
-            [ConversationStates.WAITING_QUARTIER]: 'quartier',
-            [ConversationStates.WAITING_NAME]: 'nom',
-            [ConversationStates.WAITING_AGE]: 'age',
-            [ConversationStates.WAITING_GENDER]: 'genre',
-            [ConversationStates.WAITING_WEIGHT]: 'poids',
-            [ConversationStates.WAITING_HEIGHT]: 'taille',
-            [ConversationStates.WAITING_PHONE]: 'telephone',
-            [ConversationStates.WAITING_INDICATIONS]: 'indications'
-        };
-        return map[state] || null;
-    }
-
     getStateForField(field) {
         const map = {
-            'quartier': ConversationStates.WAITING_QUARTIER,
-            'nom': ConversationStates.WAITING_NAME,
-            'age': ConversationStates.WAITING_AGE,
-            'genre': ConversationStates.WAITING_GENDER,
-            'poids': ConversationStates.WAITING_WEIGHT,
-            'taille': ConversationStates.WAITING_HEIGHT,
-            'telephone': ConversationStates.WAITING_PHONE,
-            'indications': ConversationStates.WAITING_INDICATIONS
+            'quartier': ConversationStates.CHECKOUT_QUARTIER,
+            'nom': ConversationStates.CHECKOUT_NOM,
+            'age': ConversationStates.CHECKOUT_AGE,
+            'genre': ConversationStates.CHECKOUT_GENRE,
+            'telephone': ConversationStates.CHECKOUT_PHONE,
+            'indications': ConversationStates.CHECKOUT_INDICATIONS
         };
         return map[field] || ConversationStates.IDLE;
     }
@@ -809,6 +811,7 @@ class ConversationManager {
         const { text, mediaId, mediaType } = input;
 
         console.log(`\n📩 [${phone}] ${text || mediaType || ''}`);
+        console.log('📊 État AVANT:', { state: conv.state, cart: conv.cart });
 
         try {
             await this.whatsapp.sendTyping(phone);
@@ -817,32 +820,29 @@ class ConversationManager {
                 conv.history.push({ role: 'user', content: text, timestamp: Date.now() });
             }
 
-            // AUDIO
+            // Audio non supporté
             if (mediaType === 'audio') {
                 await this.whatsapp.sendMessage(phone, 
                     "🎤 Désolé, je ne traite pas les messages vocaux. Envoie un texte ou une photo.");
                 return;
             }
 
-            // IMAGE
+            // Image
             if (mediaId) {
                 await this.processImage(phone, mediaId, conv);
                 return;
             }
 
-            // ANALYSE IA
+            // Analyse IA
             const analysis = await this.llm.analyzeMessage(text, conv);
-            
-            // Vérifier si c'est une question sur le bot
-            if (this.isQuestionAboutBot(text)) {
-                analysis.intention = 'question';
-            }
+            console.log('🧠 IA:', analysis);
 
-            // GESTION SELON INTENTION
+            // Gestion de l'intention
             await this.handleIntention(phone, conv, analysis, text);
 
-            conv.lastActivity = Date.now();
+            // Sauvegarde après traitement
             this.conversations.set(phone, conv);
+            console.log('📊 État APRÈS:', { state: conv.state, cart: conv.cart });
 
         } catch (error) {
             console.error('❌ Erreur process:', error);
@@ -851,30 +851,20 @@ class ConversationManager {
         }
     }
 
-    isQuestionAboutBot(text) {
-        const lower = text.toLowerCase();
-        const questions = [
-            'qui es tu', 'qui est tu', 'c\'est qui', 'tu es qui',
-            'comment tu t\'appelles', 'ton nom', 'présente toi',
-            'tu fais quoi', 'comment tu peux m\'aider', 'à quoi tu sers'
-        ];
-        return questions.some(q => lower.includes(q));
-    }
-
     async handleIntention(phone, conv, analysis, originalText) {
         const { intention, entites } = analysis;
 
-        // Envoyer la réponse de l'IA
-        await this.whatsapp.sendMessage(phone, analysis.reponse);
-        conv.history.push({ role: 'assistant', content: analysis.reponse, timestamp: Date.now() });
+        // Envoyer la réponse de l'IA (sauf si déjà géré)
+        if (analysis.reponse) {
+            await this.whatsapp.sendMessage(phone, analysis.reponse);
+            conv.history.push({ role: 'assistant', content: analysis.reponse, timestamp: Date.now() });
+        }
 
         switch(intention) {
             case 'greet':
-                conv.state = ConversationStates.WAITING_MEDICINE;
-                break;
-
-            case 'question':
-                // L'IA a déjà répondu, rien à faire
+                if (conv.state === ConversationStates.IDLE) {
+                    conv.state = ConversationStates.MAIN_MENU;
+                }
                 break;
 
             case 'search':
@@ -882,122 +872,235 @@ class ConversationManager {
             case 'price':
                 const medicineName = entites?.medicament || originalText;
                 const results = await this.fuse.search(medicineName, 5);
-                
                 if (results.length > 0) {
                     this.saveLastMedicine(conv, medicineName, results);
-                    
-                    if (results.length === 1) {
-                        const med = results[0];
+                    conv.context.searchResults = results;
+                    conv.state = ConversationStates.WAITING_SELECTION;
+                    // L'IA a déjà donné la liste, mais on peut forcer un affichage si besoin
+                } else {
+                    // L'IA a déjà dit qu'elle n'a pas trouvé
+                }
+                break;
+
+            case 'select':
+                if (entites?.selection && conv.context.searchResults) {
+                    const index = parseInt(entites.selection) - 1;
+                    if (index >= 0 && index < conv.context.searchResults.length) {
+                        const med = conv.context.searchResults[index];
                         conv.context.pendingMedicine = med;
-                        conv.state = ConversationStates.WAITING_ADD_CONFIRMATION;
-                        
-                        if (intention === 'order' && entites?.quantite) {
-                            conv.context.pendingQuantity = entites.quantite;
-                        }
-                    } else {
-                        conv.context.searchResults = results;
-                        conv.state = ConversationStates.WAITING_SELECTION;
+                        conv.state = ConversationStates.WAITING_QUANTITY;
+                        // L'IA a déjà demandé la quantité
                     }
                 }
                 break;
 
+            case 'quantity':
+                if (entites?.quantite && conv.context.pendingMedicine) {
+                    const med = conv.context.pendingMedicine;
+                    const qty = entites.quantite;
+                    conv.cart.push({ ...med, quantite: qty });
+                    delete conv.context.pendingMedicine;
+                    delete conv.context.searchResults;
+                    conv.state = ConversationStates.IDLE; // Retour au menu après ajout
+                    // L'IA a déjà confirmé l'ajout et proposé les options
+                }
+                break;
+
             case 'add':
-                const lastMedicine = this.getLastMedicine(conv);
-                if (lastMedicine && lastMedicine.results.length === 1) {
-                    conv.context.pendingMedicine = lastMedicine.results[0];
-                    conv.state = ConversationStates.WAITING_ADD_CONFIRMATION;
-                } else if (lastMedicine && lastMedicine.results.length > 1) {
-                    conv.context.searchResults = lastMedicine.results;
+                // L'IA a déjà demandé quel médicament ajouter, on peut utiliser le dernier discuté
+                const lastMed = this.getLastMedicine(conv);
+                if (lastMed && lastMed.results.length === 1) {
+                    conv.context.pendingMedicine = lastMed.results[0];
+                    conv.state = ConversationStates.WAITING_QUANTITY;
+                    await this.whatsapp.sendMessage(phone, 
+                        `Combien de boîtes de ${lastMed.results[0].nom_commercial} veux-tu ?`);
+                } else if (lastMed && lastMed.results.length > 1) {
+                    conv.context.searchResults = lastMed.results;
                     conv.state = ConversationStates.WAITING_SELECTION;
+                } else {
+                    await this.whatsapp.sendMessage(phone, 
+                        "Quel médicament veux-tu ajouter ? Donne-moi son nom.");
                 }
                 break;
 
             case 'cart':
                 await this.showCart(phone, conv);
-                break;
+                return; // Ne pas continuer
 
             case 'checkout':
                 await this.startCheckout(phone, conv);
-                break;
+                return;
 
             case 'info':
                 if (entites?.champ && entites?.valeur) {
                     if (ValidationService.validate(entites.champ, entites.valeur)) {
                         conv.context[entites.champ] = ValidationService.normalize(entites.champ, entites.valeur);
+                        // Passer à l'étape suivante du checkout si on y est
+                        if (conv.state === ConversationStates.CHECKOUT_QUARTIER ||
+                            conv.state === ConversationStates.CHECKOUT_NOM ||
+                            conv.state === ConversationStates.CHECKOUT_AGE ||
+                            conv.state === ConversationStates.CHECKOUT_GENRE ||
+                            conv.state === ConversationStates.CHECKOUT_PHONE) {
+                            // La prochaine étape sera gérée par startCheckout
+                        }
+                    } else {
+                        await this.whatsapp.sendMessage(phone, 
+                            `❌ La valeur "${entites.valeur}" n'est pas valide. Réessaie.`);
                     }
                 }
                 break;
 
             case 'confirm':
-                if (conv.state === ConversationStates.WAITING_ADD_CONFIRMATION && conv.context.pendingMedicine) {
-                    conv.state = ConversationStates.WAITING_QUANTITY;
-                } else if (conv.state === ConversationStates.WAITING_CONFIRMATION) {
+                if (conv.state === ConversationStates.CHECKOUT_CONFIRMATION) {
                     await this.placeOrder(phone, conv);
                     return;
                 }
                 break;
 
-            case 'cancel':
-                // Reset partiel
-                delete conv.context.pendingMedicine;
-                delete conv.context.pendingQuantity;
-                delete conv.context.searchResults;
-                conv.state = ConversationStates.IDLE;
+            case 'modify':
+                // Gérer la modification (simplifié)
+                conv.state = ConversationStates.CART_VIEW;
+                await this.showCart(phone, conv);
+                break;
+
+            case 'help':
+                await this.showHelpMenu(phone, conv);
+                return;
+
+            default:
+                // Intention inconnue, l'IA a déjà répondu
                 break;
         }
 
-        // Gestion des états d'attente
-        const expectedField = this.getExpectedField(conv.state);
-        if (expectedField && !conv.context[expectedField]) {
+        // Vérifier si on doit passer automatiquement à l'étape suivante du checkout
+        if (conv.state === ConversationStates.CHECKOUT_QUARTIER && conv.context.quartier) {
+            await this.whatsapp.sendMessage(phone, "👤 Quel est ton nom complet ?");
+            conv.state = ConversationStates.CHECKOUT_NOM;
+        } else if (conv.state === ConversationStates.CHECKOUT_NOM && conv.context.nom) {
+            await this.whatsapp.sendMessage(phone, "🎂 Quel âge as-tu ?");
+            conv.state = ConversationStates.CHECKOUT_AGE;
+        } else if (conv.state === ConversationStates.CHECKOUT_AGE && conv.context.age) {
+            await this.whatsapp.sendMessage(phone, "⚧ Genre (M/F) ?");
+            conv.state = ConversationStates.CHECKOUT_GENRE;
+        } else if (conv.state === ConversationStates.CHECKOUT_GENRE && conv.context.genre) {
+            await this.whatsapp.sendMessage(phone, "📞 Ton numéro de téléphone ?");
+            conv.state = ConversationStates.CHECKOUT_PHONE;
+        } else if (conv.state === ConversationStates.CHECKOUT_PHONE && conv.context.telephone) {
+            // Toutes les infos sont là, afficher récapitulatif
+            await this.showSummary(phone, conv);
+            conv.state = ConversationStates.CHECKOUT_CONFIRMATION;
+        }
+    }
+
+    async showCart(phone, conv) {
+        if (!conv.cart || conv.cart.length === 0) {
+            await this.whatsapp.sendMessage(phone, 
+                "🛒 Ton panier est vide. Ajoute des médicaments avec leur nom.");
+            return;
+        }
+
+        const items = conv.cart.map(i => 
+            `• ${i.quantite}x ${i.nom_commercial} - ${(i.prix * i.quantite).toLocaleString()} FCFA`
+        ).join('\n');
+        const subtotal = conv.cart.reduce((sum, i) => sum + (i.prix * i.quantite), 0);
+        const delivery = Utils.getDeliveryPrice();
+        const total = subtotal + delivery.price + DELIVERY_CONFIG.SERVICE_FEE;
+
+        const message = `🛒 *DÉTAIL DE TON PANIER*\n\n${items}\n\n` +
+            `💰 Sous-total: ${subtotal.toLocaleString()} FCFA\n` +
+            `🛵 Livraison: ${delivery.price.toLocaleString()} FCFA\n` +
+            `💎 Frais service: ${DELIVERY_CONFIG.SERVICE_FEE.toLocaleString()} FCFA\n` +
+            `💵 TOTAL: ${total.toLocaleString()} FCFA\n\n` +
+            `Tu veux :\n` +
+            `1️⃣ Ajouter un article\n` +
+            `2️⃣ Commander maintenant\n` +
+            `3️⃣ Retour au menu`;
+
+        await this.whatsapp.sendMessage(phone, message);
+        conv.state = ConversationStates.CART_VIEW;
+    }
+
+    async startCheckout(phone, conv) {
+        if (!conv.cart || conv.cart.length === 0) {
+            await this.whatsapp.sendMessage(phone, 
+                "❌ Ton panier est vide. Ajoute d'abord des médicaments.");
+            return;
+        }
+
+        const required = ['quartier', 'nom', 'age', 'genre', 'telephone'];
+        const missing = required.filter(f => !conv.context[f]);
+        
+        if (missing.length > 0) {
+            const firstMissing = missing[0];
             const questions = {
                 'quartier': "📍 Dans quel quartier habites-tu ?",
                 'nom': "👤 Ton nom complet ?",
                 'age': "🎂 Ton âge ?",
                 'genre': "⚧ Genre (M/F) ?",
-                'poids': "⚖️ Ton poids ?",
-                'taille': "📏 Ta taille ?",
-                'telephone': "📞 Ton téléphone ?",
-                'indications': "📍 Indications pour le livreur ?"
+                'telephone': "📞 Ton numéro de téléphone ?"
             };
-            await this.whatsapp.sendMessage(phone, questions[expectedField]);
-        }
-
-        // Gestion de la quantité
-        if (conv.state === ConversationStates.WAITING_QUANTITY && conv.context.pendingMedicine) {
-            const qty = entites?.quantite || Utils.extractNumber(originalText) || 1;
-            
-            if (qty >= 1 && qty <= 100) {
-                const med = conv.context.pendingMedicine;
-                conv.cart.push({ ...med, quantite: qty });
-                
-                delete conv.context.pendingMedicine;
-                delete conv.context.pendingQuantity;
-                conv.state = ConversationStates.WAITING_POST_ADD;
-                
-                await this.whatsapp.sendMessage(phone, 
-                    `✅ ${qty}x ${med.nom_commercial} ajouté (${med.prix * qty} FCFA). Tu veux autre chose ?`);
-            }
-        }
-
-        // Gestion de la sélection
-        if (conv.state === ConversationStates.WAITING_SELECTION && conv.context.searchResults) {
-            const num = parseInt(originalText);
-            if (num >= 1 && num <= conv.context.searchResults.length) {
-                const med = conv.context.searchResults[num - 1];
-                conv.context.pendingMedicine = med;
-                conv.state = ConversationStates.WAITING_ADD_CONFIRMATION;
-                
-                await this.whatsapp.sendMessage(phone, 
-                    `💊 ${med.nom_commercial} à ${med.prix} FCFA. Ajouter au panier ? (oui/non)`);
-            }
-        }
-
-        // Vérifier si on peut passer au checkout
-        if (conv.cart.length > 0 && 
-            conv.context.quartier && conv.context.nom && 
-            conv.context.age && conv.context.genre && conv.context.telephone) {
+            conv.state = this.getStateForField(firstMissing);
+            await this.whatsapp.sendMessage(phone, questions[firstMissing]);
+        } else {
             await this.showSummary(phone, conv);
-            conv.state = ConversationStates.WAITING_CONFIRMATION;
+            conv.state = ConversationStates.CHECKOUT_CONFIRMATION;
+        }
+    }
+
+    async showSummary(phone, conv) {
+        const items = conv.cart.map(i => 
+            `• ${i.quantite}x ${i.nom_commercial} - ${(i.prix * i.quantite).toLocaleString()} FCFA`
+        ).join('\n');
+        const subtotal = conv.cart.reduce((sum, i) => sum + (i.prix * i.quantite), 0);
+        const delivery = Utils.getDeliveryPrice();
+        const total = subtotal + delivery.price + DELIVERY_CONFIG.SERVICE_FEE;
+
+        const message = `📋 *RÉCAPITULATIF DE TA COMMANDE*\n\n${items}\n\n` +
+            `📍 Livraison: ${conv.context.quartier}\n` +
+            `👤 ${conv.context.nom}, ${conv.context.age} ans, ${conv.context.genre}\n` +
+            `📞 ${conv.context.telephone}\n\n` +
+            `💰 Sous-total: ${subtotal.toLocaleString()} FCFA\n` +
+            `🛵 Livraison: ${delivery.price.toLocaleString()} FCFA\n` +
+            `💎 Frais service: ${DELIVERY_CONFIG.SERVICE_FEE.toLocaleString()} FCFA\n` +
+            `💵 TOTAL: ${total.toLocaleString()} FCFA\n\n` +
+            `✅ Tout est correct ? (oui/non)`;
+
+        await this.whatsapp.sendMessage(phone, message);
+    }
+
+    async placeOrder(phone, conv) {
+        if (!conv.cart || conv.cart.length === 0) {
+            await this.whatsapp.sendMessage(phone, 
+                "❌ Ton panier est vide. Impossible de commander.");
+            return;
+        }
+
+        try {
+            const order = await this.orders.createOrder(phone, conv.cart, conv.context);
+            
+            await this.whatsapp.sendMessage(phone, 
+                `🎉 *COMMANDE CONFIRMÉE #${order.id}*\n` +
+                `🔑 CODE: ${order.confirmation_code}\n` +
+                `🛵 Livraison dans ~45 min\n\n` +
+                `Le livreur te demandera ce code. Garde-le précieusement !\n` +
+                `💝 Merci pour ta confiance !`);
+
+            await this.orders.notifySupport(order);
+            await this.orders.assignLivreur(order.id);
+
+            // Reset conversation
+            this.conversations.set(phone, {
+                state: ConversationStates.ORDER_CONFIRMED,
+                cart: [],
+                context: {},
+                history: conv.history.slice(-5),
+                lastActivity: Date.now()
+            });
+
+        } catch (error) {
+            console.error('❌ Erreur placeOrder:', error);
+            await this.whatsapp.sendMessage(phone, 
+                "❌ Une erreur est survenue. Contacte le support.");
         }
     }
 
@@ -1032,134 +1135,33 @@ class ConversationManager {
 
         if (foundMedicines.length === 1) {
             conv.context.pendingMedicine = foundMedicines[0];
-            conv.state = ConversationStates.WAITING_ADD_CONFIRMATION;
-            
+            conv.state = ConversationStates.WAITING_QUANTITY;
             await this.whatsapp.sendMessage(phone, 
-                `📸 J'ai détecté *${foundMedicines[0].nom_commercial}* à ${foundMedicines[0].prix} FCFA.\n\nAjouter au panier ? (oui/non)`);
+                `📸 J'ai détecté *${foundMedicines[0].nom_commercial}* à ${foundMedicines[0].prix} FCFA.\n\n` +
+                `Combien de boîtes veux-tu ?`);
         } else {
             conv.context.pendingImageOptions = foundMedicines;
-            conv.state = ConversationStates.WAITING_IMAGE_SELECTION;
-            
+            conv.state = ConversationStates.WAITING_SELECTION;
             const list = foundMedicines.map((m, i) => 
-                `${i+1}. *${m.nom_commercial}* (${m.prix} FCFA)`).join('\n');
-            
+                `${i+1}️⃣ *${m.nom_commercial}* - ${m.prix} FCFA`).join('\n');
             await this.whatsapp.sendMessage(phone, 
-                `📸 Plusieurs médicaments détectés:\n${list}\n\nLequel veux-tu ajouter ?`);
+                `📸 Plusieurs médicaments détectés:\n${list}\n\nLequel veux-tu ? (réponds avec le numéro)`);
         }
 
         this.conversations.set(phone, conv);
     }
 
-    async showCart(phone, conv) {
-        if (!conv.cart?.length) {
-            await this.whatsapp.sendMessage(phone, 
-                "🛒 Ton panier est vide. Ajoute des médicaments avec leur nom.");
-            return;
-        }
-
-        const items = conv.cart.map(i => 
-            `• ${i.quantite}x ${i.nom_commercial} (${i.prix * i.quantite} FCFA)`).join('\n');
-        const total = conv.cart.reduce((sum, i) => sum + (i.prix * i.quantite), 0);
-        
-        await this.whatsapp.sendMessage(phone, 
-            `🛒 *TON PANIER*\n${items}\n💰 Sous-total: ${total} FCFA`);
-    }
-
-    async showSummary(phone, conv) {
-        const total = Utils.calculateTotal(conv.cart);
-        const items = conv.cart.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n');
-        
-        await this.whatsapp.sendMessage(phone, 
-            `📋 *RÉCAPITULATIF*\n${items}\n📍 ${conv.context.quartier}\n👤 ${conv.context.nom}\n💰 Total: ${total} FCFA\n\nConfirme avec "oui"`);
-    }
-
-    async startCheckout(phone, conv) {
-        if (!conv.cart?.length) {
-            await this.whatsapp.sendMessage(phone, 
-                "❌ Ton panier est vide. Ajoute d'abord des médicaments.");
-            return;
-        }
-
-        const required = ['quartier', 'nom', 'age', 'genre', 'telephone'];
-        const missing = required.filter(f => !conv.context[f]);
-        
-        if (missing.length > 0) {
-            const firstMissing = missing[0];
-            const questions = {
-                'quartier': "📍 Pour la livraison, dans quel quartier habites-tu ?",
-                'nom': "👤 Quel est ton nom complet ?",
-                'age': "🎂 Quel âge as-tu ?",
-                'genre': "⚧ Genre (M/F) ?",
-                'telephone': "📞 Ton numéro de téléphone ?"
-            };
-            
-            conv.state = this.getStateForField(firstMissing);
-            await this.whatsapp.sendMessage(phone, questions[firstMissing]);
-        } else {
-            await this.showSummary(phone, conv);
-            conv.state = ConversationStates.WAITING_CONFIRMATION;
-        }
-    }
-
-    async placeOrder(phone, conv) {
-        try {
-            // Vérifications finales
-            if (!conv.cart?.length) {
-                await this.whatsapp.sendMessage(phone, "❌ Panier vide.");
-                return;
-            }
-
-            const required = ['quartier', 'nom', 'age', 'genre', 'telephone'];
-            const missing = required.filter(f => !conv.context[f]);
-            if (missing.length > 0) {
-                await this.startCheckout(phone, conv);
-                return;
-            }
-
-            // Créer la commande
-            const order = await this.orders.createOrder(phone, conv.cart, conv.context);
-            
-            // Confirmation client
-            await this.whatsapp.sendMessage(phone, 
-                `🎉 *Commande confirmée #${order.id}*\n🔑 Code: ${order.confirmation_code}\n🛵 Livraison dans ~45 min\n\nLe livreur te demandera ce code.`);
-            
-            // Notifications
-            await this.orders.notifySupport(order);
-            await this.orders.assignLivreur(order.id);
-
-            // Reset conversation
-            this.conversations.set(phone, {
-                state: ConversationStates.IDLE,
-                cart: [],
-                context: {},
-                history: conv.history.slice(-5),
-                lastActivity: Date.now()
-            });
-
-        } catch (error) {
-            console.error('❌ Erreur placeOrder:', error);
-            await this.whatsapp.sendMessage(phone, 
-                "❌ Une erreur est survenue. Contacte le support au 0701406880.");
-        }
-    }
-
-    async handleButton(phone, buttonText, orderId) {
-        const order = await this.orders.getOrder(orderId);
-        if (!order) return;
-
-        if (buttonText.includes('Valider')) {
-            await this.orders.updateStatus(orderId, 'DELIVERED');
-            await this.whatsapp.sendMessage(order.client_phone, 
-                `🎉 Commande #${orderId} livrée ! Merci !`);
-            await this.whatsapp.sendMessage(SUPPORT_PHONE, 
-                `✅ Commande #${orderId} validée`);
-        } else if (buttonText.includes('Annuler')) {
-            await this.orders.updateStatus(orderId, 'CANCELED');
-            await this.whatsapp.sendMessage(order.client_phone, 
-                `❌ Commande #${orderId} annulée`);
-            await this.whatsapp.sendMessage(SUPPORT_PHONE, 
-                `❌ Commande #${orderId} annulée`);
-        }
+    async showHelpMenu(phone, conv) {
+        const message = `🤔 *BESOIN D'AIDE ?*\n\n` +
+            `1️⃣ Comment chercher un médicament ?\n` +
+            `2️⃣ Comment passer commande ?\n` +
+            `3️⃣ Comment ça marche pour la livraison ?\n` +
+            `4️⃣ Puis-je modifier ma commande ?\n` +
+            `5️⃣ Parler à un conseiller\n` +
+            `6️⃣ Retour au menu principal\n\n` +
+            `Choisis une option :`;
+        await this.whatsapp.sendMessage(phone, message);
+        conv.state = ConversationStates.HELP_MENU;
     }
 }
 
@@ -1176,7 +1178,6 @@ async function initDatabase() {
             categorie VARCHAR(100),
             created_at TIMESTAMP DEFAULT NOW()
         );
-
         CREATE TABLE IF NOT EXISTS orders (
             id VARCHAR(50) PRIMARY KEY,
             client_name VARCHAR(100),
@@ -1200,7 +1201,6 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         );
-
         CREATE TABLE IF NOT EXISTS livreurs (
             id_livreur SERIAL PRIMARY KEY,
             nom VARCHAR(100) NOT NULL,
@@ -1210,11 +1210,9 @@ async function initDatabase() {
             commandes_livrees INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT NOW()
         );
-
         CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(client_phone);
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
     `);
-
     log('info', 'Base de données prête');
 }
 
@@ -1248,12 +1246,10 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
-
     try {
         const entry = req.body.entry?.[0];
         const changes = entry?.changes?.[0];
         const msg = changes?.value?.messages?.[0];
-
         if (!msg) return;
         if (processedMessages.has(msg.id)) return;
         processedMessages.set(msg.id, true);
@@ -1274,7 +1270,6 @@ app.post('/webhook', async (req, res) => {
             const orderId = msg.interactive.button_reply.id.split('_')[2];
             await bot.handleButton(phone, buttonText, orderId);
         }
-
     } catch (error) {
         log('error', `Webhook: ${error.message}`);
     }
@@ -1289,7 +1284,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Nettoyage périodique
+// Nettoyage périodique des conversations inactives
 setInterval(() => {
     const now = Date.now();
     for (const [phone, conv] of bot.conversations) {
@@ -1307,7 +1302,6 @@ async function start() {
     try {
         await initDatabase();
         await bot.init();
-
         app.listen(PORT, '0.0.0.0', () => {
             console.log(`
 ╔═══════════════════════════════════════════════════════════╗
@@ -1318,10 +1312,10 @@ async function start() {
 ║   🤖 IA Conversationnelle: llama-3.3-70b-versatile        ║
 ║   📸 Vision: llama-4-scout-17b-16e-instruct               ║
 ║   🔍 Recherche: Fuse.js (6000+ médicaments)               ║
-║   ✅ Validations strictes (8 champs)                      ║
-║   🛒 Gestion complète des commandes                        ║
+║   ✅ Style PayParrot - 100% IA                            ║
+║   🛒 Gestion de panier robuste                            ║
 ║   📱 Notifications livreur et support                      ║
-║   ⚡ Cache multi-niveaux                                    ║
+║   ⚡ Cache et performances optimisés                       ║
 ║   💰 100% GRATUIT !                                        ║
 ║                                                           ║
 ║   📱 Port: ${PORT}                                         ║

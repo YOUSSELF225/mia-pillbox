@@ -877,18 +877,18 @@ Examples:
 }
 
 // ===========================================
-// SERVICE LLM - DEEPSEEK-V3 SUR SILICONFLOW
+// SERVICE LLM - DEEPSEEK-V2.5 SUR SILICONFLOW
 // ===========================================
 class LLMService {
     constructor() {
         this.apiKey = SILICONFLOW_API_KEY;
-        this.client = this.apiKey ? new Groq({ // Groq SDK est compatible OpenAI
+        this.client = this.apiKey ? new Groq({
             apiKey: this.apiKey,
-            baseURL: "https://api.siliconflow.cn/v1" // URL de base de SiliconFlow
+            baseURL: "https://api.siliconflow.com/v1" // URL correcte
         }) : null;
 
         this.cache = new NodeCache({ stdTTL: 86400, useClones: false });
-        this.model = "deepseek-ai/DeepSeek-V3";
+        this.model = "deepseek-ai/DeepSeek-V2.5"; // Modèle fiable avec JSON mode
         
         this.systemPrompt = `You are MARIAM, a helpful pharmacy assistant in San Pedro, Côte d'Ivoire.
 Your task is to analyze user messages and return a valid JSON object.
@@ -930,7 +930,7 @@ User: "commander" → {"intention":"checkout"}`;
         if (cached) return cached;
 
         try {
-            log('info', `🧠 DeepSeek-V3 analyse: "${text.substring(0, 50)}..."`);
+            log('info', `🧠 DeepSeek-V2.5 analyse: "${text.substring(0, 50)}..."`);
             
             const response = await this.client.chat.completions.create({
                 model: this.model,
@@ -940,7 +940,7 @@ User: "commander" → {"intention":"checkout"}`;
                 ],
                 temperature: 0.1,
                 max_tokens: 150,
-                response_format: { type: "json_object" }
+                response_format: { type: "json_object" } // Supporté par V2.5
             });
 
             const content = response.choices[0].message.content;
@@ -958,11 +958,11 @@ User: "commander" → {"intention":"checkout"}`;
             };
 
             this.cache.set(cacheKey, validated);
-            log('info', `✅ DeepSeek-V3: ${validated.intention} ${validated.medicine || ''}`);
+            log('info', `✅ DeepSeek-V2.5: ${validated.intention} ${validated.medicine || ''}`);
             return validated;
 
         } catch (error) {
-            log('error', `❌ Erreur DeepSeek-V3: ${error.message}`);
+            log('error', `❌ Erreur DeepSeek-V2.5: ${error.message}`);
             return this.smartFallback(text);
         }
     }
@@ -1961,9 +1961,9 @@ async function start() {
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║   📱 Port: ${PORT}                                         ║
 ║                                                           ║
-║   ✅ LLM: DeepSeek-V3 (SiliconFlow)                       ║
+║   ✅ LLM: DeepSeek-V2.5 (SiliconFlow)                     ║
 ║   ✅ Vision: Groq (conservé)                              ║
-║   ✅ Prompt structuré en anglais                          ║
+║   ✅ Architecture hybride (IA analyse, code répond)       ║
 ║   ✅ Gestion des recherches sans nom                      ║
 ║   ✅ États de conversation corrigés                        ║
 ║   ✅ Fuse.js (6000+ médicaments)                          ║

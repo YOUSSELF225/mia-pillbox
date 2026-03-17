@@ -1,7 +1,7 @@
 // ===========================================
 // MARIAM BOT - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// 100% IA - Validations strictes - Fuse.js pour recherche
+// 100% IA avec SiliconFlow - Fuse.js pour recherche
 // ===========================================
 
 require('dotenv').config();
@@ -9,11 +9,8 @@ const express = require('express');
 const axios = require('axios');
 const { Pool } = require('pg');
 const NodeCache = require('node-cache');
-const Groq = require('groq-sdk');
 const Fuse = require('fuse.js');
 const winston = require('winston');
-const path = require('path');
-const fs = require('fs');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 
@@ -50,10 +47,11 @@ const ConversationStates = {
     WAITING_INDICATIONS: 'WAITING_INDICATIONS',
     WAITING_CONFIRMATION: 'WAITING_CONFIRMATION',
     WAITING_IMAGE_SELECTION: 'WAITING_IMAGE_SELECTION',
-    WAITING_REVIEW_NOTE: 'WAITING_REVIEW_NOTE',
-    WAITING_REVIEW_COMMENT: 'WAITING_REVIEW_COMMENT',
     ORDER_PLACED: 'ORDER_PLACED'
 };
+
+// Cache pour éviter les doublons
+const processedMessages = new NodeCache({ stdTTL: 600 });
 
 // ===========================================
 // LOGGER
@@ -62,9 +60,7 @@ const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-        winston.format.printf(info => {
-            return `${info.timestamp} [${info.level.toUpperCase()}] ${info.message}`;
-        })
+        winston.format.printf(info => `${info.timestamp} [${info.level.toUpperCase()}] ${info.message}`)
     ),
     transports: [
         new winston.transports.Console(),
@@ -74,6 +70,7 @@ const logger = winston.createLogger({
 
 function log(level, message) {
     logger.log(level, message);
+    console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
 // ===========================================
@@ -81,7 +78,10 @@ function log(level, message) {
 // ===========================================
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000
 });
 
 pool.on('error', (err) => log('error', `Erreur DB: ${err.message}`));
@@ -211,7 +211,8 @@ class WhatsAppService {
                 type: 'text',
                 text: { body: text.substring(0, 4096) }
             }, {
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                timeout: 10000
             });
             return true;
         } catch (error) {
@@ -344,143 +345,166 @@ class FuseService {
 }
 
 // ===========================================
-// LLM SERVICE - QWEN3-VL
+// LLM SERVICE - SILICONFLOW (TESTÉ ET VALIDÉ)
 // ===========================================
 class LLMService {
     constructor() {
         this.apiKey = SILICONFLOW_API_KEY;
-        this.client = new Groq({
-            apiKey: this.apiKey,
-            baseURL: "https://api.siliconflow.com/v1"
-        });
-        this.model = "Qwen/Qwen3-VL-32B-Instruct";
-        this.cache = new NodeCache({ stdTTL: 86400 });
+        this.baseURL = "https://api.siliconflow.com/v1";
+        this.model = "Qwen/Qwen2.5-72B-Instruct";
+        this.cache = new NodeCache({ stdTTL: 300 });
+        
+        log('info', `🤖 LLM Service prêt: ${this.model}`);
     }
 
-    async generateResponse(context) {
-        const {
-            userMessage,
-            conversation,
-            messageType = 'text',
-            mediaData = null,
-            validationError = null,
-            fieldRequested = null
-        } = context;
-
-        const cacheKey = `llm:${JSON.stringify({ userMessage, messageType, validationError })}`;
+    async generateResponse(userMessage, conversation) {
+        const cacheKey = `llm:${userMessage.substring(0, 50)}:${conversation.state}`;
         const cached = this.cache.get(cacheKey);
         if (cached) return cached;
 
         try {
-            const response = await this.client.chat.completions.create({
-                model: this.model,
-                messages: [
-                    { role: "system", content: this.buildSystemPrompt(conversation, validationError, fieldRequested) },
-                    ...this.getHistory(conversation),
-                    this.buildUserPrompt(userMessage, messageType, mediaData)
-                ],
-                temperature: 0.8,
-                max_tokens: 500,
-                response_format: { type: "json_object" }
+            const response = await fetch(`${this.baseURL}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: this.model,
+                    messages: [
+                        {
+                            role: "system",
+                            content: this.getSystemPrompt(conversation)
+                        },
+                        {
+                            role: "user",
+                            content: userMessage
+                        }
+                    ],
+                    temperature: 0.3,
+                    max_tokens: 150
+                })
             });
 
-            const result = JSON.parse(response.choices[0].message.content);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const data = await response.json();
+            const reply = data.choices[0].message.content;
+            
+            const result = {
+                success: true,
+                message: reply,
+                intention: this.detectIntention(userMessage)
+            };
+            
             this.cache.set(cacheKey, result);
             return result;
 
         } catch (error) {
             log('error', `Erreur LLM: ${error.message}`);
-            throw new Error('LLM service unavailable');
-        }
-    }
-
-    buildSystemPrompt(conv, validationError, fieldRequested) {
-        let prompt = `Tu es MARIAM, assistante santé à San Pedro, Côte d'Ivoire.
-Tu parles naturellement, de façon variée, et tu t'adaptes à chaque utilisateur.
-
-CONTEXTE ACTUEL:
-- État: ${conv.state}
-- Panier: ${conv.cart?.length || 0} articles
-- Infos client: ${JSON.stringify(conv.context || {})}
-`;
-
-        if (validationError) {
-            prompt += `
-ERREUR DE VALIDATION: L'utilisateur a fourni "${validationError.value}" pour "${validationError.field}".
-Cette valeur est invalide. Explique poliment pourquoi et redemande correctement.
-`;
-        }
-
-        if (fieldRequested) {
-            const instructions = {
-                'nom': "Demande le nom complet (lettres uniquement)",
-                'age': "Demande l'âge (1-120 ans)",
-                'genre': "Demande M ou F",
-                'poids': "Demande le poids en kg (20-200)",
-                'taille': "Demande la taille en cm (100-250)",
-                'telephone': "Demande le téléphone (10 chiffres, format 07...)",
-                'quartier': "Demande le quartier à San Pedro",
-                'quantite': "Demande la quantité (1-100 boîtes)",
-                'medicine': "Demande le nom du médicament"
-            };
-            prompt += `\nTU DOIS DEMANDER: ${instructions[fieldRequested] || "Demande naturellement"}\n`;
-        }
-
-        prompt += `
-FORMAT DE REPONSE (JSON):
-{
-    "message": "ta réponse naturelle",
-    "intention": "greet|order|info|confirm|unknown",
-    "next_state": "${conv.state}",
-    "extracted_data": {}
-}`;
-
-        return prompt;
-    }
-
-    getHistory(conv) {
-        return (conv.history || [])
-            .slice(-5)
-            .map(msg => ({
-                role: msg.role === 'bot' ? 'assistant' : 'user',
-                content: msg.content
-            }));
-    }
-
-    buildUserPrompt(message, type, mediaData) {
-        if (type === 'image' && mediaData) {
             return {
-                role: "user",
-                content: [
-                    { type: "text", text: "Analyse cette image de médicament:" },
-                    { type: "image_url", image_url: { url: `data:image/jpeg;base64,${mediaData}` } }
-                ]
+                success: false,
+                message: this.getFallbackMessage(userMessage, conversation),
+                intention: 'unknown'
             };
         }
-        return { role: "user", content: message };
     }
 
     async analyzeImage(base64Image) {
         try {
-            const response = await this.client.chat.completions.create({
-                model: this.model,
-                messages: [{
-                    role: "user",
-                    content: [
-                        { type: "text", text: "Liste les médicaments détectés dans cette image. Réponds en JSON: {type: 'box|prescription', medicines: [{name, dosage, form}]}" },
-                        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-                    ]
-                }],
-                temperature: 0,
-                max_tokens: 300,
-                response_format: { type: "json_object" }
+            const response = await fetch(`${this.baseURL}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: "Qwen/Qwen2.5-VL-72B-Instruct",
+                    messages: [
+                        {
+                            role: "user",
+                            content: [
+                                {
+                                    type: "image_url",
+                                    image_url: { url: `data:image/jpeg;base64,${base64Image}` }
+                                },
+                                {
+                                    type: "text",
+                                    text: "Liste les médicaments détectés sur cette image. Réponds en JSON avec format: {medicaments: [{nom, dosage, forme}]}"
+                                }
+                            ]
+                        }
+                    ],
+                    temperature: 0.1,
+                    max_tokens: 200
+                })
             });
 
-            return JSON.parse(response.choices[0].message.content);
+            const data = await response.json();
+            const content = data.choices[0].message.content;
+            
+            try {
+                return JSON.parse(content);
+            } catch {
+                return { medicaments: [] };
+            }
+
         } catch (error) {
             log('error', `Erreur vision: ${error.message}`);
-            return { type: 'unknown', medicines: [] };
+            return { medicaments: [] };
         }
+    }
+
+    getSystemPrompt(conv) {
+        return `Tu es MARIAM, assistante santé à San Pedro, Côte d'Ivoire.
+
+CONTEXTE:
+- État: ${conv.state}
+- Panier: ${conv.cart?.length || 0} articles
+
+RÈGLES:
+- Réponds en français, naturel et chaleureux
+- Sois concise (max 2 phrases)
+- Adapte-toi au contexte
+
+EXEMPLES:
+- "Bonjour ! Je suis MARIAM. Quel médicament cherches-tu ?"
+- "D'accord pour le doliprane. Combien de boîtes veux-tu ?"
+- "Dans quel quartier habites-tu à San Pedro ?"`;
+    }
+
+    detectIntention(message) {
+        const msg = message.toLowerCase();
+        if (msg.match(/bonjour|salut|hey|cc|bonsoir/)) return 'greet';
+        if (msg.match(/doliprane|paracétamol|amox|ibuprofène|aspirine/)) return 'order';
+        if (msg.match(/prix|combien|coûte|tarif/)) return 'price';
+        if (msg.match(/quartier|cité|balmer|zone/)) return 'info';
+        if (msg.match(/commander|valider|confirmer|oui/)) return 'confirm';
+        return 'unknown';
+    }
+
+    getFallbackMessage(message, conv) {
+        const msg = message.toLowerCase();
+        
+        if (conv.state === 'WAITING_QUARTIER') 
+            return "📍 Dans quel quartier habites-tu à San Pedro ?";
+        if (conv.state === 'WAITING_NAME')
+            return "👤 Quel est ton nom complet ?";
+        if (conv.state === 'WAITING_AGE')
+            return "🎂 Quel âge as-tu ?";
+        if (conv.state === 'WAITING_GENDER')
+            return "⚧ Genre (M/F) ?";
+        if (conv.state === 'WAITING_PHONE')
+            return "📞 Ton numéro de téléphone ?";
+            
+        if (msg.match(/bonjour|salut/)) 
+            return "Bonjour ! Je suis MARIAM. Quel médicament cherches-tu ?";
+        if (msg.length > 2) 
+            return `Je cherche "${message}" dans ma base de médicaments...`;
+            
+        return "Je peux t'aider à trouver des médicaments. Tape le nom de celui que tu cherches.";
     }
 }
 
@@ -602,14 +626,14 @@ class OrderService {
 class ConversationManager {
     constructor() {
         this.conversations = new Map();
+        this.whatsapp = new WhatsAppService();
         this.fuse = null;
         this.llm = null;
-        this.whatsapp = null;
         this.orders = null;
+        this.init();
     }
 
-    async initialize() {
-        this.whatsapp = new WhatsAppService();
+    async init() {
         this.fuse = new FuseService();
         await this.fuse.initialize();
         this.llm = new LLMService();
@@ -623,8 +647,7 @@ class ConversationManager {
                 cart: [],
                 context: {},
                 history: [],
-                lastActivity: Date.now(),
-                createdAt: Date.now()
+                lastActivity: Date.now()
             });
         }
         return this.conversations.get(phone);
@@ -641,8 +664,7 @@ class ConversationManager {
             [ConversationStates.WAITING_WEIGHT]: 'poids',
             [ConversationStates.WAITING_HEIGHT]: 'taille',
             [ConversationStates.WAITING_PHONE]: 'telephone',
-            [ConversationStates.WAITING_INDICATIONS]: 'indications',
-            [ConversationStates.WAITING_CONFIRMATION]: 'confirmation'
+            [ConversationStates.WAITING_INDICATIONS]: 'indications'
         };
         return map[state] || null;
     }
@@ -658,8 +680,7 @@ class ConversationManager {
             [ConversationStates.WAITING_WEIGHT]: ConversationStates.WAITING_HEIGHT,
             [ConversationStates.WAITING_HEIGHT]: ConversationStates.WAITING_PHONE,
             [ConversationStates.WAITING_PHONE]: ConversationStates.WAITING_INDICATIONS,
-            [ConversationStates.WAITING_INDICATIONS]: ConversationStates.WAITING_CONFIRMATION,
-            [ConversationStates.WAITING_CONFIRMATION]: ConversationStates.ORDER_PLACED
+            [ConversationStates.WAITING_INDICATIONS]: ConversationStates.WAITING_CONFIRMATION
         };
         return flow[currentState] || currentState;
     }
@@ -668,62 +689,49 @@ class ConversationManager {
         const conv = this.getConversation(phone);
         const { text, mediaId, mediaType } = input;
 
-        console.log(`📩 ${phone}: ${text || mediaType || ''}`);
+        console.log(`\n📩 [${phone}] ${mediaType || 'texte'}: ${text || ''}`);
 
         try {
             conv.history.push({ role: 'user', content: text || `[${mediaType}]`, timestamp: Date.now() });
 
-            // Audio
+            // AUDIO
             if (mediaType === 'audio') {
-                const response = await this.llm.generateResponse({
-                    userMessage: "[AUDIO]",
-                    conversation: conv,
-                    messageType: 'audio'
-                });
-                await this.whatsapp.sendMessage(phone, response.message);
-                conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
-                this.conversations.set(phone, conv);
+                await this.whatsapp.sendMessage(phone, 
+                    "🎤 Désolé, je ne traite pas les messages vocaux. Envoie un texte ou une photo.");
                 return;
             }
 
-            // Image
+            // IMAGE
             if (mediaId) {
                 await this.processImage(phone, mediaId, conv);
                 return;
             }
 
-            // Texte - avec validation si nécessaire
+            // TEXTE - Validation si nécessaire
             const expectedField = this.getExpectedField(conv.state);
             
-            if (expectedField && expectedField !== 'confirmation') {
+            if (expectedField && expectedField !== 'confirmation' && expectedField !== 'medicine') {
                 const isValid = ValidationService.validate(expectedField, text);
                 
                 if (!isValid) {
-                    const response = await this.llm.generateResponse({
-                        userMessage: text,
-                        conversation: conv,
-                        validationError: { field: expectedField, value: text }
-                    });
-                    await this.whatsapp.sendMessage(phone, response.message);
-                    conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
-                    this.conversations.set(phone, conv);
+                    await this.whatsapp.sendMessage(phone, 
+                        `❌ La valeur "${text}" n'est pas valide pour ${expectedField}. Réessaie.`);
                     return;
                 }
 
-                // Valide : on sauvegarde
                 const normalized = ValidationService.normalize(expectedField, text);
                 conv.context[expectedField] = normalized;
                 conv.state = this.getNextState(conv.state);
             }
 
-            // Cas spécial confirmation
+            // CONFIRMATION
             if (conv.state === ConversationStates.WAITING_CONFIRMATION && 
                 text.toLowerCase().match(/^(oui|yes|ok|valider|commander)$/)) {
                 await this.placeOrder(phone, conv);
                 return;
             }
 
-            // Recherche médicament si en idle
+            // RECHERCHE MÉDICAMENT
             if (conv.state === ConversationStates.IDLE && text.length >= 2) {
                 const results = await this.fuse.search(text, 5);
                 if (results.length > 0) {
@@ -731,62 +739,66 @@ class ConversationManager {
                     conv.state = ConversationStates.WAITING_QUANTITY;
                     
                     const list = results.map((r, i) => `${i+1}. ${r.nom_commercial} (${r.prix} FCFA)`).join('\n');
-                    const response = await this.llm.generateResponse({
-                        userMessage: `Résultats pour "${text}":\n${list}`,
-                        conversation: conv,
-                        fieldRequested: 'quantite'
-                    });
-                    await this.whatsapp.sendMessage(phone, response.message);
-                    conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
+                    await this.whatsapp.sendMessage(phone, 
+                        `Plusieurs médicaments trouvés:\n${list}\n\nChoisis le numéro.`);
                     this.conversations.set(phone, conv);
                     return;
                 }
             }
 
-            // Réponse IA générique
-            const response = await this.llm.generateResponse({
-                userMessage: text,
-                conversation: conv,
-                fieldRequested: this.getExpectedField(conv.state)
-            });
-
-            await this.whatsapp.sendMessage(phone, response.message);
-            conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
-            
-            if (response.next_state) {
-                conv.state = response.next_state;
+            // SÉLECTION
+            if (conv.state === ConversationStates.WAITING_QUANTITY && conv.context.searchResults) {
+                const num = parseInt(text);
+                if (num > 0 && num <= conv.context.searchResults.length) {
+                    const med = conv.context.searchResults[num - 1];
+                    conv.cart.push({ ...med, quantite: 1 });
+                    delete conv.context.searchResults;
+                    conv.state = ConversationStates.IDLE;
+                    
+                    await this.whatsapp.sendMessage(phone, 
+                        `✅ ${med.nom_commercial} ajouté (${med.prix} FCFA)`);
+                    this.conversations.set(phone, conv);
+                    return;
+                }
             }
-            if (response.extracted_data) {
-                conv.context = { ...conv.context, ...response.extracted_data };
+
+            // RÉPONSE IA
+            const aiResponse = await this.llm.generateResponse(text, conv);
+            await this.whatsapp.sendMessage(phone, aiResponse.message);
+            
+            conv.history.push({ role: 'bot', content: aiResponse.message, timestamp: Date.now() });
+            
+            if (aiResponse.intention === 'order') {
+                conv.state = ConversationStates.WAITING_MEDICINE;
+            } else if (aiResponse.intention === 'greet') {
+                conv.state = ConversationStates.WAITING_MEDICINE;
             }
 
             this.conversations.set(phone, conv);
 
         } catch (error) {
             log('error', `Erreur process: ${error.message}`);
+            await this.whatsapp.sendMessage(phone, 
+                "Désolé, une erreur technique est survenue. Réessaie dans quelques instants.");
         }
     }
 
     async processImage(phone, mediaId, conv) {
+        await this.whatsapp.sendMessage(phone, "📸 Analyse de l'image en cours...");
+        
         const media = await this.whatsapp.downloadMedia(mediaId);
         if (!media.success) {
-            const response = await this.llm.generateResponse({
-                userMessage: "Erreur téléchargement image",
-                conversation: conv
-            });
-            await this.whatsapp.sendMessage(phone, response.message);
-            conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
-            this.conversations.set(phone, conv);
+            await this.whatsapp.sendMessage(phone, "❌ Impossible de télécharger l'image.");
             return;
         }
 
         const base64Image = media.buffer.toString('base64');
         const visionResult = await this.llm.analyzeImage(base64Image);
 
-        if (visionResult.medicines?.length > 0) {
+        if (visionResult.medicaments?.length > 0) {
             const medicines = [];
-            for (const med of visionResult.medicines) {
-                const results = await this.fuse.search(med.name, 1);
+            for (const med of visionResult.medicaments) {
+                const results = await this.fuse.search(med.nom, 1);
                 if (results.length > 0) medicines.push(results[0]);
             }
 
@@ -795,58 +807,71 @@ class ConversationManager {
                 conv.state = ConversationStates.WAITING_IMAGE_SELECTION;
                 
                 const list = medicines.map((m, i) => `${i+1}. ${m.nom_commercial} (${m.prix} FCFA)`).join('\n');
-                const response = await this.llm.generateResponse({
-                    userMessage: `Médicaments détectés:\n${list}`,
-                    conversation: conv
-                });
-                await this.whatsapp.sendMessage(phone, response.message);
-                conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
+                await this.whatsapp.sendMessage(phone, 
+                    `Médicaments détectés:\n${list}\n\nChoisis le numéro.`);
                 this.conversations.set(phone, conv);
                 return;
             }
         }
 
-        const response = await this.llm.generateResponse({
-            userMessage: "Aucun médicament détecté",
-            conversation: conv
-        });
-        await this.whatsapp.sendMessage(phone, response.message);
-        conv.history.push({ role: 'bot', content: response.message, timestamp: Date.now() });
-        this.conversations.set(phone, conv);
+        await this.whatsapp.sendMessage(phone, 
+            "❌ Aucun médicament détecté. Envoie une photo plus nette.");
     }
 
     async placeOrder(phone, conv) {
         try {
+            // Vérifier les infos manquantes
+            const required = ['quartier', 'nom', 'age', 'genre', 'telephone'];
+            const missing = required.filter(f => !conv.context[f]);
+            
+            if (missing.length > 0) {
+                const firstMissing = missing[0];
+                const questions = {
+                    'quartier': "📍 Dans quel quartier habites-tu ?",
+                    'nom': "👤 Quel est ton nom ?",
+                    'age': "🎂 Quel âge as-tu ?",
+                    'genre': "⚧ Genre (M/F) ?",
+                    'telephone': "📞 Ton numéro de téléphone ?"
+                };
+                conv.state = this.getNextStateForField(firstMissing);
+                await this.whatsapp.sendMessage(phone, questions[firstMissing]);
+                this.conversations.set(phone, conv);
+                return;
+            }
+
             const order = await this.orders.createOrder(phone, conv.cart, conv.context);
             
-            const response = await this.llm.generateResponse({
-                userMessage: "Confirmation commande",
-                conversation: conv,
-                fieldRequested: null
-            });
+            await this.whatsapp.sendMessage(phone, 
+                `🎉 Commande confirmée #${order.id}!\n🔑 Code: ${order.confirmation_code}\n🛵 Livraison dans ~45 min`);
             
-            await this.whatsapp.sendMessage(phone, response.message + `\n\n🔑 Code: ${order.confirmation_code}`);
             await this.orders.notifySupport(order);
             await this.orders.assignLivreur(order.id);
 
-            // Nouvelle conversation
+            // Reset conversation
             this.conversations.set(phone, {
                 state: ConversationStates.IDLE,
                 cart: [],
                 context: {},
                 history: [],
-                lastActivity: Date.now(),
-                createdAt: Date.now()
+                lastActivity: Date.now()
             });
 
         } catch (error) {
             log('error', `Erreur commande: ${error.message}`);
-            const response = await this.llm.generateResponse({
-                userMessage: "Erreur lors de la commande",
-                conversation: conv
-            });
-            await this.whatsapp.sendMessage(phone, response.message);
+            await this.whatsapp.sendMessage(phone, 
+                "❌ Erreur lors de la commande. Contacte le support.");
         }
+    }
+
+    getNextStateForField(field) {
+        const map = {
+            'quartier': ConversationStates.WAITING_QUARTIER,
+            'nom': ConversationStates.WAITING_NAME,
+            'age': ConversationStates.WAITING_AGE,
+            'genre': ConversationStates.WAITING_GENDER,
+            'telephone': ConversationStates.WAITING_PHONE
+        };
+        return map[field] || ConversationStates.IDLE;
     }
 
     async handleButton(phone, buttonText, orderId) {
@@ -855,12 +880,16 @@ class ConversationManager {
 
         if (buttonText.includes('Valider')) {
             await this.orders.updateStatus(orderId, 'DELIVERED');
-            await this.whatsapp.sendMessage(order.client_phone, `🎉 Commande #${orderId} livrée ! Merci !`);
-            await this.whatsapp.sendMessage(SUPPORT_PHONE, `✅ Commande #${orderId} validée`);
+            await this.whatsapp.sendMessage(order.client_phone, 
+                `🎉 Commande #${orderId} livrée ! Merci !`);
+            await this.whatsapp.sendMessage(SUPPORT_PHONE, 
+                `✅ Commande #${orderId} validée`);
         } else if (buttonText.includes('Annuler')) {
             await this.orders.updateStatus(orderId, 'CANCELED');
-            await this.whatsapp.sendMessage(order.client_phone, `❌ Commande #${orderId} annulée`);
-            await this.whatsapp.sendMessage(SUPPORT_PHONE, `❌ Commande #${orderId} annulée`);
+            await this.whatsapp.sendMessage(order.client_phone, 
+                `❌ Commande #${orderId} annulée`);
+            await this.whatsapp.sendMessage(SUPPORT_PHONE, 
+                `❌ Commande #${orderId} annulée`);
         }
     }
 }
@@ -877,15 +906,6 @@ async function initDatabase() {
             prix DECIMAL(10,2) NOT NULL,
             categorie VARCHAR(100),
             created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS conversations (
-            phone VARCHAR(20) PRIMARY KEY,
-            state VARCHAR(50),
-            cart JSONB,
-            context JSONB,
-            history JSONB,
-            updated_at TIMESTAMP DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS orders (
@@ -922,16 +942,6 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         );
 
-        CREATE TABLE IF NOT EXISTS avis_clients (
-            id SERIAL PRIMARY KEY,
-            order_id VARCHAR(50) REFERENCES orders(id),
-            client_phone VARCHAR(20),
-            client_name VARCHAR(100),
-            note INTEGER CHECK (note >= 1 AND note <= 5),
-            commentaire TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
         CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(client_phone);
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
     `);
@@ -943,7 +953,6 @@ async function initDatabase() {
 // SERVEUR EXPRESS
 // ===========================================
 const app = express();
-const processedMessages = new NodeCache({ stdTTL: 600 });
 const bot = new ConversationManager();
 
 // Middleware
@@ -951,13 +960,18 @@ app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100
+    max: 100,
+    keyGenerator: (req) => {
+        const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+        return msg?.from || req.ip;
+    }
 }));
 
 // Routes
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
         res.send(req.query['hub.challenge']);
+        log('info', '✅ Webhook vérifié');
     } else {
         res.sendStatus(403);
     }
@@ -1023,16 +1037,16 @@ setInterval(() => {
 async function start() {
     try {
         await initDatabase();
-        await bot.initialize();
+        await bot.init();
 
-        app.listen(PORT, () => {
+        app.listen(PORT, '0.0.0.0', () => {
             console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
 ║   🚀 MARIAM BOT - PRODUCTION READY                        ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   ✅ 100% IA - Réponses naturelles                         ║
+║   ✅ 100% IA - SiliconFlow Qwen2.5-72B                    ║
 ║   ✅ Validations strictes (8 champs)                      ║
 ║   ✅ Fuse.js - Recherche floue (6000+ médicaments)        ║
 ║   ✅ Gestion complète des commandes                        ║

@@ -1,7 +1,7 @@
 // ===========================================
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version finale avec gestion intelligente du contexte
+// Version finale avec fallback multi-modèles et gestion intelligente des quotas
 // ===========================================
 
 require('dotenv').config();
@@ -302,15 +302,65 @@ class FuseService {
 }
 
 // ===========================================
-// LLM SERVICE - Groq (Cerveau de l'IA)
+// LLM SERVICE - Groq avec fallback multi-modèles
 // ===========================================
 class LLMService {
     constructor() {
         this.client = new Groq({ apiKey: GROQ_API_KEY });
-        this.models = {
-            vision: "meta-llama/llama-4-scout-17b-16e-instruct",
-            text: "llama-3.3-70b-versatile"
+        
+        // Modèles disponibles classés par priorité
+        this.modeles = [
+            {
+                id: "llama-3.3-70b-versatile",
+                nom: "70B",
+                type: "text",
+                quota: { utilise: 0, max: 100000 },
+                priorite: 1,
+                actif: true,
+                vitesse: 280,
+                qualite: "haute"
+            },
+            {
+                id: "llama-3.1-8b-instant",
+                nom: "8B",
+                type: "text",
+                quota: { utilise: 0, max: 100000 },
+                priorite: 2,
+                actif: true,
+                vitesse: 560,
+                qualite: "moyenne"
+            },
+            {
+                id: "openai/gpt-oss-20b",
+                nom: "OSS-20B",
+                type: "text",
+                quota: { utilise: 0, max: 100000 },
+                priorite: 3,
+                actif: true,
+                vitesse: 1000,
+                qualite: "moyenne"
+            }
+        ];
+        
+        this.modelesVision = [
+            {
+                id: "meta-llama/llama-4-scout-17b-16e-instruct",
+                nom: "Vision",
+                type: "vision",
+                quota: { utilise: 0, max: 100000 },
+                actif: true
+            }
+        ];
+        
+        this.modeleActuel = this.modeles[0];
+        this.rateLimitMinute = {
+            count: 0,
+            resetTime: Date.now() + 60000
         };
+        this.requestQueue = [];
+        this.processing = false;
+        this.lastRequestTime = 0;
+        this.consecutiveErrors = 0;
         this.cache = cache;
     }
 
@@ -393,12 +443,6 @@ User: "Quel problème tu résous ?"
     "reponse": "Le problème que Youssef a vu depuis sa chambre :\n- Pharmacies fermées la nuit\n- Prix inconnus\n- Livraisons compliquées\n\nMaintenant : disponible 24h/24, prix transparents, livraison en 45 min ! 🚚"
 }
 
-User: "Pourquoi t'as été créée dans une chambre ?"
-{
-    "intention": "creator",
-    "reponse": "Parce que les plus grandes idées naissent souvent dans les petits espaces ! ✨\n\nYoussef était dans sa chambre d'étudiant à l'UPSP quand il a réalisé que la technologie pouvait résoudre un vrai problème. Pas besoin d'un grand bureau pour avoir une grande idée ! 💙"
-}
-
 3. PURPOSE (Utilité de MARIAM) :
 User: "À quoi tu sers ?"
 {
@@ -421,13 +465,6 @@ User: "Je veux plus commander"
     "reponse": "D'accord, j'annule ta commande en cours. ✅\n\nSi tu changes d'avis, je suis là ! 💊"
 }
 
-User: "Rien merci"
-{
-    "intention": "annulation",
-    "donnees_commande": {"etape": null},
-    "reponse": "Pas de problème ! À bientôt j'espère 👋"
-}
-
 **GUIDE POUR LES COMMANDES** :
 
 ÉTAPE 1 - ACCUEIL COMMANDE :
@@ -438,7 +475,7 @@ User: "Je veux commander"
     "reponse": "Super ! Je prends ta commande directement 🛍️\n\nQuel médicament veux-tu ? (tape le nom)"
 }
 
-ÉTAPE 2 - SÉLECTION MÉDICAMENT (SYSTEM: Résultats Fuse fournis) :
+ÉTAPE 2 - SÉLECTION MÉDICAMENT :
 {
     "intention": "commande",
     "medicament": "Doliprane",
@@ -482,22 +519,188 @@ User: "J'ai mal à la tête" (en pleine commande)
 }`;
     }
 
-    async comprendre(message, historique = []) {
+    async getVisionPrompt() {
+        return `Liste les médicaments que tu vois sur cette image au format JSON. Réponds uniquement avec {"medicaments": ["nom1", "nom2"]}`;
+    }
+
+    async getModeleDisponible(type = 'text') {
+        const maintenant = Date.now();
+        
+        // Réinitialiser le compteur minute si nécessaire
+        if (maintenant > this.rateLimitMinute.resetTime) {
+            this.rateLimitMinute = {
+                count: 0,
+                resetTime: maintenant + 60000
+            };
+        }
+        
+        // Vérifier la limite minute (max 30 requêtes par minute)
+        if (this.rateLimitMinute.count >= 30) {
+            log('warn', '⚠️ Limite minute atteinte, attente...');
+            const attente = this.rateLimitMinute.resetTime - maintenant;
+            await new Promise(r => setTimeout(r, attente));
+            this.rateLimitMinute.count = 0;
+            this.rateLimitMinute.resetTime = Date.now() + 60000;
+        }
+        
+        // Récupérer les quotas depuis Redis
+        await this.chargerQuotas();
+        
+        // Chercher le premier modèle avec quota disponible
+        const modeles = type === 'text' ? this.modeles : this.modelesVision;
+        for (const modele of modeles) {
+            if (modele.quota.utilise < modele.quota.max) {
+                return modele;
+            }
+        }
+        
+        // Tous les modèles sont épuisés
+        return null;
+    }
+
+    async trackTokenUsage(modele, tokens) {
+        try {
+            modele.quota.utilise += tokens;
+            await this.sauvegarderQuotas();
+            
+            // Log quand on approche de la limite
+            const pourcentage = (modele.quota.utilise / modele.quota.max) * 100;
+            if (pourcentage > 80 && pourcentage < 90) {
+                log('warn', `⚠️ Modèle ${modele.nom}: ${Math.round(pourcentage)}% utilisé`);
+            } else if (pourcentage >= 90) {
+                log('warn', `🔴 Modèle ${modele.nom}: ${Math.round(pourcentage)}% utilisé - bientôt épuisé`);
+            }
+        } catch (error) {
+            log('error', `Erreur trackTokenUsage: ${error.message}`);
+        }
+    }
+
+    async sauvegarderQuotas() {
+        try {
+            await this.cache.set('modeles_quotas', {
+                modeles: this.modeles,
+                modelesVision: this.modelesVision,
+                timestamp: Date.now()
+            }, 86400); // 24h
+        } catch (error) {
+            log('error', `Erreur sauvegarde quotas: ${error.message}`);
+        }
+    }
+
+    async chargerQuotas() {
+        try {
+            const saved = await this.cache.get('modeles_quotas');
+            if (saved && saved.timestamp > Date.now() - 86400000) {
+                // Vérifier si c'est un nouveau jour
+                const aujourdhui = new Date().toDateString();
+                const dateSauvegarde = new Date(saved.timestamp).toDateString();
+                
+                if (aujourdhui === dateSauvegarde) {
+                    this.modeles = saved.modeles;
+                    this.modelesVision = saved.modelesVision;
+                    log('info', '📊 Quotas chargés depuis Redis');
+                } else {
+                    // Nouveau jour, réinitialiser les compteurs
+                    this.modeles.forEach(m => m.quota.utilise = 0);
+                    this.modelesVision.forEach(m => m.quota.utilise = 0);
+                    log('info', '📊 Nouveau jour - quotas réinitialisés');
+                }
+            }
+        } catch (error) {
+            log('error', `Erreur chargement quotas: ${error.message}`);
+        }
+    }
+
+    async processQueue() {
+        if (this.processing || this.requestQueue.length === 0) return;
+        
+        this.processing = true;
+        
+        while (this.requestQueue.length > 0) {
+            const { message, historique, type, resolve, reject } = this.requestQueue.shift();
+            
+            try {
+                // Espacement minimum entre les requêtes
+                const now = Date.now();
+                const timeSinceLast = now - this.lastRequestTime;
+                if (timeSinceLast < 2000) {
+                    await new Promise(r => setTimeout(r, 2000 - timeSinceLast));
+                }
+                
+                const result = await this._comprendre(message, historique, type);
+                this.lastRequestTime = Date.now();
+                this.consecutiveErrors = 0;
+                resolve(result);
+                
+            } catch (error) {
+                if (error.status === 429) {
+                    this.consecutiveErrors++;
+                    
+                    // Attendre de plus en plus longtemps
+                    const waitTime = Math.min(5000 * this.consecutiveErrors, 30000);
+                    log('warn', `Rate limit, attente ${waitTime}ms`);
+                    
+                    await new Promise(r => setTimeout(r, waitTime));
+                    
+                    // Remettre en file d'attente
+                    this.requestQueue.unshift({ message, historique, type, resolve, reject });
+                } else {
+                    reject(error);
+                }
+            }
+        }
+        
+        this.processing = false;
+    }
+
+    async comprendre(message, historique = [], type = 'text') {
+        return new Promise((resolve, reject) => {
+            this.requestQueue.push({ message, historique, type, resolve, reject });
+            this.processQueue();
+        });
+    }
+
+    async _comprendre(message, historique = [], type = 'text') {
         const cacheKey = `comprendre:${Utils.normalizeText(message).substring(0, 50)}`;
         const cached = await this.cache.get(cacheKey);
         if (cached) return cached;
 
         try {
+            // Obtenir le modèle disponible
+            const modele = await this.getModeleDisponible(type);
+            
+            if (!modele) {
+                // TOUS les modèles sont épuisés → rediriger vers support
+                log('error', '❌ TOUS LES QUOTAS ÉPUISÉS');
+                return {
+                    intention: "support",
+                    medicament: null,
+                    reponse: "Désolé, j'ai trop de demandes aujourd'hui ! 📞\n\nContacte directement le support pour être aidé : https://wa.me/2250701406880\n\nIls te répondront rapidement ! 💙"
+                };
+            }
+
+            // Incrémenter compteur minute
+            this.rateLimitMinute.count++;
+            
+            // Estimation des tokens
+            const tokensEstimes = Math.ceil(message.length / 4) + 300;
+            
+            log('info', `📊 Modèle: ${modele.nom} (${modele.quota.utilise}/${modele.quota.max})`);
+
             const completion = await this.client.chat.completions.create({
-                model: this.models.text,
+                model: modele.id,
                 messages: [
                     { role: "system", content: this.getSystemPrompt() },
                     { role: "user", content: `Message: "${message}"\nHistorique: ${JSON.stringify(historique.slice(-5))}` }
                 ],
-                temperature: 0.7,
+                temperature: modele.id.includes('70b') ? 0.7 : 0.5,
                 max_completion_tokens: 500,
                 response_format: { type: "json_object" }
             });
+
+            // Mettre à jour le quota utilisé
+            const tokensUtilises = completion.usage?.total_tokens || tokensEstimes;
+            await this.trackTokenUsage(modele, tokensUtilises);
 
             const result = JSON.parse(completion.choices[0].message.content);
             await this.cache.set(cacheKey, result, 3600);
@@ -505,6 +708,19 @@ User: "J'ai mal à la tête" (en pleine commande)
             
         } catch (error) {
             log('error', `Comprendre error: ${error.message}`);
+            
+            // Si erreur 429 (rate limit), marquer le modèle comme épuisé pour cette minute
+            if (error.status === 429) {
+                this.consecutiveErrors++;
+                
+                // Attendre un peu et réessayer
+                const waitTime = 5000 * this.consecutiveErrors;
+                await new Promise(r => setTimeout(r, waitTime));
+                
+                // Réessayer avec le même message
+                return this._comprendre(message, historique, type);
+            }
+            
             return {
                 intention: "unknown",
                 medicament: null,
@@ -517,15 +733,23 @@ User: "J'ai mal à la tête" (en pleine commande)
         try {
             const base64Image = imageBuffer.toString('base64');
             
+            // Obtenir le modèle vision disponible
+            const modele = await this.getModeleDisponible('vision');
+            
+            if (!modele) {
+                log('error', '❌ QUOTA VISION ÉPUISÉ');
+                return { medicaments: [] };
+            }
+            
             const completion = await this.client.chat.completions.create({
-                model: this.models.vision,
+                model: modele.id,
                 messages: [
                     {
                         role: "user",
                         content: [
                             {
                                 type: "text",
-                                text: "Liste les médicaments que tu vois sur cette image au format JSON. Réponds uniquement avec {\"medicaments\": [\"nom1\", \"nom2\"]}"
+                                text: await this.getVisionPrompt()
                             },
                             {
                                 type: "image_url",
@@ -540,6 +764,10 @@ User: "J'ai mal à la tête" (en pleine commande)
                 max_completion_tokens: 300,
                 response_format: { type: "json_object" }
             });
+
+            // Mettre à jour le quota
+            const tokensUtilises = completion.usage?.total_tokens || 500;
+            await this.trackTokenUsage(modele, tokensUtilises);
 
             return JSON.parse(completion.choices[0].message.content);
             
@@ -568,6 +796,7 @@ class ConversationManager {
 
     async init() {
         await this.fuse.initialize();
+        await this.llm.chargerQuotas();
         log('info', '🚀 MARIAM IA prête');
     }
 
@@ -742,7 +971,7 @@ class ConversationManager {
                     return;
                 }
 
-                // LLM comprend le message
+                // LLM comprend le message (avec fallback automatique)
                 const comprehension = await this.llm.comprendre(text, conv.historique);
                 
                 // Si une commande est en cours mais que l'utilisateur change de sujet
@@ -1051,6 +1280,19 @@ app.get('/health', async (req, res) => {
         health.db = 'error';
     }
 
+    // Ajouter les infos de quota
+    try {
+        const quotas = await cache.get('modeles_quotas');
+        if (quotas) {
+            health.quotas = quotas.modeles.map(m => ({
+                nom: m.nom,
+                utilise: m.quota.utilise,
+                max: m.quota.max,
+                pourcentage: Math.round((m.quota.utilise / m.quota.max) * 100)
+            }));
+        }
+    } catch {}
+
     res.json(health);
 });
 
@@ -1095,7 +1337,10 @@ async function start() {
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
 ║   🤖 100% IA Conversationnelle                            ║
-║   💬 Llama 3.3 70B (texte)                               ║
+║   💬 Multi-modèles avec fallback automatique :            ║
+║      • Llama 3.3 70B (prioritaire)                       ║
+║      • Llama 3.1 8B (secours)                            ║
+║      • GPT-OSS 20B (ultra rapide)                        ║
 ║   📸 Llama 4 Scout 17B (vision)                          ║
 ║   🛒 Système de commande intégré                          ║
 ║   🔍 Fuse.js (recherche floue)                           ║
@@ -1107,6 +1352,9 @@ async function start() {
 ║                                                           ║
 ║   📱 Port: ${PORT}                                        ║
 ║   📞 Support: ${SUPPORT_PHONE}                           ║
+║                                                           ║
+║   🔄 Fallback automatique actif - L'utilisateur ne voit   ║
+║      jamais les erreurs de quota !                        ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
             `);

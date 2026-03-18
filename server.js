@@ -742,9 +742,11 @@ User: "J'ai mal à la tête" (en pleine commande)
         const cached = await this.cache.get(cacheKey);
         if (cached) return cached;
 
+        let modele = null; // Déclaré ici pour être accessible dans le catch
+
         try {
             // Obtenir le modèle disponible
-            const modele = await this.getModeleDisponible(type);
+            modele = await this.getModeleDisponible(type);
             
             if (!modele) {
                 // TOUS les modèles sont épuisés → rediriger vers support
@@ -781,7 +783,7 @@ User: "J'ai mal à la tête" (en pleine commande)
             return result;
             
         } catch (error) {
-            if (error.status === 429) {
+            if (error.status === 429 && modele) { // Vérifier que modele existe
                 // Gérer le rate limit
                 await this.handleRateLimit(error, modele);
                 

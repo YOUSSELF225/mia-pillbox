@@ -1,6 +1,7 @@
 // ===========================================
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
+// Version avec système de commande IA
 // ===========================================
 
 require('dotenv').config();
@@ -330,56 +331,177 @@ CONTEXTE :
 - Livraison: ${delivery.price}F (${delivery.period}), délai: ${delivery.time}min
 - Support: ${supportLink}
 
+**NOUVELLE FONCTIONNALITÉ : PRISE DE COMMANDE COMPLÈTE**
+
+Tu peux maintenant prendre les commandes directement, sans renvoyer vers le support.
+
 FORMAT DE REPONSE (JSON uniquement) :
 {
-    "intention": "greet|search|support|delivery|creator|purpose|unknown",
+    "intention": "greet|search|commande|infos_livraison|recapitulatif|confirmation|avis",
     "medicament": "nom extrait ou null",
+    "donnees_commande": {
+        "etape": "accueil|selection|quantite|nom|quartier|age|taille|poids|tel_joindre|whatsapp|indications|recap|attente_confirmation|avis_note|avis_commentaire",
+        "medicaments": [{"nom": "Doliprane", "prix": 1500, "quantite": 2}],
+        "client": {
+            "nom": null,
+            "quartier": null,
+            "age": null,
+            "taille": null,
+            "poids": null,
+            "tel_joindre": null,
+            "whatsapp": null,
+            "indications": null
+        },
+        "code": null
+    },
     "reponse": "ta réponse style PayParrot"
 }
 
-EXEMPLES (ne pas copier, juste comprendre le style) :
+**GUIDE POUR LES COMMANDES** :
 
-User: "Salut"
+1. DÉTECTION : Si l'utilisateur veut commander ("je veux commander", "j'aimerais acheter", etc.), intention = "commande"
+
+2. DÉROULEMENT NATUREL DE LA COMMANDE :
+
+ÉTAPE 1 - ACCUEIL COMMANDE :
+User: "Je veux commander"
 {
-    "intention": "greet",
-    "medicament": null,
-    "reponse": "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊\n\nJe cherche tes médicaments et je les livre. Qu'est-ce qu'il te faut ?"
+    "intention": "commande",
+    "donnees_commande": {"etape": "accueil"},
+    "reponse": "Super ! Je prends ta commande directement 🛍️\n\nQuel médicament veux-tu ? (tape le nom)"
 }
 
+ÉTAPE 2 - SÉLECTION MÉDICAMENT (après recherche Fuse) :
 User: "Doliprane"
 {
-    "intention": "search",
+    "intention": "commande",
     "medicament": "Doliprane",
-    "reponse": "Je cherche le Doliprane pour toi ! 🔍"
+    "donnees_commande": {"etape": "selection"},
+    "reponse": "J'ai trouvé le Doliprane ! 💊\n\n- Doliprane 500mg (1500F)\n- Doliprane 1000mg (2000F)\n\nLequel veux-tu ?"
 }
 
-User: "J'ai mal à la tête"
+ÉTAPE 3 - QUANTITÉ :
+User: "Le 500mg"
 {
-    "intention": "search",
-    "medicament": null,
-    "reponse": "Pour les maux de tête, j'ai deux options :\n\n- Doliprane 500mg (1500F)\n- Ibuprofène 400mg (1800F)\n\nLequel te conviendrait ? 💊"
+    "intention": "commande",
+    "medicament": "Doliprane 500mg",
+    "donnees_commande": {"etape": "quantite", "medicaments": [{"nom": "Doliprane 500mg", "prix": 1500}]},
+    "reponse": "Combien de boîtes de Doliprane 500mg veux-tu ? 📦"
 }
 
-User: "Prix livraison"
+ÉTAPE 4 - AJOUT AUTRE MÉDICAMENT :
+User: "2 boîtes"
 {
-    "intention": "delivery",
-    "medicament": null,
-    "reponse": "Livraison à San Pedro :\n\n- Jour : 400F\n- Nuit : 600F\n- Délai : 45 min 🚚"
+    "intention": "commande",
+    "donnees_commande": {
+        "etape": "ajout_autre",
+        "medicaments": [{"nom": "Doliprane 500mg", "prix": 1500, "quantite": 2}]
+    },
+    "reponse": "2 Doliprane 500mg ajoutés (3000F) ✅\n\nVeux-tu ajouter autre chose ?\n- Tape 'oui' pour ajouter\n- Tape 'non' pour continuer"
 }
 
-User: "Qui t'a créée ?"
+ÉTAPE 5 - INFOS PERSONNELLES :
+User: "Non"
 {
-    "intention": "creator",
-    "medicament": null,
-    "reponse": "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !"
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "nom"},
+    "reponse": "Parfait ! Pour la livraison, j'ai besoin de quelques infos 📝\n\nTon nom complet :"
 }
 
-User: "À quoi tu sers ?"
+User: "Kouadio Paul"
 {
-    "intention": "purpose",
-    "medicament": null,
-    "reponse": "Je simplifie l'accès aux médicaments à San Pedro ! 💊\n\nPrix transparents, disponibilité en direct, livraison rapide. Ta santé mérite le meilleur."
-}`;
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "quartier", "client": {"nom": "Kouadio Paul"}},
+    "reponse": "Ton quartier à San Pedro :"
+}
+
+User: "Port"
+{
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "age", "client": {"quartier": "Port"}},
+    "reponse": "Ton âge :"
+}
+
+User: "25"
+{
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "taille", "client": {"age": 25}},
+    "reponse": "Ta taille en cm (ex: 175) :"
+}
+
+User: "175"
+{
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "poids", "client": {"taille": 175}},
+    "reponse": "Ton poids en kg (ex: 70) :"
+}
+
+User: "70"
+{
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "tel_joindre", "client": {"poids": 70}},
+    "reponse": "Numéro à joindre pour le livreur (ex: 0701406880) :"
+}
+
+User: "0701406880"
+{
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "whatsapp", "client": {"tel_joindre": "0701406880"}},
+    "reponse": "Ton numéro WhatsApp (pour la confirmation) :"
+}
+
+User: "0701406880"
+{
+    "intention": "infos_livraison",
+    "donnees_commande": {"etape": "indications", "client": {"whatsapp": "0701406880"}},
+    "reponse": "Des indications pour le livreur ? (maison rouge, près du marché...)\nTape 'aucune' si besoin :"
+}
+
+User: "Maison rouge près du marché"
+{
+    "intention": "recapitulatif",
+    "donnees_commande": {
+        "etape": "recap",
+        "client": {"indications": "Maison rouge près du marché"}
+    },
+    "reponse": "📋 *RÉCAPITULATIF*\n\nMédicaments :\n- Doliprane 500mg x2 = 3000F\n\nInfos :\n- Kouadio Paul, 25 ans\n- Quartier Port\n- Tél: 0701406880\n- Indications: Maison rouge\n\nTotal avec livraison: 3000 + 400 = 3400F\n\nConfirmer ? (oui/non/modifier)"
+}
+
+ÉTAPE 6 - CONFIRMATION :
+User: "Oui"
+{
+    "intention": "confirmation",
+    "donnees_commande": {"etape": "confirmation"},
+    "reponse": "✅ *COMMANDE CONFIRMÉE !*\n\nTon code de suivi est *473291*\n📌 RETIENS CE CODE ! Le livreur te le demandera.\n\nLe support te contacte dans 2 min. Livraison dans 45 min 🚚\n\nMerci ! 💙"
+}
+
+ÉTAPE 7 - AVIS (1 heure après) :
+{
+    "intention": "avis",
+    "donnees_commande": {"etape": "avis_note"},
+    "reponse": "Comment s'est passée ta commande ? (1-5 étoiles) ⭐"
+}
+
+User: "5"
+{
+    "intention": "avis",
+    "donnees_commande": {"etape": "avis_commentaire", "note": 5},
+    "reponse": "Super ! Un petit commentaire ? 😊"
+}
+
+User: "Très satisfait, livraison rapide"
+{
+    "intention": "avis",
+    "donnees_commande": {"etape": "fin", "commentaire": "Très satisfait, livraison rapide"},
+    "reponse": "Merci beaucoup ! Ton retour m'aide à m'améliorer 💙\n\nÀ bientôt !"
+}
+
+**RÈGLES IMPORTANTES** :
+- TOUJOURS garder le contexte de la commande en cours
+- Mettre à jour "donnees_commande" à chaque étape
+- Valider les données (âge entre 1-120, taille entre 50-250, poids entre 10-300)
+- À la confirmation, laisse le système générer le code unique
+- Ne pas inventer de médicaments, utiliser Fuse pour les recherches`;
     }
 
     async comprendre(message, historique = []) {
@@ -395,7 +517,7 @@ User: "À quoi tu sers ?"
                     { role: "user", content: `Message: "${message}"\nHistorique: ${JSON.stringify(historique.slice(-3))}` }
                 ],
                 temperature: 0.7,
-                max_completion_tokens: 300,
+                max_completion_tokens: 500,
                 response_format: { type: "json_object" }
             });
 
@@ -409,6 +531,35 @@ User: "À quoi tu sers ?"
                 intention: "unknown",
                 medicament: null,
                 reponse: "Désolé, petit problème technique ! Réessaie dans une minute ⏱️"
+            };
+        }
+    }
+
+    async gererCommande(message, historique, commandeEnCours = null) {
+        try {
+            const completion = await this.client.chat.completions.create({
+                model: this.models.text,
+                messages: [
+                    { role: "system", content: this.getSystemPrompt() },
+                    { role: "user", content: `Message: "${message}"
+Historique: ${JSON.stringify(historique.slice(-5))}
+Commande en cours: ${JSON.stringify(commandeEnCours)}
+
+Gère cette étape de commande naturellement.` }
+                ],
+                temperature: 0.7,
+                max_completion_tokens: 500,
+                response_format: { type: "json_object" }
+            });
+
+            return JSON.parse(completion.choices[0].message.content);
+            
+        } catch (error) {
+            log('error', `Erreur commande: ${error.message}`);
+            return {
+                intention: "commande",
+                donnees_commande: { etape: "accueil" },
+                reponse: "Désolé, petit problème. On recommence ? Quel médicament veux-tu ? 💊"
             };
         }
     }
@@ -474,6 +625,10 @@ User: "À quoi tu sers ?"
             };
         }
     }
+
+    async genererCodeCommande() {
+        return Math.floor(100000 + Math.random() * 900000).toString();
+    }
 }
 
 // ===========================================
@@ -497,7 +652,8 @@ class ConversationManager {
         if (!this.conversations.has(phone)) {
             this.conversations.set(phone, {
                 historique: [],
-                derniereActivite: Date.now()
+                derniereActivite: Date.now(),
+                commandeEnCours: null
             });
         }
         return this.conversations.get(phone);
@@ -535,11 +691,9 @@ class ConversationManager {
                     return;
                 }
 
-                // LLM analyse l'image
                 const visionResult = await this.llm.analyserImage(media.buffer);
                 
                 if (visionResult.medicaments && visionResult.medicaments.length > 0) {
-                    // Chercher chaque médicament
                     const results = [];
                     for (const med of visionResult.medicaments) {
                         const searchResults = await this.fuse.search(med, 1);
@@ -553,7 +707,7 @@ class ConversationManager {
                         results.forEach(med => {
                             reponse += `- ${med.nom_commercial} : ${med.prix}F\n`;
                         });
-                        reponse += "\nIls sont disponibles. Tu veux commander ?";
+                        reponse += "\nTu veux les commander ? Dis-moi 'oui' ou 'non'";
 
                         await this.whatsapp.sendMessage(phone, reponse);
                         
@@ -562,6 +716,18 @@ class ConversationManager {
                             content: reponse,
                             timestamp: Date.now()
                         });
+                        
+                        // Initialiser commande avec les médicaments détectés
+                        if (text && text.toLowerCase() === 'oui') {
+                            conv.commandeEnCours = {
+                                etape: "quantite",
+                                medicaments: results.map(med => ({
+                                    nom: med.nom_commercial,
+                                    prix: med.prix,
+                                    quantite: 1
+                                }))
+                            };
+                        }
                     } else {
                         await this.whatsapp.sendMessage(phone, 
                             "J'ai détecté des médicaments mais ils ne sont pas dans ma base. Envoie les noms par texte stp ! 💊");
@@ -579,47 +745,89 @@ class ConversationManager {
             // CAS 2: TEXTE REÇU
             // ===========================================
             if (text) {
-                // LLM comprend le message
-                const comprehension = await this.llm.comprendre(text, conv.historique);
+                let reponseIA;
                 
-                // Si besoin de recherche
-                if (comprehension.intention === "search" && comprehension.medicament) {
-                    const results = await this.fuse.search(comprehension.medicament, 3);
+                // Si une commande est en cours, l'IA la gère
+                if (conv.commandeEnCours) {
+                    reponseIA = await this.llm.gererCommande(
+                        text, 
+                        conv.historique, 
+                        conv.commandeEnCours
+                    );
                     
-                    if (results.length > 0) {
-                        // LLM intègre les résultats
-                        const reponseAvecResultats = await this.llm.integrerResultats(
-                            results, 
-                            text, 
-                            conv.historique
-                        );
-                        
-                        await this.whatsapp.sendMessage(phone, reponseAvecResultats.reponse || reponseAvecResultats);
-                        
-                        conv.historique.push({
-                            role: "assistant",
-                            content: reponseAvecResultats.reponse || reponseAvecResultats,
-                            timestamp: Date.now()
-                        });
-                    } else {
-                        // Pas de résultats
-                        const reponse = `Désolé, je n'ai pas trouvé "${comprehension.medicament}" dans ma base. 💊\n\nPeux-tu vérifier l'orthographe ou envoyer une photo ?`;
-                        
-                        await this.whatsapp.sendMessage(phone, reponse);
-                        
-                        conv.historique.push({
-                            role: "assistant",
-                            content: reponse,
-                            timestamp: Date.now()
-                        });
+                    // Mettre à jour la commande en cours
+                    if (reponseIA.donnees_commande) {
+                        conv.commandeEnCours = {
+                            ...conv.commandeEnCours,
+                            ...reponseIA.donnees_commande
+                        };
                     }
-                } else {
-                    // Réponse directe du LLM
-                    await this.whatsapp.sendMessage(phone, comprehension.reponse);
+                    
+                    // Si confirmation finale, sauvegarder et envoyer au support
+                    if (reponseIA.intention === "confirmation" && 
+                        reponseIA.donnees_commande?.etape === "confirmation") {
+                        
+                        const code = await this.llm.genererCodeCommande();
+                        conv.commandeEnCours.code = code;
+                        conv.commandeEnCours.phone = phone;
+                        
+                        await this.sauvegarderCommande(conv.commandeEnCours);
+                        await this.envoyerCommandeAuSupport(conv.commandeEnCours);
+                        
+                        // Programmer la demande d'avis dans 1 heure
+                        setTimeout(() => {
+                            this.demanderAvisIA(phone, conv.commandeEnCours);
+                        }, 60 * 60 * 1000);
+                        
+                        conv.commandeEnCours = null;
+                    }
+                    
+                    // Si fin d'avis, réinitialiser
+                    if (reponseIA.intention === "avis" && 
+                        reponseIA.donnees_commande?.etape === "fin") {
+                        conv.commandeEnCours = null;
+                    }
+                } 
+                else {
+                    // Pas de commande en cours, comportement normal
+                    reponseIA = await this.llm.comprendre(text, conv.historique);
+                    
+                    // Si l'utilisateur veut commander, initialiser la commande
+                    if (reponseIA.intention === "commande") {
+                        conv.commandeEnCours = { 
+                            etape: "accueil",
+                            medicaments: [],
+                            client: {},
+                            total: 0
+                        };
+                    }
+                    
+                    // Si c'est une recherche, utiliser Fuse
+                    if (reponseIA.intention === "search" && reponseIA.medicament) {
+                        const results = await this.fuse.search(reponseIA.medicament, 3);
+                        if (results.length > 0) {
+                            const reponseAvecResultats = await this.llm.integrerResultats(
+                                results, text, conv.historique
+                            );
+                            await this.whatsapp.sendMessage(phone, reponseAvecResultats.reponse);
+                            
+                            conv.historique.push({
+                                role: "assistant",
+                                content: reponseAvecResultats.reponse,
+                                timestamp: Date.now()
+                            });
+                            return;
+                        }
+                    }
+                }
+                
+                // Envoyer la réponse de l'IA
+                if (reponseIA) {
+                    await this.whatsapp.sendMessage(phone, reponseIA.reponse);
                     
                     conv.historique.push({
                         role: "assistant",
-                        content: comprehension.reponse,
+                        content: reponseIA.reponse,
                         timestamp: Date.now()
                     });
                 }
@@ -631,6 +839,119 @@ class ConversationManager {
             log('error', `Process error: ${error.message}`);
             await this.whatsapp.sendMessage(phone, 
                 "Désolé, erreur technique ! Réessaie dans une minute ⏱️");
+        }
+    }
+
+    async sauvegarderCommande(commande) {
+        try {
+            // Créer la table si elle n'existe pas
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS commandes (
+                    code VARCHAR(6) PRIMARY KEY,
+                    phone VARCHAR(20) NOT NULL,
+                    nom_complet VARCHAR(200),
+                    quartier VARCHAR(100),
+                    age INTEGER,
+                    taille INTEGER,
+                    poids INTEGER,
+                    telephone_joindre VARCHAR(20),
+                    whatsapp VARCHAR(20),
+                    indications TEXT,
+                    medicaments JSONB NOT NULL,
+                    total_prix DECIMAL(10,2) NOT NULL,
+                    statut VARCHAR(20) DEFAULT 'en_attente',
+                    avis TEXT,
+                    note INTEGER,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            `);
+
+            await pool.query(`
+                INSERT INTO commandes (
+                    code, phone, nom_complet, quartier, age, taille, poids,
+                    telephone_joindre, whatsapp, indications, medicaments, total_prix
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            `, [
+                commande.code,
+                commande.phone,
+                commande.client?.nom || '',
+                commande.client?.quartier || '',
+                commande.client?.age || 0,
+                commande.client?.taille || 0,
+                commande.client?.poids || 0,
+                commande.client?.tel_joindre || '',
+                commande.client?.whatsapp || '',
+                commande.client?.indications || '',
+                JSON.stringify(commande.medicaments || []),
+                (commande.medicaments || []).reduce((sum, m) => sum + (m.prix * (m.quantite || 1)), 0) + 400
+            ]);
+            
+            log('info', `Commande ${commande.code} sauvegardée`);
+        } catch (error) {
+            log('error', `Erreur sauvegarde commande: ${error.message}`);
+        }
+    }
+
+    async envoyerCommandeAuSupport(commande) {
+        try {
+            const total = (commande.medicaments || []).reduce((sum, m) => sum + (m.prix * (m.quantite || 1)), 0) + 400;
+            
+            let message = `🆕 *NOUVELLE COMMANDE MARIAM*\n\n`;
+            message += `🎫 *Code* : ${commande.code}\n`;
+            message += `📱 *Client* : ${commande.client?.whatsapp || commande.phone}\n\n`;
+            message += `🛒 *Médicaments* :\n`;
+            
+            (commande.medicaments || []).forEach(med => {
+                message += `  • ${med.nom} x${med.quantite || 1} = ${med.prix * (med.quantite || 1)}F\n`;
+            });
+            
+            message += `\n💰 *Total* : ${total}F (livraison incluse)\n\n`;
+            
+            if (commande.client?.nom) {
+                message += `📋 *Infos client* :\n`;
+                message += `  • ${commande.client.nom}\n`;
+                message += `  • ${commande.client.quartier || ''}\n`;
+                message += `  • ${commande.client.age || ''} ans\n`;
+                message += `  • Taille: ${commande.client.taille || ''} cm\n`;
+                message += `  • Poids: ${commande.client.poids || ''} kg\n`;
+                message += `  • Tél: ${commande.client.tel_joindre || ''}\n`;
+                if (commande.client.indications) {
+                    message += `  • Indications: ${commande.client.indications}\n`;
+                }
+            }
+
+            await axios.post(WHATSAPP_API_URL, {
+                messaging_product: 'whatsapp',
+                to: SUPPORT_PHONE,
+                type: 'text',
+                text: { body: message }
+            }, {
+                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+            });
+            
+            log('info', `Commande ${commande.code} envoyée au support`);
+        } catch (error) {
+            log('error', `Erreur envoi support: ${error.message}`);
+        }
+    }
+
+    async demanderAvisIA(phone, commande) {
+        try {
+            const reponseIA = await this.llm.gererCommande(
+                "SYSTEM: Demande d'avis après commande",
+                [],
+                { ...commande, etape: "avis_note" }
+            );
+            
+            await this.whatsapp.sendMessage(phone, reponseIA.reponse);
+            
+            // Mettre à jour l'état pour la suite de l'avis
+            const conv = this.getConversation(phone);
+            conv.commandeEnCours = { ...commande, etape: "avis_note" };
+            
+        } catch (error) {
+            log('error', `Erreur demande avis: ${error.message}`);
         }
     }
 }
@@ -734,6 +1055,22 @@ app.get('/health', async (req, res) => {
     res.json(health);
 });
 
+// Route pour vérifier une commande par code
+app.get('/commande/:code', async (req, res) => {
+    try {
+        const { code } = req.params;
+        const result = await pool.query('SELECT * FROM commandes WHERE code = $1', [code]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Commande non trouvée' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Nettoyage périodique
 setInterval(() => {
     const now = Date.now();
@@ -763,6 +1100,7 @@ async function start() {
 ║   🤖 100% IA Conversationnelle                            ║
 ║   💬 Llama 3.3 70B (texte)                               ║
 ║   📸 Llama 4 Scout 17B (vision)                          ║
+║   🛒 Système de commande intégré                          ║
 ║   🔍 Fuse.js (recherche floue)                           ║
 ║   🗄️ Redis + NodeCache                                    ║
 ║   🗃️ PostgreSQL                                           ║

@@ -361,6 +361,7 @@ class LLMService {
         this.processing = false;
         this.lastRequestTime = 0;
         this.consecutiveErrors = 0;
+        this.last429Time = 0;
         this.cache = cache;
     }
 
@@ -443,6 +444,12 @@ User: "Quel problème tu résous ?"
     "reponse": "Le problème que Youssef a vu depuis sa chambre :\n- Pharmacies fermées la nuit\n- Prix inconnus\n- Livraisons compliquées\n\nMaintenant : disponible 24h/24, prix transparents, livraison en 45 min ! 🚚"
 }
 
+User: "Pourquoi t'as été créée dans une chambre ?"
+{
+    "intention": "creator",
+    "reponse": "Parce que les plus grandes idées naissent souvent dans les petits espaces ! ✨\n\nYoussef était dans sa chambre d'étudiant à l'UPSP quand il a réalisé que la technologie pouvait résoudre un vrai problème. Pas besoin d'un grand bureau pour avoir une grande idée ! 💙"
+}
+
 3. PURPOSE (Utilité de MARIAM) :
 User: "À quoi tu sers ?"
 {
@@ -465,6 +472,13 @@ User: "Je veux plus commander"
     "reponse": "D'accord, j'annule ta commande en cours. ✅\n\nSi tu changes d'avis, je suis là ! 💊"
 }
 
+User: "Rien merci"
+{
+    "intention": "annulation",
+    "donnees_commande": {"etape": null},
+    "reponse": "Pas de problème ! À bientôt j'espère 👋"
+}
+
 **GUIDE POUR LES COMMANDES** :
 
 ÉTAPE 1 - ACCUEIL COMMANDE :
@@ -475,7 +489,7 @@ User: "Je veux commander"
     "reponse": "Super ! Je prends ta commande directement 🛍️\n\nQuel médicament veux-tu ? (tape le nom)"
 }
 
-ÉTAPE 2 - SÉLECTION MÉDICAMENT :
+ÉTAPE 2 - SÉLECTION MÉDICAMENT (SYSTEM: Résultats Fuse fournis) :
 {
     "intention": "commande",
     "medicament": "Doliprane",
@@ -546,9 +560,27 @@ User: "J'ai mal à la tête" (en pleine commande)
         // Récupérer les quotas depuis Redis
         await this.chargerQuotas();
         
+        // IMPORTANT: Vérifier si le 70B est vraiment épuisé
+        // En regardant l'erreur 429 récente
+        if (this.last429Time && (Date.now() - this.last429Time) < 300000) { // 5 minutes
+            log('warn', '⚠️ 429 récent détecté, on évite le 70B');
+            // Marquer le 70B comme épuisé pour cette session
+            const modele70B = this.modeles.find(m => m.id.includes('70b'));
+            if (modele70B) {
+                modele70B.quota.utilise = modele70B.quota.max;
+            }
+        }
+        
         // Chercher le premier modèle avec quota disponible
         const modeles = type === 'text' ? this.modeles : this.modelesVision;
         for (const modele of modeles) {
+            // Vérifier si on a eu une erreur 429 récente pour ce modèle
+            const modeleEpuise = await this.cache.get(`modele_epuise_${modele.id}`);
+            if (modeleEpuise) {
+                log('info', `⚠️ Modèle ${modele.nom} marqué comme épuisé jusqu'à ${new Date(modeleEpuise).toLocaleTimeString()}`);
+                continue;
+            }
+            
             if (modele.quota.utilise < modele.quota.max) {
                 return modele;
             }
@@ -556,6 +588,31 @@ User: "J'ai mal à la tête" (en pleine commande)
         
         // Tous les modèles sont épuisés
         return null;
+    }
+
+    async handleRateLimit(error, modele) {
+        log('error', `🚨 Rate limit pour ${modele.nom}: ${error.message}`);
+        
+        // Extraire le temps d'attente du message d'erreur
+        const match = error.message.match(/in (\d+)m/);
+        let waitTime = 60 * 60 * 1000; // 1 heure par défaut
+        
+        if (match) {
+            waitTime = parseInt(match[1]) * 60 * 1000;
+        }
+        
+        // Marquer ce modèle comme épuisé dans Redis
+        const expireTime = Date.now() + waitTime;
+        await this.cache.set(`modele_epuise_${modele.id}`, expireTime, Math.ceil(waitTime / 1000));
+        
+        // Mettre à jour le compteur local
+        modele.quota.utilise = modele.quota.max;
+        await this.sauvegarderQuotas();
+        
+        // Enregistrer le moment du dernier 429
+        this.last429Time = Date.now();
+        
+        log('info', `⏰ Modèle ${modele.nom} marqué comme épuisé pour ${waitTime/60000} minutes`);
     }
 
     async trackTokenUsage(modele, tokens) {
@@ -590,22 +647,42 @@ User: "J'ai mal à la tête" (en pleine commande)
     async chargerQuotas() {
         try {
             const saved = await this.cache.get('modeles_quotas');
-            if (saved && saved.timestamp > Date.now() - 86400000) {
-                // Vérifier si c'est un nouveau jour
-                const aujourdhui = new Date().toDateString();
+            const aujourdhui = new Date().toDateString();
+            
+            if (saved && saved.timestamp) {
                 const dateSauvegarde = new Date(saved.timestamp).toDateString();
                 
                 if (aujourdhui === dateSauvegarde) {
+                    // Même jour, on garde les compteurs
                     this.modeles = saved.modeles;
                     this.modelesVision = saved.modelesVision;
                     log('info', '📊 Quotas chargés depuis Redis');
                 } else {
-                    // Nouveau jour, réinitialiser les compteurs
+                    // Nouveau jour, réinitialiser
                     this.modeles.forEach(m => m.quota.utilise = 0);
                     this.modelesVision.forEach(m => m.quota.utilise = 0);
                     log('info', '📊 Nouveau jour - quotas réinitialisés');
+                    await this.sauvegarderQuotas();
                 }
             }
+            
+            // Vérifier aussi les modèles marqués comme épuisés
+            for (const modele of this.modeles) {
+                const epuise = await this.cache.get(`modele_epuise_${modele.id}`);
+                if (epuise && epuise > Date.now()) {
+                    // Modèle encore épuisé, on force son quota à max
+                    modele.quota.utilise = modele.quota.max;
+                    log('info', `⚠️ Modèle ${modele.nom} épuisé jusqu'à ${new Date(epuise).toLocaleTimeString()}`);
+                } else if (epuise && epuise <= Date.now()) {
+                    // Le temps d'attente est passé, on réactive
+                    await this.cache.del(`modele_epuise_${modele.id}`);
+                    if (modele.quota.utilise >= modele.quota.max) {
+                        modele.quota.utilise = modele.quota.max - 1000; // Laisse un peu de marge
+                    }
+                    log('info', `✅ Modèle ${modele.nom} réactivé`);
+                }
+            }
+            
         } catch (error) {
             log('error', `Erreur chargement quotas: ${error.message}`);
         }
@@ -682,10 +759,7 @@ User: "J'ai mal à la tête" (en pleine commande)
             // Incrémenter compteur minute
             this.rateLimitMinute.count++;
             
-            // Estimation des tokens
-            const tokensEstimes = Math.ceil(message.length / 4) + 300;
-            
-            log('info', `📊 Modèle: ${modele.nom} (${modele.quota.utilise}/${modele.quota.max})`);
+            log('info', `📊 Tentative avec modèle: ${modele.nom} (${modele.quota.utilise}/${modele.quota.max})`);
 
             const completion = await this.client.chat.completions.create({
                 model: modele.id,
@@ -698,8 +772,8 @@ User: "J'ai mal à la tête" (en pleine commande)
                 response_format: { type: "json_object" }
             });
 
-            // Mettre à jour le quota utilisé
-            const tokensUtilises = completion.usage?.total_tokens || tokensEstimes;
+            // Succès ! Mettre à jour le quota
+            const tokensUtilises = completion.usage?.total_tokens || 500;
             await this.trackTokenUsage(modele, tokensUtilises);
 
             const result = JSON.parse(completion.choices[0].message.content);
@@ -707,20 +781,15 @@ User: "J'ai mal à la tête" (en pleine commande)
             return result;
             
         } catch (error) {
-            log('error', `Comprendre error: ${error.message}`);
-            
-            // Si erreur 429 (rate limit), marquer le modèle comme épuisé pour cette minute
             if (error.status === 429) {
-                this.consecutiveErrors++;
+                // Gérer le rate limit
+                await this.handleRateLimit(error, modele);
                 
-                // Attendre un peu et réessayer
-                const waitTime = 5000 * this.consecutiveErrors;
-                await new Promise(r => setTimeout(r, waitTime));
-                
-                // Réessayer avec le même message
+                // Réessayer avec le prochain modèle
                 return this._comprendre(message, historique, type);
             }
             
+            log('error', `Comprendre error: ${error.message}`);
             return {
                 intention: "unknown",
                 medicament: null,
@@ -1213,11 +1282,19 @@ async function initDatabase() {
 const app = express();
 const bot = new ConversationManager();
 
+app.set('trust proxy', 1); // AJOUTÉ pour corriger l'erreur X-Forwarded-For
+
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 200
+    max: 200,
+    keyGenerator: (req) => {
+        // Utiliser l'IP du client de manière sécurisée
+        return req.headers['x-forwarded-for']?.split(',')[0] || 
+               req.socket.remoteAddress || 
+               'unknown';
+    }
 }));
 
 app.get('/webhook', (req, res) => {

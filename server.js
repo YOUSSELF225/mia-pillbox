@@ -2,11 +2,15 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const { Pool } = require('pg');
+const Redis = require('ioredis');
 const NodeCache = require('node-cache');
 const Fuse = require('fuse.js');
 const winston = require('winston');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const os = require('os');
+const sharp = require('sharp');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 // ===========================================
 // CONFIGURATION
@@ -19,31 +23,59 @@ const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/me
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Configuration livraison (frais de service supprimés)
+// Configuration livraison
 const DELIVERY_CONFIG = {
     PRICES: { DAY: 400, NIGHT: 600 },
-    DELIVERY_TIME: 45,
-    FREE_DELIVERY_THRESHOLD: 5000 // Seuil pour livraison gratuite
+    DELIVERY_TIME: 45
 };
 
-// États de conversation
-const ConversationStates = {
-    IDLE: 'IDLE',
-    WAITING_MEDICINE: 'WAITING_MEDICINE',
-    WAITING_QUANTITY: 'WAITING_QUANTITY',
-    WAITING_SELECTION: 'WAITING_SELECTION',
-    WAITING_QUARTIER: 'WAITING_QUARTIER',
-    WAITING_NAME: 'WAITING_NAME',
-    WAITING_AGE: 'WAITING_AGE',
-    WAITING_PHONE: 'WAITING_PHONE',
-    WAITING_CONFIRMATION: 'WAITING_CONFIRMATION',
-    WAITING_MODIFICATION: 'WAITING_MODIFICATION',
-    WAITING_MEDICINE_TO_EDIT: 'WAITING_MEDICINE_TO_EDIT',
-    WAITING_QUANTITY_TO_EDIT: 'WAITING_QUANTITY_TO_EDIT',
-    WAITING_INFO_TO_EDIT: 'WAITING_INFO_TO_EDIT'
-};
+// [RENDER] Configuration Redis (Valkey)
+let redis;
+try {
+    redis = new Redis(process.env.REDIS_URL, {
+        retryStrategy: (times) => Math.min(times * 100, 5000),
+        maxRetriesPerRequest: 3,
+        enableOfflineQueue: false,
+    });
+    redis.on('error', (err) => log('error', `Erreur Redis: ${err.message}`));
+    redis.on('connect', () => log('info', 'Connecté à Redis (Valkey)'));
+} catch (error) {
+    log('error', `Impossible de se connecter à Redis: ${error.message}`);
+    redis = null;
+}
 
-// Cache pour éviter les doublons
+// Cache hybride (Redis + NodeCache en fallback)
+class HybridCache {
+    constructor() {
+        this.localCache = new NodeCache({ stdTTL: 3600 });
+    }
+
+    async get(key) {
+        if (!redis) return this.localCache.get(key);
+        try {
+            const value = await redis.get(key);
+            return value ? JSON.parse(value) : null;
+        } catch (error) {
+            log('error', `Erreur Redis (get): ${error.message}`);
+            return this.localCache.get(key);
+        }
+    }
+
+    async set(key, value, ttl = 3600) {
+        if (!redis) {
+            this.localCache.set(key, value, ttl);
+            return;
+        }
+        try {
+            await redis.set(key, JSON.stringify(value), 'EX', ttl);
+        } catch (error) {
+            log('error', `Erreur Redis (set): ${error.message}`);
+            this.localCache.set(key, value, ttl);
+        }
+    }
+}
+
+const cache = new HybridCache();
 const processedMessages = new NodeCache({ stdTTL: 600 });
 
 // ===========================================
@@ -67,19 +99,6 @@ function log(level, message) {
 }
 
 // ===========================================
-// BASE DE DONNÉES
-// ===========================================
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000
-});
-
-pool.on('error', (err) => log('error', `Erreur DB: ${err.message}`));
-
-// ===========================================
 // UTILS
 // ===========================================
 class Utils {
@@ -93,83 +112,19 @@ class Utils {
             .trim();
     }
 
-    static extractNumber(text) {
-        if (!text) return null;
-        const match = text.match(/\d+/);
-        return match ? parseInt(match[0], 10) : null;
-    }
-
-    static formatPhone(phone) {
-        return phone?.toString().replace(/\D/g, '') || '';
-    }
-
-    static generateOrderId() {
-        return `CMD${Date.now()}${Math.floor(Math.random() * 1000)}`;
-    }
-
-    static generateCode() {
-        return Math.floor(100000 + Math.random() * 900000).toString();
-    }
-
     static getDeliveryPrice() {
         const hour = new Date().getHours();
         const isNight = hour >= 0 && hour < 7;
         return {
             price: isNight ? DELIVERY_CONFIG.PRICES.NIGHT : DELIVERY_CONFIG.PRICES.DAY,
-            period: isNight ? 'Nuit' : 'Jour',
+            period: isNight ? 'nuit' : 'jour',
             time: DELIVERY_CONFIG.DELIVERY_TIME
         };
     }
 
-    static calculateTotal(cart) {
-        const subtotal = cart.reduce((sum, i) => sum + (i.prix * i.quantite), 0);
-        const delivery = this.getDeliveryPrice();
-        const total = subtotal + delivery.price;
-        return {
-            subtotal,
-            deliveryPrice: delivery.price,
-            total,
-            deliveryPeriod: delivery.period,
-            deliveryTime: delivery.time,
-            isFreeDelivery: subtotal >= DELIVERY_CONFIG.FREE_DELIVERY_THRESHOLD
-        };
-    }
-}
-
-// ===========================================
-// VALIDATION SERVICE
-// ===========================================
-class ValidationService {
-    static validate(field, value) {
-        if (!value && value !== 0) return false;
-        switch(field) {
-            case 'nom':
-                return value.trim().length >= 2 && /^[a-zA-ZÀ-ÿ\s-]+$/.test(value);
-            case 'age':
-                const age = parseInt(value, 10);
-                return !isNaN(age) && age >= 1 && age <= 120;
-            case 'telephone':
-                const clean = value.replace(/\D/g, '');
-                return clean.length === 10 && /^(07|01|05)\d{8}$/.test(clean);
-            case 'quartier':
-                return value.trim().length >= 2;
-            case 'quantite':
-                const qty = parseInt(value, 10);
-                return !isNaN(qty) && qty >= 1 && qty <= 10;
-            default:
-                return true;
-        }
-    }
-
-    static getErrorMessage(field) {
-        const messages = {
-            'nom': "❌ *Nom invalide.*\n→ Utilise seulement des lettres (ex: *Jean Kouamé*).",
-            'age': "❌ *Âge invalide.*\n→ Choisis un nombre entre 1 et 120.",
-            'telephone': "❌ *Numéro invalide.*\n→ Format attendu: *0712345678*.",
-            'quartier': "❌ *Quartier invalide.*\n→ Précise ton quartier à San Pedro (ex: *Cité*).",
-            'quantite': "❌ *Quantité invalide.*\n→ Choisis un nombre entre 1 et 10."
-        };
-        return messages[field] || "❌ *Valeur invalide.*";
+    static getSupportLink() {
+        const phone = SUPPORT_PHONE.replace('+', '');
+        return `https://wa.me/${phone}`;
     }
 }
 
@@ -177,10 +132,14 @@ class ValidationService {
 // WHATSAPP SERVICE
 // ===========================================
 class WhatsAppService {
+    constructor() {
+        this.lastTyping = new NodeCache({ stdTTL: 10 });
+    }
+
     async sendMessage(to, text) {
         try {
             if (!text || typeof text !== 'string') {
-                text = "Bonjour ! Je suis MARIAM, ton assistante santé à San Pedro. 💊 *Quel médicament cherches-tu ?*";
+                text = "Salut ! Je suis MARIAM, je cherche tes médicaments et je les livre à San Pedro. Qu'est-ce qu'il te faut ?";
             }
             const safeText = text.substring(0, 4096);
             await axios.post(WHATSAPP_API_URL, {
@@ -194,63 +153,52 @@ class WhatsAppService {
             });
             return true;
         } catch (error) {
-            log('error', `Erreur envoi: ${error.message}`);
+            log('error', `Erreur envoi WhatsApp: ${error.message}`);
             return false;
         }
     }
 
     async sendTyping(to) {
         try {
-            await axios.post(WHATSAPP_API_URL, {
-                messaging_product: 'whatsapp',
-                to: to,
-                type: 'typing',
-                typing: { action: 'typing', duration_ms: 3000 }
-            }, {
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-            });
+            const lastTyping = this.lastTyping.get(to);
+            if (!lastTyping || Date.now() - lastTyping > 10000) {
+                await axios.post(WHATSAPP_API_URL, {
+                    messaging_product: 'whatsapp',
+                    to: to,
+                    type: 'typing',
+                    typing: { action: 'typing', duration_ms: 3000 }
+                }, {
+                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                    timeout: 5000
+                });
+                this.lastTyping.set(to, Date.now());
+            }
         } catch (error) {}
-    }
-
-    async sendInteractiveButtons(to, text, buttons) {
-        try {
-            await axios.post(WHATSAPP_API_URL, {
-                messaging_product: 'whatsapp',
-                to: to,
-                type: 'interactive',
-                interactive: {
-                    type: 'button',
-                    body: { text: text.substring(0, 1024) },
-                    action: {
-                        buttons: buttons.slice(0, 3).map((btn, index) => ({
-                            type: 'reply',
-                            reply: { id: `btn_${Date.now()}_${index}`, title: btn.substring(0, 20) }
-                        }))
-                    }
-                }
-            }, {
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-            });
-            return true;
-        } catch (error) {
-            log('error', `Erreur boutons: ${error.message}`);
-            return false;
-        }
     }
 
     async downloadMedia(mediaId) {
         try {
             const mediaResponse = await axios.get(
                 `https://graph.facebook.com/v18.0/${mediaId}`,
-                { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } }
+                { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }, timeout: 10000 }
             );
-            const fileResponse = await axios.get(mediaResponse.data.url, {
+            const imageUrl = mediaResponse.data.url;
+            const fileResponse = await axios.get(imageUrl, {
                 responseType: 'arraybuffer',
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                timeout: 15000
             });
-            return { success: true, buffer: Buffer.from(fileResponse.data) };
+
+            const buffer = Buffer.from(fileResponse.data);
+            if (buffer.length > 2 * 1024 * 1024) {
+                const resizedBuffer = await sharp(buffer)
+                    .resize(800, 800, { fit: 'inside' })
+                    .toBuffer();
+                return { success: true, buffer: resizedBuffer };
+            }
+            return { success: true, buffer: buffer };
         } catch (error) {
-            log('error', `Erreur téléchargement: ${error.message}`);
+            log('error', `Erreur téléchargement media: ${error.message}`);
             return { success: false, error: error.message };
         }
     }
@@ -262,193 +210,322 @@ class WhatsAppService {
                 status: 'read',
                 message_id: messageId
             }, {
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                timeout: 5000
             });
         } catch (error) {}
     }
 }
 
 // ===========================================
-// FUSE SERVICE - RECHERCHE MÉDICAMENTS
+// BASE DE DONNÉES (PostgreSQL sur Render)
+// ===========================================
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => log('error', `Erreur DB: ${err.message}`));
+
+// ===========================================
+// FUSE SERVICE (Recherche de Médicaments)
 // ===========================================
 class FuseService {
     constructor() {
         this.fuse = null;
         this.medicaments = [];
-        this.cache = new NodeCache({ stdTTL: 3600 });
+        this.cache = cache;
     }
 
     async initialize() {
         log('info', 'Chargement des médicaments...');
-        const result = await pool.query(`
-            SELECT code_produit, nom_commercial, dci, prix, categorie
-            FROM medicaments
-        `);
-        this.medicaments = result.rows.map(med => ({
-            ...med,
-            normalized: Utils.normalizeText(med.nom_commercial),
-            searchable: `${med.nom_commercial} ${med.dci || ''}`.toLowerCase()
-        }));
-        this.fuse = new Fuse(this.medicaments, {
-            keys: [
-                { name: 'nom_commercial', weight: 0.8 },
-                { name: 'dci', weight: 0.5 },
-                { name: 'normalized', weight: 0.6 }
-            ],
-            threshold: 0.3,
-            distance: 50,
-            minMatchCharLength: 2,
-            shouldSort: true,
-            includeScore: true,
-            ignoreLocation: true
-        });
-        log('info', `${this.medicaments.length} médicaments chargés`);
+        try {
+            const cachedMedicaments = await this.cache.get("all_medicaments");
+            if (cachedMedicaments) {
+                this.medicaments = cachedMedicaments;
+                this.fuse = new Fuse(this.medicaments, {
+                    keys: [
+                        { name: 'nom_commercial', weight: 0.8 },
+                        { name: 'dci', weight: 0.5 },
+                        { name: 'normalized', weight: 0.6 }
+                    ],
+                    threshold: 0.3,
+                    includeScore: true
+                });
+                return;
+            }
+
+            const result = await pool.query("SELECT * FROM medicaments");
+            this.medicaments = result.rows.map(med => ({
+                ...med,
+                normalized: Utils.normalizeText(med.nom_commercial),
+                searchable: `${med.nom_commercial} ${med.dci || ''}`.toLowerCase()
+            }));
+
+            this.fuse = new Fuse(this.medicaments, {
+                keys: [
+                    { name: 'nom_commercial', weight: 0.8 },
+                    { name: 'dci', weight: 0.5 },
+                    { name: 'normalized', weight: 0.6 }
+                ],
+                threshold: 0.3,
+                includeScore: true
+            });
+
+            await this.cache.set("all_medicaments", this.medicaments, 300);
+            log('info', `${this.medicaments.length} médicaments chargés`);
+        } catch (error) {
+            log('error', `Erreur chargement médicaments: ${error.message}`);
+            throw error;
+        }
     }
 
-    async search(query, limit = 5, threshold = 0.4) {
+    async search(query, limit = 5) {
         if (!query || query.length < 2) return [];
         const cacheKey = `search:${Utils.normalizeText(query)}`;
-        const cached = this.cache.get(cacheKey);
+        const cached = await this.cache.get(cacheKey);
         if (cached) return cached.slice(0, limit);
+
         const results = this.fuse.search(query)
-            .filter(r => r.score < threshold)
+            .filter(r => r.score < 0.4)
             .slice(0, limit)
             .map(r => r.item);
-        if (results.length > 0) this.cache.set(cacheKey, results);
+
+        if (results.length > 0) await this.cache.set(cacheKey, results);
         return results;
     }
 }
 
 // ===========================================
-// LLM SERVICE - GROQ LLAMA-3.3-70B
+// LLM SERVICE (Groq)
 // ===========================================
 class LLMService {
     constructor() {
-        this.apiKey = GROQ_API_KEY;
-        this.baseURL = "https://api.groq.com/openai/v1";
-        this.model = "llama-3.3-70b-versatile";
-        this.cache = new NodeCache({ stdTTL: 300 });
+        this.models = {
+            detailed: "llama-3.3-70b-versatile",
+            vision: "meta-llama/llama-4-scout-17b-16e-instruct"
+        };
+        this.cache = cache;
     }
 
-    getSystemPrompt(conv) {
-        const context = conv?.context || {};
-        const cart = conv?.cart || [];
-        const lastMedicine = conv?.context?.lastMedicine?.name || 'aucun';
-        return `Tu es MARIAM, une assistante santé virtuelle à San Pedro, Côte d'Ivoire.
+    getSystemPrompt() {
+        const delivery = Utils.getDeliveryPrice();
+        const supportLink = Utils.getSupportLink();
+        return `
+            Tu es MARIAM, une assistante santé 100% IA à San Pedro, Côte d'Ivoire.
 
-        ⚠️ INSTRUCTIONS CRITIQUES ⚠️
-        - Réponds UNIQUEMENT en JSON valide.
-        - Utilise les champs "intention", "entites", et "reponse".
-        - Si l'utilisateur demande un médicament, retourne une liste numérotée des résultats.
-        - Guide l'utilisateur étape par étape jusqu'à la commande.
+            **RÈGLES STRICTES** :
+            1. Réponds **UNIQUEMENT** en JSON valide avec ce format :
+               {
+                   "intention": "greet|search|support|delivery|creator|purpose|unknown|image",
+                   "reponse": "Ta réponse naturelle en 1-2 phrases max (avec emojis pertinents : 💊, 📸, 🚚, 📲, 💙)."
+               }
+            2. Détecte l'intention en utilisant les mots-clés et exemples ci-dessous.
+            3. Pour chaque intention, suis les consignes spécifiques ci-dessous.
 
-        ===========================================================
-        CONTEXTE ACTUEL
-        ===========================================================
-        - État: ${conv?.state || 'IDLE'}
-        - Panier: ${cart.length} article(s)
-        - Dernier médicament: ${lastMedicine}
+            **CONTEXTE** :
+            - Livraison : ${delivery.price}F (${delivery.period}), délai : ${delivery.time} min.
+            - Support : ${supportLink}.
 
-        ===========================================================
-        INTENTIONS À DÉTECTER
-        ===========================================================
-        1. "greet" → Salutation (bonjour, salut, hey, cc)
-        2. "question" → Question sur toi (qui es-tu, que fais-tu, comment tu peux m'aider)
-        3. "help" → Demande d'aide (aide, aide-moi, que peux-tu faire)
-        4. "search" → Recherche médicament (doliprane, amox)
-        5. "order" → Commande avec quantité (je veux 2 doliprane)
-        6. "add" → Ajout au panier (ajoute, mets dans panier)
-        7. "cart" → Voir le panier (mon panier, voir panier)
-        8. "checkout" → Passer commande (commander, finaliser)
-        9. "info" → Donner info (j'habite à, je m'appelle, j'ai X ans)
-        10. "confirm" → Confirmation (oui, d'accord, ok)
-        11. "cancel" → Annulation (non, annuler)
+            **INTENTIONS ET CONSIGNES** :
 
-        ===========================================================
-        EXEMPLES PRÉCIS
-        ===========================================================
-        1. "salut" → {"intention":"greet", "reponse":"Salut ! Je suis MARIAM, ton assistante santé à San Pedro. 💊 Quel médicament cherches-tu ?"}
-        2. "qui es-tu ?" → {"intention":"question", "reponse":"Je suis MARIAM, ton assistante santé à San Pedro. Je peux t'aider à trouver des médicaments, répondre à tes questions sur la santé et te guider pour passer commande en ligne."}
-        3. "aide" → {"intention":"help", "reponse":"Voici ce que je peux faire pour toi :\\n- Rechercher des médicaments (ex: \\"doliprane\\\")\\n- Ajouter des médicaments à ton panier\\n- Passer une commande\\n- Répondre à tes questions sur la santé\\n\\nTu peux commencer par me dire ce que tu cherches !"}
-        4. "doliprane" → {"intention":"search", "entites":{"medicament":"doliprane"}, "reponse":"Je cherche le doliprane..."}
-        5. "je veux 2 doliprane" → {"intention":"order", "entites":{"medicament":"doliprane", "quantite":2}, "reponse":"D'accord pour 2 doliprane. Je l'ajoute à ton panier."}
-        6. "ajoute au panier" → {"intention":"add", "reponse":"Quel médicament veux-tu ajouter ?"}
-        7. "mon panier" → {"intention":"cart", "reponse":"Voici ton panier : ..."}
-        8. "commander" → {"intention":"checkout", "reponse":"Je prépare ta commande..."}
-        9. "j'habite à cité" → {"intention":"info", "entites":{"champ":"quartier", "valeur":"cité"}, "reponse":"Quartier enregistré : Cité."}
-        10. "oui" → {"intention":"confirm", "reponse":"Commande confirmée !"}
-        11. "non" → {"intention":"cancel", "reponse":"Annulé."}`;
+            --- GREET (Salutations) ---
+            Mots-clés : salut, bonjour, hey, cc, coucou, bonsoir, yo, hello, slt, bjr, wesh, ça va
+            Exemples :
+            - "Salut MARIAM !" → {"intention": "greet", "reponse": "Salut ! Je suis MARIAM, ton assistante santé à San Pedro. 💊 Besoin d’un médicament ?"}
+            - "Bonjour, comment ça va ?" → {"intention": "greet", "reponse": "Bonjour ! Je vais bien, merci. 😊 Je suis là pour t’aider avec tes médicaments à San Pedro. Qu’est-ce qu’il te faut ?"}
+
+            --- SEARCH (Recherche de Médicaments) ---
+            Mots-clés : cherche, trouve, prix de, as-tu, existe, disponible, médicament, mg, g, boîte, comprimé, sirop, gélule
+            Exemples :
+            - "Tu as du Doliprane 500mg ?" → {"intention": "search", "reponse": "Oui ! **Doliprane 500mg** est disponible à **1500F**. 💊 Pour commander, envoie *‘2 Doliprane 500mg’* au support : ${supportLink}."}
+            - "Prix de l’amoxicilline 1g" → {"intention": "search", "reponse": "**Amoxicilline 1g** est à **2500F**. 💊 Commande via le support : ${supportLink} (ex: *‘1 boîte’*)."}
+
+            --- SUPPORT (Commande/Livraison) ---
+            Mots-clés : support, commander, comment commander, numéro, contact, aide, besoin d’aide, je veux, je prends
+            Exemples :
+            - "Comment commander du Doliprane ?" → {"intention": "support", "reponse": "Pour commander, envoie un message au support avec le **nom + quantité** (ex: *‘2 Doliprane 500mg’*). 📲 Lien : ${supportLink}. Livraison en **${delivery.time} min** !"}
+            - "Je veux 2 Doliprane" → {"intention": "support", "reponse": "Parfait ! Envoie *‘2 Doliprane 500mg’* au support : ${supportLink}. 🚚 Livraison en **${delivery.time} min** à San Pedro."}
+
+            --- DELIVERY (Livraison) ---
+            Mots-clés : livraison, prix livraison, livrer, délai, temps livraison, livraison nuit
+            Exemples :
+            - "Combien coûte la livraison ?" → {"intention": "delivery", "reponse": "Livraison à San Pedro : **${delivery.price}F** (${delivery.period}). Délai : **${delivery.time} min**. 🚚 Besoin d’aide ? Contacte le support : ${supportLink}."}
+            - "Livraison de nuit ?" → {"intention": "delivery", "reponse": "Oui ! Livraison de nuit : **600F**. 🌙 Délai : **${delivery.time} min**. Commande via ${supportLink}."}
+
+            --- CREATOR (Créateurs - DÉTAILS COMPLETS) ---
+            Mots-clés : qui t'a créée, créateur, youssef, coulibaly, qui t'a fait, ton créateur, ton développeur, ton concepteur
+            Consignes :
+            - Donne TOUJOURS ces informations :
+              1. Youssef : étudiant en Licence 2 (Tronc Commun Agriculture, Ressources Halieutiques et Agro-Industrie) à l’UPSP.
+              2. Coulibaly Yaya : son amie, rencontrée en mars 2026 dans sa chambre d’étudiant.
+              3. Projet créé pour faciliter l’accès aux médicaments à San Pedro.
+              4. Ton : chaleureux et reconnaissant ("merci à eux", "belle histoire").
+            Exemples :
+            - "Qui t’a créée ?" → {"intention": "creator", "reponse": "J’ai été créée par **Youssef**, étudiant en **Licence 2 (Tronc Commun Agriculture, Ressources Halieutiques et Agro-Industrie)** à l’**UPSP**. 🎓 En **mars 2026**, il a été soutenu par son amie **Coulibaly Yaya**, rencontrée dans sa chambre d’étudiant. Une belle histoire d’amitié et d’innovation ! 💙"}
+            - "Parle-moi de Youssef" → {"intention": "creator", "reponse": "Mon créateur, **Youssef**, est un étudiant passionné en **Agro-Industrie** à l’**UPSP**. 👨🎓 Avec l’aide de **Coulibaly Yaya**, ils ont développé MARIAM pour **révolutionner l’accès aux médicaments** à San Pedro. Leur objectif ? Rendre la santé accessible à tous, sans stress. 💖"}
+
+            --- PURPOSE (Utilité du Bot) ---
+            Mots-clés : pourquoi tu existes, à quoi tu sers, utilité, objectif, but, raison
+            Consignes :
+            - Explique clairement :
+              1. Problème avant MARIAM : pharmacies fermées, prix inconnus, livraisons longues.
+              2. Solution : recherche rapide, prix transparents, livraison en ${delivery.time} min.
+              3. Impact : simplifier la vie des habitants de San Pedro.
+            Exemples :
+            - "Pourquoi tu existes ?" → {"intention": "purpose", "reponse": "Pour que tu trouves **tes médicaments en 2 min** sans stress ! 💊 Avant MARIAM, c’était compliqué : pharmacies fermées, prix inconnus… Maintenant, je te donne **prix, dispo et livraison express** à San Pedro. Mon but ? Que **personne ne reste sans solution**."}
+            - "À quoi tu sers ?" → {"intention": "purpose", "reponse": "Je simplifie **l’accès aux médicaments** à San Pedro ! 🏥 Plus besoin de courir les pharmacies : avec moi, tu as **prix transparents** et **livraison en ${delivery.time} min**. Parce que ta santé mérite d’être **facile et rapide** ! 😊"}
+
+            --- UNKNOWN (Messages Inconnus) ---
+            Exemples :
+            - "Quel temps fait-il ?" → {"intention": "unknown", "reponse": "Désolée, je ne réponds qu’aux questions sur les **médicaments** à San Pedro. 💊 Envoie-moi un nom ou une photo pour t’aider !"}
+            - "Tu aimes les chats ?" → {"intention": "unknown", "reponse": "Je suis là pour les **médicaments** uniquement. 😊 Dis-moi ce que tu cherches, et je te trouve ça en 2 sec !"}
+        `;
     }
 
-    getHistory(conversation) {
-        if (!conversation?.history) return [];
-        return conversation.history
-            .slice(-6)
-            .map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.content
-            }));
-    }
-
-    async analyzeMessage(userMessage, conversation) {
-        const cacheKey = `llm:${userMessage.substring(0, 50)}`;
-        const cached = this.cache.get(cacheKey);
-        if (cached) return cached;
+    async callGroq(prompt, model) {
         try {
-            const response = await fetch(`${this.baseURL}/chat/completions`, {
+            const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Authorization': `Bearer ${GROQ_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    model: this.model,
+                    model: model,
                     messages: [
-                        { role: "system", content: this.getSystemPrompt(conversation) },
-                        ...this.getHistory(conversation),
-                        { role: "user", content: userMessage }
+                        { role: "system", content: this.getSystemPrompt() },
+                        { role: "user", content: prompt }
                     ],
-                    temperature: 0.1,
-                    max_tokens: 300,
+                    temperature: model === this.models.detailed ? 0.7 : 0.1,
+                    max_tokens: model === this.models.detailed ? 200 : 500,
                     response_format: { type: "json_object" }
-                })
+                }),
+                timeout: 10000
             });
+
+            if (!response.ok) {
+                throw new Error(`Groq API error: ${response.statusText}`);
+            }
+
             const data = await response.json();
-            let content = data.choices[0].message.content;
-            content = content.replace(/^```json\s*|\s*```$/g, '');
-            const result = JSON.parse(content);
-            this.cache.set(cacheKey, result);
-            return result;
+            return this.safeParseJSON(data);
         } catch (error) {
-            console.error('❌ Erreur LLM:', error);
-            return this.fallbackResponse(userMessage);
+            log('error', `Erreur Groq: ${error.message}`);
+            throw error;
         }
     }
 
-    fallbackResponse(userMessage) {
-        const lower = userMessage.toLowerCase();
-        if (lower.match(/bonjour|salut|hey|cc/)) {
-            return { intention: "greet", reponse: "Salut ! Je suis MARIAM, ton assistante santé à San Pedro. 💊 *Quel médicament cherches-tu ?*" };
-        } else if (lower.match(/qui es-tu|qui es tu|tu es qui|présente toi/)) {
-            return { intention: "question", reponse: "Je suis MARIAM, ton assistante santé à San Pedro. Je peux t'aider à trouver des médicaments, répondre à tes questions sur la santé et te guider pour passer commande en ligne." };
-        } else if (lower.match(/aide|help|aide-moi|que peux-tu faire/)) {
-            return { intention: "help", reponse: "Je peux t'aider à rechercher des médicaments, les ajouter à ton panier et passer commande. Essaie par exemple : *\"doliprane\"* ou *\"mon panier\"*." };
-        } else if (lower.match(/mon panier|voir panier/)) {
-            return { intention: "cart", reponse: "Ton panier est vide. Ajoute des médicaments avec leur nom." };
-        } else {
-            return { intention: "search", entites: { medicament: userMessage }, reponse: `Je cherche "${userMessage}"...` };
+    safeParseJSON(response) {
+        try {
+            if (!response.choices || !response.choices[0] || !response.choices[0].message) {
+                throw new Error("Réponse Groq invalide");
+            }
+
+            const content = response.choices[0].message.content.trim();
+            const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
+            const jsonStr = jsonMatch ? jsonMatch[1] : content;
+            const parsed = JSON.parse(jsonStr);
+
+            if (!parsed.intention || !parsed.reponse) {
+                throw new Error("JSON incomplet");
+            }
+
+            return parsed;
+        } catch (e) {
+            log('error', `Erreur parsing JSON: ${e.message}`);
+            return {
+                intention: "unknown",
+                reponse: "Désolée, une erreur technique est survenue. Réessaye dans 1 min !"
+            };
         }
+    }
+
+    async analyzeMessage(text, intention) {
+        const cacheKey = `llm:${intention}:${Utils.normalizeText(text).substring(0, 50)}`;
+        const cached = await this.cache.get(cacheKey);
+        if (cached) return cached;
+
+        let prompt;
+        if (intention === "search") {
+            prompt = `Réponds à une recherche de médicament. Format JSON strict.`;
+        } else if (intention === "creator") {
+            prompt = `
+                Réponds à une question sur ton créateur avec ces DÉTAILS PRÉCIS :
+                - Youssef : étudiant en Licence 2 (Tronc Commun Agriculture, Ressources Halieutiques et Agro-Industrie) à l'UPSP.
+                - Coulibaly Yaya : son amie, rencontrée en mars 2026 dans sa chambre d'étudiant.
+                - Projet créé pour faciliter l'accès aux médicaments à San Pedro.
+                - Ton : chaleureux, reconnaissant ("merci à eux", "belle histoire").
+                Format JSON strict.
+            `;
+        } else if (intention === "purpose") {
+            prompt = `
+                Explique pourquoi tu existes :
+                1. Problème avant MARIAM : pharmacies fermées, prix inconnus, livraisons longues.
+                2. Solution : recherche rapide, prix transparents, livraison en ${delivery.time} min.
+                3. Impact : simplifier la vie des habitants de San Pedro.
+                Format JSON strict.
+            `;
+        } else {
+            prompt = `Réponds à une question de type "${intention}". Format JSON strict.`;
+        }
+
+        prompt += `\nQuestion utilisateur: "${text}"`;
+
+        try {
+            const model = intention === "image" ? this.models.vision : this.models.detailed;
+            const response = await this.callGroq(prompt, model);
+            await this.cache.set(cacheKey, response, 3600);
+            return response;
+        } catch (error) {
+            return this.getFallbackResponse(intention);
+        }
+    }
+
+    getFallbackResponse(intention) {
+        const fallbacks = {
+            greet: {
+                intention: "greet",
+                reponse: "Salut ! Je suis MARIAM, ton assistante santé à San Pedro. 💊 Besoin d’un médicament ?"
+            },
+            search: {
+                intention: "search",
+                reponse: `Désolée, problème technique. Contacte le support pour commander : ${Utils.getSupportLink()}.`
+            },
+            support: {
+                intention: "support",
+                reponse: `Pour commander, contacte le support : ${Utils.getSupportLink()}. Exemple : *‘2 Doliprane 500mg’*.`
+            },
+            delivery: {
+                intention: "delivery",
+                reponse: `Livraison à San Pedro : **${Utils.getDeliveryPrice().price}F** (${Utils.getDeliveryPrice().period}). Délai : **${Utils.getDeliveryPrice().time} min**. 🚚`
+            },
+            creator: {
+                intention: "creator",
+                reponse: "J’ai été créée par **Youssef** (étudiant en Licence 2 Agriculture à l’UPSP) et **Coulibaly Yaya** en mars 2026. 💙 Une belle histoire d’amitié et d’innovation !"
+            },
+            purpose: {
+                intention: "purpose",
+                reponse: "Pour simplifier l’accès aux médicaments à San Pedro ! 💊 Plus de stress, tout est rapide et clair."
+            },
+            unknown: {
+                intention: "unknown",
+                reponse: "Désolée, je ne réponds qu’aux questions sur les médicaments à San Pedro. 💊 Envoie-moi un nom ou une photo !"
+            }
+        };
+        return fallbacks[intention] || fallbacks.unknown;
     }
 }
 
 // ===========================================
-// VISION SERVICE - GROQ LLAMA-4-SCOUT
+// VISION SERVICE (Analyse d'Images)
 // ===========================================
 class VisionService {
     constructor() {
-        this.apiKey = GROQ_API_KEY;
-        this.baseURL = "https://api.groq.com/openai/v1";
-        this.model = "meta-llama/llama-4-scout-17b-16e-instruct";
+        this.llm = new LLMService();
     }
 
     async analyzeImage(imageBuffer) {
@@ -456,171 +533,63 @@ class VisionService {
             const base64Image = imageBuffer.toString('base64');
             const sizeInMB = base64Image.length / 1024 / 1024;
             if (sizeInMB > 4) {
-                return { type: "inconnu", error: "L'image est trop grande (max 4MB)." };
+                return {
+                    type: "inconnu",
+                    medicaments: [],
+                    message: "L’image est trop grande (max 4 Mo). Envoie une photo plus petite ou le nom du médicament en texte."
+                };
             }
-            const response = await fetch(`${this.baseURL}/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.apiKey}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    model: this.model,
-                    messages: [
+
+            const prompt = `
+                Analyse cette image de boîte de médicament ou ordonnance.
+                Retourne UNIQUEMENT un JSON avec ce format :
+                {
+                    "type": "boite" | "ordonnance" | "inconnu",
+                    "medicaments": [
                         {
-                            role: "user",
-                            content: [
-                                {
-                                    type: "text",
-                                    text: `Analyse cette image de médicament. Réponds en JSON avec:
-                                    {
-                                        "type": "boite|ordonnance|inconnu",
-                                        "medicaments": [{"nom": "", "dosage": "", "forme": ""}],
-                                        "confidence": 0.0-1.0
-                                    }`
-                                },
-                                {
-                                    type: "image_url",
-                                    image_url: { url: `data:image/jpeg;base64,${base64Image}` }
-                                }
-                            ]
+                            "nom": "nom du médicament (ex: Doliprane)",
+                            "dosage": "dosage (ex: 500mg) ou null",
+                            "forme": "comprimé|gélule|sirop|injection|inconnu"
                         }
                     ],
-                    temperature: 0.1,
-                    max_tokens: 500,
-                    response_format: { type: "json_object" }
-                })
-            });
-            const data = await response.json();
-            const content = data.choices[0].message.content;
-            const cleanContent = content.replace(/^```json\s*|\s*```$/g, '');
-            return JSON.parse(cleanContent);
+                    "message": "Message optionnel si type='inconnu'"
+                }
+                Si l’image est illisible, retourne {"type": "inconnu", "medicaments": [], "message": "..."}.
+            `;
+
+            const response = await this.llm.callGroq(prompt, this.llm.models.vision);
+            return response;
         } catch (error) {
-            console.error('❌ Erreur vision:', error);
-            return { type: "inconnu", error: "Erreur lors de l'analyse de l'image." };
+            log('error', `Erreur analyse image: ${error.message}`);
+            return {
+                type: "inconnu",
+                medicaments: [],
+                message: "Désolée, je n’ai pas pu analyser cette image. Envoie-moi le nom du médicament en texte !"
+            };
         }
     }
 }
 
 // ===========================================
-// ORDER SERVICE
-// ===========================================
-class OrderService {
-    constructor(whatsapp) {
-        this.whatsapp = whatsapp;
-    }
-
-    async createOrder(phone, cart, context, deliveryPrice) {
-        if (!cart || cart.length === 0) throw new Error("Panier vide");
-        const requiredFields = ['quartier', 'nom', 'age', 'telephone'];
-        if (requiredFields.some(field => !context[field])) {
-            throw new Error("Données client incomplètes");
-        }
-        const orderId = Utils.generateOrderId();
-        const code = Utils.generateCode();
-        const subtotal = cart.reduce((sum, i) => sum + (i.prix * i.quantite), 0);
-        const total = subtotal + deliveryPrice;
-        const order = {
-            id: orderId,
-            client_name: context.nom,
-            client_phone: phone,
-            client_quartier: context.quartier,
-            client_ville: 'San Pedro',
-            client_indications: context.indications || '',
-            patient_age: context.age,
-            patient_genre: context.genre,
-            patient_poids: context.poids || null,
-            patient_taille: context.taille || null,
-            items: cart,
-            subtotal,
-            delivery_price: deliveryPrice,
-            total,
-            confirmation_code: code,
-            delivery_period: Utils.getDeliveryPrice().period,
-            status: 'PENDING'
-        };
-        await pool.query(`
-            INSERT INTO orders (
-                id, client_name, client_phone, client_quartier, client_ville,
-                client_indications, patient_age, patient_genre, patient_poids,
-                patient_taille, items, subtotal, delivery_price, total,
-                confirmation_code, delivery_period, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-        `, [
-            order.id, order.client_name, order.client_phone, order.client_quartier,
-            order.client_ville, order.client_indications, order.patient_age,
-            order.patient_genre, order.patient_poids, order.patient_taille,
-            JSON.stringify(order.items), order.subtotal, order.delivery_price,
-            order.total, order.confirmation_code, order.delivery_period, order.status
-        ]);
-        return order;
-    }
-
-    async notifySupport(order) {
-        const items = order.items.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n');
-        const message = `📦 NOUVELLE COMMANDE #${order.id}
-👤 ${order.client_name} (${order.client_phone})
-📍 ${order.client_quartier}
-📦\n${items}
-💰 TOTAL: ${order.total} FCFA (livraison incluse)
-🔑 CODE: ${order.confirmation_code}`;
-        await this.whatsapp.sendInteractiveButtons(SUPPORT_PHONE, message, [
-            '✅ Valider livraison',
-            '❌ Annuler commande'
-        ]);
-    }
-
-    async assignLivreur(orderId) {
-        const livreurResult = await pool.query(`
-            SELECT id_livreur, nom, telephone, whatsapp
-            FROM livreurs
-            WHERE disponible = true
-            ORDER BY commandes_livrees ASC
-            LIMIT 1
-        `);
-        if (livreurResult.rows.length === 0) return { success: false };
-        const livreur = livreurResult.rows[0];
-        const order = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
-        if (order.rows.length === 0) return { success: false };
-        const items = JSON.parse(order.rows[0].items).map(i => `${i.quantite}x ${i.nom_commercial}`).join(', ');
-        const message = `🛵 NOUVELLE LIVRAISON #${orderId}
-👤 Client: ${order.rows[0].client_name} (${order.rows[0].client_phone})
-📍 ${order.rows[0].client_quartier}
-📦 ${items}
-💰 ${order.rows[0].total} FCFA
-🔑 CODE: ${order.rows[0].confirmation_code}`;
-        await this.whatsapp.sendMessage(livreur.whatsapp || livreur.telephone, message);
-        return { success: true, livreur };
-    }
-}
-
-// ===========================================
-// CONVERSATION MANAGER
+// CONVERSATION MANAGER (Cœur du Bot)
 // ===========================================
 class ConversationManager {
     constructor() {
         this.conversations = new Map();
         this.whatsapp = new WhatsAppService();
-        this.fuse = null;
-        this.llm = null;
-        this.vision = null;
-        this.orders = null;
+        this.fuse = new FuseService();
+        this.llm = new LLMService();
+        this.vision = new VisionService();
     }
 
     async init() {
-        this.fuse = new FuseService();
         await this.fuse.initialize();
-        this.llm = new LLMService();
-        this.vision = new VisionService();
-        this.orders = new OrderService(this.whatsapp);
+        log('info', "MARIAM initialisé avec succès ! 🚀");
     }
 
     getConversation(phone) {
         if (!this.conversations.has(phone)) {
             this.conversations.set(phone, {
-                state: ConversationStates.IDLE,
-                cart: [],
-                context: {},
                 history: [],
                 lastActivity: Date.now()
             });
@@ -628,327 +597,225 @@ class ConversationManager {
         return this.conversations.get(phone);
     }
 
+    detectIntention(text) {
+        if (!text) return "unknown";
+
+        const normalizedText = Utils.normalizeText(text);
+
+        // GREET (Salutations)
+        if (/\b(salut|bonjour|hey|cc|coucou|bonsoir|yo|hello|slt|bjr|wesh|ça va|allô|ohé)\b/i.test(normalizedText)) {
+            return "greet";
+        }
+        // SEARCH (Médicaments)
+        else if (
+            /\b(cherche|trouve|prix de|as[- ]tu|existe|disponible|médicament|mg|g|boîte|comprimé|sirop|gélule|pour la fièvre|contre la toux|antidouleur|antibiotique|\w+mg|\w+g)\b/i.test(normalizedText) ||
+            /\b(doliprane|paracétamol|amoxicilline|ibuprofène|dafalgan|spasfon|voltarène|seresta|aspirine|augmentin|lexomil|nurofen|zyrtec|maalox|gaviscon|smecta|dexeryl)\b/i.test(normalizedText)
+        ) {
+            return "search";
+        }
+        // SUPPORT (Commande)
+        else if (/\b(support|commander|comment.*command|numéro|contact|aide|besoin d[a']?ide|je veux|je prends|passer.*commande|livrer.*moi|envoyer.*moi)\b/i.test(normalizedText)) {
+            return "support";
+        }
+        // DELIVERY (Livraison)
+        else if (/\b(livraison|prix.*livraison|livrer|délai|temps.*livraison|livraison nuit|frais.*livraison|combien.*livrer|livrez[- ]?vous)\b/i.test(normalizedText)) {
+            return "delivery";
+        }
+        // CREATOR (Créateur)
+        else if (/\b(qui.*(crée|fait)|ton.*créateur|c’est qui.*youssef|coulibaly|qui.*derrière|qui.*inventeur|ton père|ton.*père|qui.*fait.*bot)\b/i.test(normalizedText)) {
+            return "creator";
+        }
+        // PURPOSE (Utilité)
+        else if (/\b(pourquoi.*(existes?|crée|fait)|à quoi.*sers?|utilit[éé]|objectif|but|raison|problème.*résous?|simplifies?)\b/i.test(normalizedText)) {
+            return "purpose";
+        }
+        // UNKNOWN (Par défaut)
+        else {
+            return "unknown";
+        }
+    }
+
     async process(phone, input) {
         const conv = this.getConversation(phone);
         const { text, mediaId, mediaType } = input;
+
         try {
             await this.whatsapp.sendTyping(phone);
+
+            // Sauvegarde le message utilisateur
             if (text) {
                 conv.history.push({ role: 'user', content: text, timestamp: Date.now() });
             }
+
+            // AUDIO (non supporté)
             if (mediaType === 'audio') {
-                await this.whatsapp.sendMessage(phone, "🎤 Désolé, je ne traite pas les messages vocaux. Envoie un texte ou une photo.");
+                const response = await this.llm.analyzeMessage(
+                    "L'utilisateur a envoyé un message audio. Réponds poliment que tu ne traites que le texte et les images.",
+                    "unknown"
+                );
+                await this.whatsapp.sendMessage(phone, response.reponse);
+                conv.history.push({ role: 'assistant', content: response.reponse, timestamp: Date.now() });
+                conv.lastActivity = Date.now();
                 return;
             }
+
+            // IMAGE
             if (mediaId) {
                 await this.processImage(phone, mediaId, conv);
                 return;
             }
-            const analysis = await this.llm.analyzeMessage(text, conv);
-            await this.handleIntention(phone, conv, analysis, text);
-            conv.lastActivity = Date.now();
-            this.conversations.set(phone, conv);
+
+            // TEXTE
+            if (text) {
+                const intention = this.detectIntention(text);
+                const response = await this.llm.analyzeMessage(text, intention);
+
+                await this.whatsapp.sendMessage(phone, response.reponse);
+                conv.history.push({ role: 'assistant', content: response.reponse, timestamp: Date.now() });
+
+                // Si c'est une recherche, on peut aussi chercher dans Fuse
+                if (intention === "search") {
+                    const query = text.replace(/^(cherche|trouve|as[- ]tu|existe|disponible)\s*/i, '');
+                    const results = await this.fuse.search(query, 3);
+                    if (results.length > 0) {
+                        const searchPrompt = `
+                            Résultats de recherche pour "${query}" :
+                            ${results.map(r => `- ${r.nom_commercial} (${r.dci || 'N/A'}): ${r.prix}F`).join('\n')}
+                            Génère une réponse naturelle pour l'utilisateur avec ces résultats.
+                            Rappelle-lui de contacter le support pour commander : ${Utils.getSupportLink()}.
+                            Format JSON strict.
+                        `;
+                        const searchResponse = await this.llm.analyzeMessage(searchPrompt, "search");
+                        await this.whatsapp.sendMessage(phone, searchResponse.reponse);
+                        conv.history.push({ role: 'assistant', content: searchResponse.reponse, timestamp: Date.now() });
+                    }
+                }
+
+                conv.lastActivity = Date.now();
+            }
         } catch (error) {
-            console.error('❌ Erreur process:', error);
-            await this.whatsapp.sendMessage(phone, "Désolé, une erreur technique est survenue. Réessaie.");
+            log('error', `Erreur process: ${error.message}`);
+            const errorResponse = await this.llm.analyzeMessage(
+                "Erreur technique. Dis à l'utilisateur de réessayer ou de contacter le support.",
+                "unknown"
+            );
+            await this.whatsapp.sendMessage(phone, errorResponse.reponse);
+            conv.history.push({ role: 'assistant', content: errorResponse.reponse, timestamp: Date.now() });
         }
     }
 
     async processImage(phone, mediaId, conv) {
-        const media = await this.whatsapp.downloadMedia(mediaId);
-        if (!media.success) {
-            await this.whatsapp.sendMessage(phone, "❌ Impossible de télécharger l'image. Réessaie.");
-            return;
-        }
-        const analysis = await this.vision.analyzeImage(media.buffer);
-        if (analysis.type === "boite" && analysis.medicaments.length > 0) {
-            const medNames = analysis.medicaments.map(m => m.nom).join(", ");
-            await this.whatsapp.sendMessage(phone, `📸 J'ai détecté : *${medNames}*.\n💡 Tu peux maintenant chercher ces médicaments par leur nom.`);
-        } else if (analysis.type === "ordonnance") {
-            await this.whatsapp.sendMessage(phone, "📄 Ordonnance détectée. Envoie-moi le *nom des médicaments* un par un pour les ajouter à ton panier.");
-        } else {
-            await this.whatsapp.sendMessage(phone, "❌ Je n'ai pas pu analyser cette image. Envoie une photo plus nette d'une boîte ou d'une ordonnance.");
-        }
-    }
-
-    async handleIntention(phone, conv, analysis, originalText) {
-        const { intention, entites, reponse } = analysis;
-        await this.whatsapp.sendMessage(phone, reponse);
-        conv.history.push({ role: 'assistant', content: reponse, timestamp: Date.now() });
-
-        switch (intention) {
-            case 'greet':
-                conv.state = ConversationStates.IDLE;
-                break;
-
-            case 'question':
-                conv.state = ConversationStates.IDLE;
-                break;
-
-            case 'help':
-                conv.state = ConversationStates.IDLE;
-                break;
-
-            case 'search':
-                if (entites.medicament) {
-                    const delivery = Utils.getDeliveryPrice();
-                    const results = await this.fuse.search(entites.medicament, 5);
-                    if (results.length > 0) {
-                        conv.context.searchResults = results;
-                        conv.state = ConversationStates.WAITING_SELECTION;
-                        const list = results.map((m, i) =>
-                            `${i+1}. *${m.nom_commercial}* (${m.prix} FCFA/boîte)`
-                        ).join('\n');
-                        const message = `🔍 *Résultats pour "${entites.medicament}"* :
-${list}
-
-📌 *Frais de livraison* : ${delivery.price} FCFA (${delivery.period})
-💡 *Réponds avec le numéro* (ex: *1*), ou envoie une *photo* de ton ordonnance.`;
-                        await this.whatsapp.sendMessage(phone, message);
-                    } else {
-                        const suggestions = await this.fuse.search(entites.medicament, 3, 0.5);
-                        let suggestionText = "";
-                        if (suggestions.length > 0) {
-                            suggestionText = `\n\n💡 *Tu cherches peut-être :*
-${suggestions.slice(0, 3).map((m, i) => `${i+1}. ${m.nom_commercial}`).join('\n')}`;
-                        }
-                        await this.whatsapp.sendMessage(phone, `❌ *"${entites.medicament}" introuvable.*${suggestionText}`);
-                    }
-                }
-                break;
-
-            case 'select':
-                if (conv.context.searchResults) {
-                    const selectedIndex = Utils.extractNumber(originalText) - 1;
-                    if (selectedIndex >= 0 && selectedIndex < conv.context.searchResults.length) {
-                        const selectedMed = conv.context.searchResults[selectedIndex];
-                        conv.context.pendingMedicine = selectedMed;
-                        conv.state = ConversationStates.WAITING_QUANTITY;
-                        const delivery = Utils.getDeliveryPrice();
-                        await this.whatsapp.sendMessage(phone,
-                            `💊 *Tu as sélectionné* : *${selectedMed.nom_commercial}* (${selectedMed.prix} FCFA/boîte)
-🚚 *Frais de livraison* : ${delivery.price} FCFA (${delivery.period})
-
-📌 *Combien de boîtes veux-tu ?* (1-10)
-→ Réponds avec un *nombre* (ex: *2*).`);
-                    } else {
-                        await this.whatsapp.sendMessage(phone,
-                            `❌ *"${originalText}" n'est pas un numéro valide.
-📌 *Choisis un numéro entre 1 et ${conv.context.searchResults.length}.*`);
-                    }
-                }
-                break;
-
-            case 'add':
-                if (conv.context.pendingMedicine) {
-                    const med = conv.context.pendingMedicine;
-                    const qty = Utils.extractNumber(originalText) || 1;
-                    if (qty < 1 || qty > 10) {
-                        await this.whatsapp.sendMessage(phone,
-                            `❌ *Quantité invalide* (${qty}).
-📌 *Choisis un nombre entre 1 et 10.*`);
-                        return;
-                    }
-                    if (!conv.cart) conv.cart = [];
-                    const existing = conv.cart.find(item => item.code_produit === med.code_produit);
-                    if (existing) {
-                        existing.quantite += qty;
-                        await this.whatsapp.sendMessage(phone,
-                            `✅ *Mise à jour* : ${existing.quantite}x *${med.nom_commercial}* dans ton panier.`);
-                    } else {
-                        conv.cart.push({ ...med, quantite: qty });
-                        await this.whatsapp.sendMessage(phone,
-                            `✅ *${qty}x ${med.nom_commercial}* ajouté à ton panier !
-🛒 *Pour voir ton panier*, envoie *mon panier*.`);
-                    }
-                    delete conv.context.pendingMedicine;
-                    conv.state = ConversationStates.IDLE;
-                }
-                break;
-
-            case 'cart':
-                await this.showCart(phone, conv);
-                break;
-
-            case 'checkout':
-                await this.startCheckout(phone, conv);
-                break;
-
-            case 'info':
-                if (entites.champ && entites.valeur) {
-                    if (ValidationService.validate(entites.champ, entites.valeur)) {
-                        conv.context[entites.champ] = ValidationService.normalize(entites.champ, entites.valeur);
-                        await this.whatsapp.sendMessage(phone, `✅ *${entites.champ}* enregistré : *${entites.valeur}*.`);
-                        if (entites.champ === 'quartier') {
-                            await this.startCheckout(phone, conv);
-                        }
-                    } else {
-                        await this.whatsapp.sendMessage(phone, ValidationService.getErrorMessage(entites.champ));
-                    }
-                }
-                break;
-
-            case 'confirm':
-                if (conv.state === ConversationStates.WAITING_CONFIRMATION) {
-                    if (originalText.toUpperCase() === 'OUI') {
-                        await this.placeOrder(phone, conv);
-                    } else if (originalText.toUpperCase() === 'NON') {
-                        await this.whatsapp.sendMessage(phone,
-                            `🔙 *Que veux-tu modifier ?*
-→ *1* : Changer un médicament
-→ *2* : Changer la quantité
-→ *3* : Changer mes infos (quartier, nom, etc.)
-→ *4* : Annuler la commande
-
-💡 *Réponds avec le numéro.*`);
-                        conv.state = ConversationStates.WAITING_MODIFICATION;
-                    } else {
-                        await this.whatsapp.sendMessage(phone,
-                            `❌ *Réponse invalide.*
-📌 *Réponds par OUI, NON ou ANNULER.*`);
-                    }
-                }
-                break;
-
-            case 'cancel':
-                conv.state = ConversationStates.IDLE;
-                delete conv.context.pendingMedicine;
-                break;
-        }
-    }
-
-    async showCart(phone, conv) {
-        if (!conv.cart || conv.cart.length === 0) {
-            const delivery = Utils.getDeliveryPrice();
-            await this.whatsapp.sendMessage(phone,
-                `🛒 *Ton panier est vide.*
-💊 *Pour ajouter un médicament*, envoie son nom (ex: *Doliprane*).
-📌 *Frais de livraison* : ${delivery.price} FCFA (${delivery.period})`);
-            return;
-        }
-        const totalInfo = Utils.calculateTotal(conv.cart);
-        const items = conv.cart.map(i =>
-            `• ${i.quantite}x *${i.nom_commercial}* (${i.prix * i.quantite} FCFA)`
-        ).join('\n');
-        let deliveryMessage = `🚚 *Livraison (${totalInfo.deliveryPeriod})* : ${totalInfo.deliveryPrice} FCFA`;
-        if (totalInfo.isFreeDelivery) {
-            deliveryMessage = `🎉 *Livraison gratuite !* (dès ${DELIVERY_CONFIG.FREE_DELIVERY_THRESHOLD} FCFA)`;
-            totalInfo.total = totalInfo.subtotal; // Livraison gratuite
-        }
-        await this.whatsapp.sendMessage(phone,
-            `🛒 *TON PANIER* :
-${items}
-
-💰 *Sous-total* : ${totalInfo.subtotal} FCFA
-${deliveryMessage}
-💰 *TOTAL* : *${totalInfo.total} FCFA*
-
-📌 *Que veux-tu faire ?*
-→ *1* : Continuer mes achats
-→ *2* : Passer commande
-→ *3* : Vider le panier
-
-💡 *Réponds avec le numéro.*`);
-    }
-
-    async startCheckout(phone, conv) {
-        if (!conv.cart || conv.cart.length === 0) {
-            await this.whatsapp.sendMessage(phone,
-                `❌ *Ton panier est vide.*
-💊 *Ajoute des médicaments* en envoyant leur nom.`);
-            return;
-        }
-        const requiredFields = ['quartier', 'nom', 'age', 'telephone'];
-        const missingFields = requiredFields.filter(field => !conv.context[field]);
-        if (missingFields.length > 0) {
-            const fieldQuestions = {
-                'quartier': "📍 *Quel est ton quartier à San Pedro ?*\n→ Ex: *Cité*, *Quartier Industriel*",
-                'nom': "👤 *Quel est ton nom complet ?*\n→ Ex: *Jean Kouamé*",
-                'age': "🎂 *Quel est ton âge ?*\n→ Ex: *25*",
-                'telephone': "📞 *Quel est ton numéro de téléphone ?*\n→ Ex: *0701234567*"
-            };
-            await this.whatsapp.sendMessage(phone, fieldQuestions[missingFields[0]]);
-            conv.state = this.getStateForField(missingFields[0]);
-        } else {
-            await this.showOrderSummary(phone, conv);
-            conv.state = ConversationStates.WAITING_CONFIRMATION;
-        }
-    }
-
-    async showOrderSummary(phone, conv) {
-        const totalInfo = Utils.calculateTotal(conv.cart);
-        const items = conv.cart.map(i => `• ${i.quantite}x *${i.nom_commercial}*`).join('\n');
-        let deliveryMessage = `🚚 *Livraison (${totalInfo.deliveryPeriod})* : ${totalInfo.deliveryPrice} FCFA`;
-        if (totalInfo.isFreeDelivery) {
-            deliveryMessage = `🎉 *Livraison gratuite !* (dès ${DELIVERY_CONFIG.FREE_DELIVERY_THRESHOLD} FCFA)`;
-        }
-        await this.whatsapp.sendMessage(phone,
-            `📋 *RÉCAPITULATIF DE TA COMMANDE*
-${items}
-
-📍 *Livraison à* : ${conv.context.quartier} (${totalInfo.deliveryPeriod})
-👤 *Nom* : ${conv.context.nom}
-📞 *Téléphone* : ${conv.context.telephone}
-
-💰 *Sous-total* : ${totalInfo.subtotal} FCFA
-${deliveryMessage}
-💰 *TOTAL* : *${totalInfo.total} FCFA*
-
-🔘 *Tout est correct ?*
-→ *OUI* : Pour confirmer la commande
-→ *NON* : Pour modifier
-→ *ANNULER* : Pour tout annuler
-
-💡 *Réponds avec OUI, NON ou ANNULER.*`);
-    }
-
-    async placeOrder(phone, conv) {
         try {
-            const totalInfo = Utils.calculateTotal(conv.cart);
-            const order = await this.orders.createOrder(phone, conv.cart, conv.context, totalInfo.deliveryPrice);
-            let deliveryMessage = `🛵 *Livraison à ${order.client_quartier} (${totalInfo.deliveryPeriod}) dans ${totalInfo.deliveryTime} min.*`;
-            if (totalInfo.isFreeDelivery) {
-                deliveryMessage = `🎉 *Livraison gratuite !* (dès ${DELIVERY_CONFIG.FREE_DELIVERY_THRESHOLD} FCFA)`;
+            const media = await this.whatsapp.downloadMedia(mediaId);
+            if (!media.success) {
+                const response = await this.llm.analyzeMessage(
+                    "L'image n'a pas pu être téléchargée. Explique à l'utilisateur et redirige vers le support.",
+                    "unknown"
+                );
+                await this.whatsapp.sendMessage(phone, response.reponse);
+                conv.history.push({ role: 'assistant', content: response.reponse, timestamp: Date.now() });
+                return;
             }
-            await this.whatsapp.sendMessage(phone,
-                `🎉 *Commande #${order.id} confirmée !*
-📦 *Médicaments* :
-${conv.cart.map(i => `• ${i.quantite}x ${i.nom_commercial}`).join('\n')}
 
-${deliveryMessage}
-🔑 *Code* : ${order.confirmation_code}
-💰 *TOTAL* : *${totalInfo.total} FCFA* (livraison incluse)
+            // Utilise un Worker pour l'analyse d'image
+            const workerResult = await this.runImageWorker(media.buffer);
+            const supportLink = Utils.getSupportLink();
 
-💡 *Montre ce code au livreur à la réception.*
-Merci pour ta confiance ! 💊`);
+            if (workerResult.medicaments && workerResult.medicaments.length > 0) {
+                const foundMedicines = [];
+                for (const med of workerResult.medicaments) {
+                    const results = await this.fuse.search(med.nom, 1);
+                    if (results.length > 0) {
+                        foundMedicines.push({
+                            ...results[0],
+                            dosage: med.dosage || null
+                        });
+                    }
+                }
 
-            await this.orders.notifySupport(order);
-            await this.orders.assignLivreur(order.id);
+                let visionPrompt;
+                if (foundMedicines.length > 0) {
+                    visionPrompt = `
+                        J'ai analysé une ${workerResult.type}.
+                        Médicaments détectés : ${workerResult.medicaments.map(m => `${m.nom} ${m.dosage || ''}`.trim()).join(', ')}.
+                        Prix trouvés : ${foundMedicines.map(m => `${m.nom_commercial}: ${m.prix}F`).join(', ')}.
+                        Génère une réponse naturelle pour l'utilisateur.
+                        Dis-lui de contacter le support pour commander : ${supportLink}.
+                        Format JSON strict.
+                    `;
+                } else {
+                    visionPrompt = `
+                        J'ai analysé une ${workerResult.type} avec les médicaments : ${workerResult.medicaments.map(m => `${m.nom} ${m.dosage || ''}`.trim()).join(', ')}.
+                        Mais je n'ai pas trouvé de prix dans ma base.
+                        Génère une réponse naturelle pour l'utilisateur.
+                        Propose-lui d'envoyer le nom du médicament en texte pour une recherche plus précise.
+                        Format JSON strict.
+                    `;
+                }
 
-            // Réinitialisation
-            this.conversations.set(phone, {
-                state: ConversationStates.IDLE,
-                cart: [],
-                context: {},
-                history: conv.history.slice(-5),
-                lastActivity: Date.now()
+                const response = await this.llm.analyzeMessage(visionPrompt, "image");
+                await this.whatsapp.sendMessage(phone, response.reponse);
+                conv.history.push({ role: 'assistant', content: response.reponse, timestamp: Date.now() });
+            } else {
+                const response = await this.llm.analyzeMessage(
+                    workerResult.message || "L'image n'a pas pu être analysée. Explique à l'utilisateur et propose-lui d'envoyer le nom du médicament par texte.",
+                    "unknown"
+                );
+                await this.whatsapp.sendMessage(phone, response.reponse);
+                conv.history.push({ role: 'assistant', content: response.reponse, timestamp: Date.now() });
+            }
+
+            conv.lastActivity = Date.now();
+        } catch (error) {
+            log('error', `Erreur processImage: ${error.message}`);
+            const response = await this.llm.analyzeMessage(
+                "Erreur technique lors de l'analyse de l'image. Dis à l'utilisateur de réessayer ou d'envoyer le nom du médicament en texte.",
+                "unknown"
+            );
+            await this.whatsapp.sendMessage(phone, response.reponse);
+            conv.history.push({ role: 'assistant', content: response.reponse, timestamp: Date.now() });
+        }
+    }
+
+    async runImageWorker(imageBuffer) {
+        return new Promise((resolve, reject) => {
+            const worker = new Worker(__filename, {
+                workerData: { imageBuffer, action: 'analyzeImage' }
             });
 
-        } catch (error) {
-            console.error('❌ Erreur placeOrder:', error);
-            await this.whatsapp.sendMessage(phone, "❌ *Erreur technique.* Réessaie plus tard.");
-        }
+            worker.on('message', resolve);
+            worker.on('error', (err) => {
+                log('error', `Erreur Worker: ${err.message}`);
+                reject(err);
+            });
+            worker.on('exit', (code) => {
+                if (code !== 0) {
+                    reject(new Error(`Worker stopped with exit code ${code}`));
+                }
+            });
+        });
     }
+}
 
-    getStateForField(field) {
-        const map = {
-            'quartier': ConversationStates.WAITING_QUARTIER,
-            'nom': ConversationStates.WAITING_NAME,
-            'age': ConversationStates.WAITING_AGE,
-            'telephone': ConversationStates.WAITING_PHONE
-        };
-        return map[field] || ConversationStates.IDLE;
-    }
+// ===========================================
+// WORKER POUR L'ANALYSE D'IMAGES
+// ===========================================
+if (workerData && workerData.action === 'analyzeImage') {
+    const { VisionService } = require('./server'); // En production, utilise un fichier séparé
+    const visionService = new VisionService();
+
+    (async () => {
+        try {
+            const result = await visionService.analyzeImage(workerData.imageBuffer);
+            parentPort.postMessage(result);
+        } catch (error) {
+            parentPort.postMessage({
+                type: "inconnu",
+                medicaments: [],
+                message: "Erreur lors de l'analyse de l'image: " + error.message
+            });
+        }
+    })();
 }
 
 // ===========================================
@@ -964,43 +831,12 @@ async function initDatabase() {
             categorie VARCHAR(100),
             created_at TIMESTAMP DEFAULT NOW()
         );
-
-        CREATE TABLE IF NOT EXISTS orders (
-            id VARCHAR(50) PRIMARY KEY,
-            client_name VARCHAR(100),
-            client_phone VARCHAR(20),
-            client_quartier VARCHAR(100),
-            client_ville VARCHAR(100),
-            client_indications TEXT,
-            patient_age INTEGER,
-            patient_genre VARCHAR(1),
-            patient_poids INTEGER,
-            patient_taille INTEGER,
-            items JSONB NOT NULL,
-            subtotal DECIMAL(10,2),
-            delivery_price DECIMAL(10,2),
-            total DECIMAL(10,2),
-            confirmation_code VARCHAR(20),
-            delivery_period VARCHAR(10),
-            status VARCHAR(50),
-            livreur_phone VARCHAR(20),
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS livreurs (
-            id_livreur SERIAL PRIMARY KEY,
-            nom VARCHAR(100) NOT NULL,
-            telephone VARCHAR(20) NOT NULL,
-            whatsapp VARCHAR(20),
-            disponible BOOLEAN DEFAULT true,
-            commandes_livrees INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(client_phone);
-        CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
     `);
+
+    // Index pour accélérer les recherches
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci);`);
+
     log('info', 'Base de données prête');
 }
 
@@ -1015,11 +851,7 @@ app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
-    keyGenerator: (req) => {
-        const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-        return msg?.from || req.ip;
-    }
+    max: 200
 }));
 
 // Routes
@@ -1041,42 +873,76 @@ app.post('/webhook', async (req, res) => {
         if (!msg) return;
         if (processedMessages.has(msg.id)) return;
         processedMessages.set(msg.id, true);
+
         await bot.whatsapp.markAsRead(msg.id);
         const phone = msg.from;
+
         if (msg.type === 'text') {
             await bot.process(phone, { text: msg.text.body });
         } else if (msg.type === 'image') {
             await bot.process(phone, { mediaId: msg.image.id, mediaType: 'image' });
         } else if (msg.type === 'audio') {
             await bot.process(phone, { mediaType: 'audio' });
-        } else if (msg.type === 'interactive') {
-            const buttonText = msg.interactive.button_reply.title;
-            await bot.process(phone, { text: buttonText });
         }
     } catch (error) {
         log('error', `Webhook: ${error.message}`);
     }
 });
 
-app.get('/health', (req, res) => {
-    res.json({
+app.get('/health', async (req, res) => {
+    const health = {
         status: 'healthy',
-        mode: 'production',
+        mode: 'production - 100% IA',
         conversations: bot.conversations.size,
-        timestamp: new Date().toISOString()
-    });
+        timestamp: new Date().toISOString(),
+        redis: redis ? 'connecté' : 'déconnecté (fallback local)',
+        db: 'connecté'
+    };
+
+    // Teste la connexion à Redis
+    if (redis) {
+        try {
+            await redis.ping();
+        } catch (error) {
+            health.redis = 'déconnecté (erreur ping)';
+        }
+    }
+
+    // Teste la connexion à PostgreSQL
+    try {
+        await pool.query('SELECT 1');
+    } catch (error) {
+        health.db = 'déconnecté';
+    }
+
+    res.json(health);
 });
 
 // Nettoyage périodique
-setInterval(() => {
+setInterval(async () => {
     const now = Date.now();
+
+    // Nettoyage des conversations
     for (const [phone, conv] of bot.conversations) {
-        if (now - conv.lastActivity > 30 * 60 * 1000) {
+        if (now - conv.lastActivity > 2 * 60 * 1000) {
             bot.conversations.delete(phone);
             log('info', `Conversation expirée: ${phone}`);
         }
     }
-}, 15 * 60 * 1000);
+
+    // Nettoyage du cache Redis
+    if (redis) {
+        try {
+            const keys = await redis.keys('llm:*');
+            for (const key of keys) {
+                const ttl = await redis.ttl(key);
+                if (ttl < 0) await redis.del(key);
+            }
+        } catch (error) {
+            log('error', `Erreur nettoyage Redis: ${error.message}`);
+        }
+    }
+}, 2 * 60 * 1000); // Toutes les 2 min
 
 // ===========================================
 // DÉMARRAGE
@@ -1092,17 +958,23 @@ async function start() {
 ║   🚀 MARIAM BOT - PRODUCTION FINALE                       ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   🤖 IA Conversationnelle: llama-3.3-70b-versatile        ║
-║   📸 Vision: llama-4-scout-17b-16e-instruct               ║
-║   🔍 Recherche: Fuse.js (6000+ médicaments)               ║
-║   ✅ Validations strictes (8 champs)                      ║
-║   🛒 Gestion complète des commandes                        ║
-║   📱 Notifications livreur et support                      ║
-║   ⚡ Cache multi-niveaux                                    ║
-║   💰 Livraison transparente (400 FCFA jour / 600 FCFA nuit)║
+║   🤖 100% IA Conversationnelle                            ║
+║   📸 Vision: meta-llama-4-scout-17b                       ║
+║   💬 Texte: llama-3.3-70b-versatile                      ║
+║   🔍 Recherche: Fuse.js (6000+ médicaments)              ║
+║   🗄️  Cache: Redis (Valkey) sur Render                   ║
+║   🗃️  DB: PostgreSQL (pillbox) sur Render                ║
 ║                                                           ║
-║   📱 Port: ${PORT}                                         ║
-║   👨‍💻 Créé par Youssef - UPSP 2026                        ║
+║   ✅ Aucun message codé en dur                            ║
+║   ✅ L'IA génère TOUTES les réponses                     ║
+║   ✅ Réponses naturelles et variées (1-2 phrases)        ║
+║   ✅ Premier message : se présente + livraison           ║
+║   ✅ Recherche texte + image                             ║
+║   ✅ Support WhatsApp direct                              ║
+║                                                           ║
+║   📱 Port: ${PORT}                                        ║
+║   📞 Support: ${SUPPORT_PHONE}                           ║
+║   👨‍💻 Créé par Youssef - UPSP 2026                       ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
             `);

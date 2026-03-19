@@ -1,6 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version complète avec cache intelligent et gestion de quota
+// Version complète avec système de commande intelligent
 // ===========================================
 
 require('dotenv').config();
@@ -16,6 +16,7 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const sharp = require('sharp');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const crypto = require('crypto');
 
 // ===========================================
 // CONFIGURATION
@@ -148,6 +149,75 @@ class Utils {
         const match = text.match(pattern);
         return match ? (match[1] || match[2] || match[3] || match[4]) : null;
     }
+
+    static generateOrderCode() {
+        return crypto.randomInt(100000, 999999).toString();
+    }
+
+    static formatOrderForSupport(order) {
+        return `
+🆔 CODE COMMANDE: ${order.code}
+📦 NOUVELLE COMMANDE
+════════════════════
+
+👤 CLIENT:
+Nom: ${order.client.nom}
+Quartier: ${order.client.quartier}
+Âge: ${order.client.age} ans
+Taille: ${order.client.taille} cm
+Poids: ${order.client.poids} kg
+Tél joindre: ${order.client.telephone_joindre}
+WhatsApp: ${order.client.telephone_whatsapp}
+
+💊 MÉDICAMENTS:
+${order.medicaments.map(m => `- ${m.nom}: ${m.quantite} x ${m.prix}F = ${m.prix * m.quantite}F`).join('\n')}
+
+💰 TOTAL: ${order.total} F CFA
+🚚 LIVRAISON: ${order.frais_livraison} F CFA (${order.period_livraison})
+💵 TOTAL À PAYER: ${order.total + order.frais_livraison} F CFA
+
+📝 INDICATIONS:
+${order.indications || 'Aucune indication particulière'}
+
+⏰ COMMANDE PASSÉE: ${new Date().toLocaleString('fr-FR')}
+
+════════════════════
+✅ À TRAITER URGENT
+        `;
+    }
+
+    static formatOrderConfirmation(order) {
+        return `
+✅ RÉCAPITULATIF DE VOTRE COMMANDE
+════════════════════════════
+
+🆔 CODE: ${order.code}
+
+👤 Vos informations:
+• Nom: ${order.client.nom}
+• Quartier: ${order.client.quartier}
+• Âge: ${order.client.age} ans
+• Taille: ${order.client.taille} cm
+• Poids: ${order.client.poids} kg
+• Tél: ${order.client.telephone_joindre}
+
+💊 Médicaments commandés:
+${order.medicaments.map(m => `• ${m.nom}: ${m.quantite} x ${m.prix}F`).join('\n')}
+
+💰 Total médicaments: ${order.total} F CFA
+🚚 Frais livraison: ${order.frais_livraison} F CFA (${order.period_livraison})
+💵 TOTAL À PAYER: ${order.total + order.frais_livraison} F CFA
+
+📝 Indications: ${order.indications || 'Aucune'}
+
+════════════════════════════
+1️⃣ CONFIRMER la commande
+2️⃣ MODIFIER la commande
+3️⃣ ANNULER la commande
+
+Réponds avec le chiffre correspondant 👆
+        `;
+    }
 }
 
 // ===========================================
@@ -224,7 +294,6 @@ class WhatsAppService {
 
             let buffer = Buffer.from(fileResponse.data);
             
-            // Redimensionner si trop grand (max 4MB pour base64)
             if (buffer.length > 3.5 * 1024 * 1024) {
                 buffer = await sharp(buffer)
                     .resize(800, 800, { fit: 'inside' })
@@ -250,6 +319,176 @@ class WhatsAppService {
                 timeout: 5000
             });
         } catch (error) {}
+    }
+}
+
+// ===========================================
+// ORDER MANAGER - Gestion des commandes
+// ===========================================
+class OrderManager {
+    constructor(whatsappService) {
+        this.orders = new Map(); // orders en cours
+        this.whatsapp = whatsappService;
+        this.cache = cache;
+    }
+
+    createOrder(phone) {
+        const order = {
+            phone,
+            code: Utils.generateOrderCode(),
+            status: 'en_cours',
+            step: 'medicaments',
+            medicaments: [],
+            client: {},
+            indications: '',
+            created_at: Date.now(),
+            updated_at: Date.now()
+        };
+        this.orders.set(phone, order);
+        return order;
+    }
+
+    getOrder(phone) {
+        return this.orders.get(phone);
+    }
+
+    updateOrder(phone, data) {
+        const order = this.orders.get(phone);
+        if (order) {
+            Object.assign(order, data);
+            order.updated_at = Date.now();
+        }
+        return order;
+    }
+
+    async addMedicament(phone, medicament, quantite) {
+        const order = this.orders.get(phone);
+        if (order) {
+            order.medicaments.push({
+                ...medicament,
+                quantite: parseInt(quantite)
+            });
+            order.total = order.medicaments.reduce((sum, m) => sum + (m.prix * m.quantite), 0);
+            order.updated_at = Date.now();
+        }
+        return order;
+    }
+
+    async finalizeOrder(phone) {
+        const order = this.orders.get(phone);
+        if (order) {
+            order.status = 'finalized';
+            order.finalized_at = Date.now();
+            
+            // Ajouter frais livraison
+            const delivery = Utils.getDeliveryPrice();
+            order.frais_livraison = delivery.price;
+            order.period_livraison = delivery.period;
+            
+            // Sauvegarder dans cache pour récupération
+            await this.cache.set(`order:${order.code}`, order, 86400); // 24h
+            await this.cache.set(`order:phone:${phone}`, order.code, 86400);
+            
+            // Sauvegarder en DB
+            await this.saveOrderToDB(order);
+        }
+        return order;
+    }
+
+    async saveOrderToDB(order) {
+        try {
+            await pool.query(
+                `INSERT INTO orders (
+                    code, phone, client_nom, client_quartier, client_age, 
+                    client_taille, client_poids, client_telephone_joindre, 
+                    client_telephone_whatsapp, medicaments, total, frais_livraison,
+                    indications, status, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+                [
+                    order.code, order.phone, order.client.nom, order.client.quartier,
+                    order.client.age, order.client.taille, order.client.poids,
+                    order.client.telephone_joindre, order.client.telephone_whatsapp,
+                    JSON.stringify(order.medicaments), order.total, order.frais_livraison,
+                    order.indications, order.status, new Date(order.created_at)
+                ]
+            );
+            log('info', `Commande ${order.code} sauvegardée en DB`);
+        } catch (error) {
+            log('error', `Erreur sauvegarde commande: ${error.message}`);
+        }
+    }
+
+    async getOrderByCode(code) {
+        return await this.cache.get(`order:${code}`);
+    }
+
+    async getOrderByPhone(phone) {
+        const code = await this.cache.get(`order:phone:${phone}`);
+        if (code) {
+            return await this.getOrderByCode(code);
+        }
+        return null;
+    }
+
+    async confirmOrder(code) {
+        const order = await this.getOrderByCode(code);
+        if (order) {
+            order.status = 'confirmé';
+            order.confirmed_at = Date.now();
+            await this.cache.set(`order:${code}`, order, 86400);
+            
+            // Mettre à jour DB
+            await pool.query(
+                'UPDATE orders SET status = $1, confirmed_at = $2 WHERE code = $3',
+                ['confirmé', new Date(), code]
+            );
+            
+            return order;
+        }
+        return null;
+    }
+
+    async cancelOrder(code) {
+        const order = await this.getOrderByCode(code);
+        if (order) {
+            order.status = 'annulé';
+            order.cancelled_at = Date.now();
+            await this.cache.set(`order:${code}`, order, 86400);
+            
+            await pool.query(
+                'UPDATE orders SET status = $1, cancelled_at = $2 WHERE code = $3',
+                ['annulé', new Date(), code]
+            );
+            
+            return order;
+        }
+        return null;
+    }
+
+    async sendOrderToSupport(order) {
+        const message = Utils.formatOrderForSupport(order);
+        return await this.whatsapp.sendMessage(SUPPORT_PHONE, message);
+    }
+
+    async saveAvis(phone, note, commentaire) {
+        try {
+            await pool.query(
+                `INSERT INTO avis (phone, note, commentaire, created_at) 
+                 VALUES ($1, $2, $3, NOW())`,
+                [phone, note, commentaire]
+            );
+            
+            // Récupérer la dernière commande pour lier l'avis
+            const order = await this.getOrderByPhone(phone);
+            if (order) {
+                await pool.query(
+                    'UPDATE orders SET avis_note = $1, avis_commentaire = $2 WHERE code = $3',
+                    [note, commentaire, order.code]
+                );
+            }
+        } catch (error) {
+            log('error', `Erreur sauvegarde avis: ${error.message}`);
+        }
     }
 }
 
@@ -327,7 +566,6 @@ class SmartCacheManager {
         this.fuse = fuseService;
         this.localCache = new NodeCache({ stdTTL: 3600 });
         
-        // Patterns pour détection des requêtes simples
         this.patterns = {
             prix: /prix\s+(\w+)|combien\s+co[uû]te\s+(\w+)|(\w+)\s+prix|tarif\s+(\w+)|(\w+)\s+c'est\s+combien/i,
             disponibilite: /disponible\s+(\w+)|est-ce\s+que\s+vous\s+avez\s+(\w+)|(\w+)\s+disponible|vous\s+avez\s+(\w+)/i,
@@ -337,51 +575,31 @@ class SmartCacheManager {
             purpose: /à\s+quoi\s+tu\s+sers|tu\s+fais\s+quoi|r[ôo]le|utilite|pourquoi\s+tu\s+existes/i,
             salut: /^(salut|bonjour|bonsoir|coucou|hello|hi|cc|slt|bsr|bjr)$/i,
             merci: /^(merci|thanks|thank you|merci beaucoup|merci bcp|😊|👍)$/i,
-            commande: /commander|acheter|je\s+veux|je\s+prends|r[ée]servation/i
-        };
-        
-        // Réponses pré-définies (ne nécessitent pas de LLM)
-        this.staticResponses = {
-            creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !",
-            purpose: "Je simplifie l'accès aux médicaments à San Pedro ! 💊\n\nPrix transparents, disponibilité en direct, livraison rapide. Ta santé mérite le meilleur.",
-            support: (link) => `Besoin d'aide ? Contacte le support :\n${link} 📞`,
-            merci: "Avec plaisir ! N'hésite pas si tu as besoin d'autre chose 💙",
-            fallback: null
+            commander: /commander|acheter|je\s+veux|je\s+prends|r[ée]servation/i
         };
     }
     
-    // Détecte si c'est une requête simple qui peut être servie sans LLM
     detectSimpleQuery(text) {
-        const normalized = Utils.normalizeText(text);
-        
-        // Vérifier les patterns
         for (const [type, pattern] of Object.entries(this.patterns)) {
             if (pattern.test(text)) {
-                
-                // Extraire le médicament pour les requêtes prix/disponibilité
                 if (type === 'prix' || type === 'disponibilite') {
                     const medicament = Utils.extractMedicamentFromQuery(text, pattern);
                     if (medicament) {
                         return { type, medicament: medicament.trim() };
                     }
                 }
-                
-                // Requêtes sans médicament
                 return { type, medicament: null };
             }
         }
-        
         return null;
     }
     
-    // Générer une réponse pour une requête simple
     async generateSimpleResponse(query, phone) {
         const detected = this.detectSimpleQuery(query.text);
         if (!detected) return null;
         
         const cacheKey = `simple:${detected.type}:${detected.medicament || 'general'}`;
         
-        // Vérifier le cache
         const cached = await this.cache.get(cacheKey);
         if (cached) {
             log('info', `✅ Cache hit pour: ${cacheKey}`);
@@ -395,119 +613,33 @@ class SmartCacheManager {
         switch (detected.type) {
             case 'prix':
                 if (detected.medicament) {
-                    response = await this.handlePriceQuery(detected.medicament);
+                    const results = await this.fuse.search(detected.medicament, 3);
+                    if (results.length > 0) {
+                        response = results.map(m => `${m.nom_commercial}: ${m.prix}F`).join('\n');
+                    }
                 }
                 break;
                 
             case 'disponibilite':
                 if (detected.medicament) {
-                    response = await this.handleAvailabilityQuery(detected.medicament);
+                    const results = await this.fuse.search(detected.medicament, 3);
+                    if (results.length > 0) {
+                        response = `✅ Disponible:\n${results.map(m => `• ${m.nom_commercial}`).join('\n')}`;
+                    }
                 }
                 break;
                 
             case 'livraison':
-                response = this.handleDeliveryQuery();
-                break;
-                
-            case 'support':
-                response = this.staticResponses.support(Utils.getSupportLink());
-                break;
-                
-            case 'creator':
-                response = this.staticResponses.creator;
-                break;
-                
-            case 'purpose':
-                response = this.staticResponses.purpose;
-                break;
-                
-            case 'salut':
-                response = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊\n\nJe cherche tes médicaments et je les livre. Qu'est-ce qu'il te faut ?";
-                break;
-                
-            case 'merci':
-                response = this.staticResponses.merci;
-                break;
-                
-            case 'commande':
-                response = "Pour commander, dis-moi quel médicament tu veux et la quantité ! 💊\n\nExemple: \"Je veux 2 Doliprane\"";
+                const delivery = Utils.getDeliveryPrice();
+                response = `Livraison: ${delivery.price}F (${delivery.period}) - ${delivery.time}min`;
                 break;
         }
         
-        // Mettre en cache si on a une réponse
         if (response) {
-            // Cache pour 1 heure (3600 secondes)
             await this.cache.set(cacheKey, response, 3600);
-            
-            // Sauvegarder aussi dans l'historique des requêtes pour analytics
-            await this.logQuery(query, detected, phone);
         }
         
         return response;
-    }
-    
-    // Gérer les requêtes de prix
-    async handlePriceQuery(medicamentName) {
-        const results = await this.fuse.search(medicamentName, 5);
-        
-        if (results.length === 0) {
-            return `Désolé, je n'ai pas trouvé "${medicamentName}" dans ma base. 💊\n\nPeux-tu vérifier l'orthographe ?`;
-        }
-        
-        if (results.length === 1) {
-            const med = results[0];
-            return `${med.nom_commercial} : ${med.prix}F CFA\n\nDisponible immédiatement !`;
-        }
-        
-        // Plusieurs résultats
-        let response = `J'ai trouvé plusieurs options :\n\n`;
-        results.slice(0, 3).forEach(med => {
-            response += `- ${med.nom_commercial} : ${med.prix}F CFA\n`;
-        });
-        response += `\nLequel te convient ? 💊`;
-        
-        return response;
-    }
-    
-    // Gérer les requêtes de disponibilité
-    async handleAvailabilityQuery(medicamentName) {
-        const results = await this.fuse.search(medicamentName, 5);
-        
-        if (results.length === 0) {
-            return `Désolé, "${medicamentName}" n'est pas dans ma base pour le moment. 💊`;
-        }
-        
-        if (results.length === 1) {
-            const med = results[0];
-            return `✅ ${med.nom_commercial} est disponible !\nPrix : ${med.prix}F CFA\n\nTu veux commander ?`;
-        }
-        
-        let response = `✅ Médicaments disponibles :\n\n`;
-        results.slice(0, 3).forEach(med => {
-            response += `- ${med.nom_commercial} : ${med.prix}F CFA\n`;
-        });
-        response += `\nLequel te intéresse ?`;
-        
-        return response;
-    }
-    
-    // Gérer les requêtes de livraison
-    handleDeliveryQuery() {
-        const delivery = Utils.getDeliveryPrice();
-        return `Livraison à San Pedro :\n\n- Jour : ${DELIVERY_CONFIG.PRICES.DAY}F CFA\n- Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F CFA\n- Délai : ${DELIVERY_CONFIG.DELIVERY_TIME} min 🚚\n\nPériode actuelle : ${delivery.period}`;
-    }
-    
-    // Logger les requêtes pour analytics
-    async logQuery(query, detected, phone) {
-        try {
-            await pool.query(
-                `INSERT INTO queries_log (phone, message, type, medicament, timestamp) 
-                 VALUES ($1, $2, $3, $4, NOW())`,
-                [phone, query.text, detected.type, detected.medicament]
-            );
-        } catch (error) {
-            // Silently fail, pas critique
-        }
     }
 }
 
@@ -526,14 +658,12 @@ class LLMService {
         };
         this.cache = cache;
         
-        // État des quotas
         this.quota = {
             primary: { available: true, lastCheck: Date.now() },
             fallback: { available: true, lastCheck: Date.now() },
             vision: { available: true, lastCheck: Date.now() }
         };
         
-        // Période de retry après épuisement (1 heure)
         this.QUOTA_RETRY_MS = 60 * 60 * 1000;
     }
 
@@ -543,32 +673,48 @@ class LLMService {
         
         return `Tu es MARIAM, une IA santé à San Pedro, Côte d'Ivoire.
 
-STYLE PAYPARROT :
-- Messages courts et clairs (max 3-4 lignes)
-- Emojis discrets (💊 🚚 📲)
-- Options avec tirets
-- Structure: accueil → info → question
-
-CONTEXTE :
-- Livraison: ${delivery.price}F CFA (${delivery.period}), délai: ${delivery.time}min
+CONTEXTE ACTUEL:
+- Livraison: ${delivery.price}F (${delivery.period})
 - Support: ${supportLink}
 
-FORMAT DE REPONSE (JSON uniquement) :
+TON RÔLE:
+1. Aider les clients à trouver des médicaments
+2. Les guider dans le processus de commande
+3. Collecter leurs informations (nom, quartier, âge, taille, poids, téléphone)
+4. Confirmer les commandes avec code unique
+5. Prendre les avis après livraison
+
+STYLE DE COMMUNICATION:
+- Naturel et conversationnel
+- Emojis discrets (💊 📦 ✅)
+- Questions claires et précises
+- Pas de réponses pré-définies, chaque réponse est unique
+
+INSTRUCTIONS SPÉCIFIQUES:
+- Si le client veut commander, guide-le étape par étape
+- Demande une information à la fois
+- Confirme chaque information avant de passer à la suivante
+- Génère un code à 6 chiffres pour chaque commande
+- Après commande, demande avis et note (1-5)
+
+FORMAT DE RÉPONSE (JSON uniquement):
 {
-    "intention": "greet|search|support|delivery|creator|purpose|unknown",
-    "medicament": "nom extrait ou null",
-    "reponse": "ta réponse style PayParrot"
+    "intention": "order|search|support|delivery|creator|purpose|greet|confirm_order|modify_order|cancel_order|collect_info|avis",
+    "medicament": "nom si pertinent",
+    "step": "medicaments|nom|quartier|age|taille|poids|telephone|indications|recap|confirmation|avis",
+    "question": "prochaine question à poser",
+    "reponse": "ta réponse naturelle au client",
+    "action": "ask_info|show_recap|confirm|cancel|modify|save_avis",
+    "field": "champ à collecter si pertinent"
 }`;
     }
 
-    // Vérifier et mettre à jour l'état des quotas
     checkQuotaAvailability(modelType) {
         const now = Date.now();
         const quota = this.quota[modelType];
         
         if (!quota) return true;
         
-        // Si le quota est marqué comme indisponible, vérifier si 1 heure est passée
         if (!quota.available) {
             if (now - quota.lastCheck > this.QUOTA_RETRY_MS) {
                 quota.available = true;
@@ -580,7 +726,6 @@ FORMAT DE REPONSE (JSON uniquement) :
         return quota.available;
     }
 
-    // Marquer un quota comme épuisé
     markQuotaExhausted(modelType) {
         if (this.quota[modelType]) {
             this.quota[modelType].available = false;
@@ -589,75 +734,67 @@ FORMAT DE REPONSE (JSON uniquement) :
         }
     }
 
-    // Sélectionner le meilleur modèle disponible
     getAvailableTextModel() {
-        // Vérifier le modèle principal
         if (this.checkQuotaAvailability('primary')) {
             return this.models.text.primary;
         }
-        
-        // Vérifier le modèle de secours
         if (this.checkQuotaAvailability('fallback')) {
             return this.models.text.fallback;
         }
-        
-        // Aucun modèle disponible
         return null;
     }
 
-    async comprendre(message, historique = []) {
+    async comprendre(message, historique = [], orderContext = null) {
         const cacheKey = `comprendre:${Utils.normalizeText(message).substring(0, 50)}`;
         const cached = await this.cache.get(cacheKey);
         if (cached) return cached;
 
-        // Vérifier si un modèle est disponible
         const model = this.getAvailableTextModel();
         
         if (!model) {
             const supportLink = Utils.getSupportLink();
             return {
                 intention: "quota_exhausted",
-                medicament: null,
-                reponse: `⏳ Désolé, tous mes modèles IA sont temporairement épuisés pour l'heure !\n\nRéessaie dans 1 heure, ou contacte le support si ta demande est urgente :\n${supportLink} 📞`
+                reponse: `⏳ Désolé, mes modèles sont épuisés ! Réessaie dans 1h ou contacte le support: ${supportLink}`
             };
         }
 
         try {
+            const contextPrompt = orderContext ? 
+                `Contexte commande: ${JSON.stringify(orderContext)}` : 
+                'Pas de commande en cours';
+
             const completion = await this.client.chat.completions.create({
                 model: model,
                 messages: [
                     { role: "system", content: this.getSystemPrompt() },
-                    { role: "user", content: `Message: "${message}"\nHistorique: ${JSON.stringify(historique.slice(-3))}` }
+                    { role: "user", content: `Message: "${message}"\nHistorique: ${JSON.stringify(historique.slice(-5))}\n${contextPrompt}` }
                 ],
                 temperature: 0.7,
-                max_completion_tokens: 300,
+                max_completion_tokens: 500,
                 response_format: { type: "json_object" }
             });
 
             const result = JSON.parse(completion.choices[0].message.content);
-            await this.cache.set(cacheKey, result, 3600);
+            
+            // Ne pas cacheter les réponses de commande (trop contextuelles)
+            if (result.intention !== 'order' && result.intention !== 'collect_info') {
+                await this.cache.set(cacheKey, result, 1800);
+            }
+            
             return result;
             
         } catch (error) {
-            // Détecter si c'est une erreur de quota
             const errorMsg = error.message.toLowerCase();
-            if (errorMsg.includes('quota') || errorMsg.includes('rate limit') || errorMsg.includes('exhausted') || errorMsg.includes('429')) {
-                
-                // Identifier quel modèle a échoué
+            if (errorMsg.includes('quota') || errorMsg.includes('rate limit')) {
                 if (model === this.models.text.primary) {
                     this.markQuotaExhausted('primary');
-                    log('warn', 'Quota modèle principal épuisé, tentative avec fallback');
-                    
-                    // Réessayer avec le fallback immédiatement
-                    return this.comprendre(message, historique);
-                } else if (model === this.models.text.fallback) {
+                    return this.comprendre(message, historique, orderContext);
+                } else {
                     this.markQuotaExhausted('fallback');
-                    
-                    const supportLink = Utils.getSupportLink();
                     return {
                         intention: "quota_exhausted",
-                        medicament: null,
-                        reponse: `⏳ Tous mes modèles IA sont épuisés ! Réessaie dans 1 heure.\n\nUrgent ? Contacte le support :\n${supportLink} 📞`
+                        reponse: "⏳ Modèles épuisés. Réessaie dans 1h !"
                     };
                 }
             }
@@ -665,19 +802,17 @@ FORMAT DE REPONSE (JSON uniquement) :
             log('error', `Comprendre error: ${error.message}`);
             return {
                 intention: "unknown",
-                medicament: null,
-                reponse: "Désolé, petit problème technique ! Réessaie dans une minute ⏱️"
+                reponse: "Désolé, erreur technique ! Réessaie ⏱️"
             };
         }
     }
 
     async integrerResultats(resultats, question, historique) {
-        // Vérifier si un modèle est disponible
         const model = this.getAvailableTextModel();
         
         if (!model) {
             return {
-                reponse: "⏳ Mes modèles IA sont épuisés pour l'heure. Réessaie dans 1 heure ou contacte le support si urgent !"
+                reponse: "Voici ce que j'ai trouvé ! Dis-moi lequel tu veux commander."
             };
         }
 
@@ -688,69 +823,10 @@ FORMAT DE REPONSE (JSON uniquement) :
                     { role: "system", content: this.getSystemPrompt() },
                     { 
                         role: "user", 
-                        content: `Résultats de recherche: ${JSON.stringify(resultats)}\nQuestion: "${question}"\nHistorique: ${JSON.stringify(historique.slice(-3))}\n\nGénère une réponse naturelle style PayParrot.` 
+                        content: `Résultats: ${JSON.stringify(resultats)}\nQuestion: "${question}"\nHistorique: ${JSON.stringify(historique.slice(-3))}\n\nGuide le client vers la commande.` 
                     }
                 ],
                 temperature: 0.7,
-                max_completion_tokens: 200,
-                response_format: { type: "json_object" }
-            });
-
-            return JSON.parse(completion.choices[0].message.content);
-            
-        } catch (error) {
-            // Gérer les erreurs de quota
-            if (error.message.toLowerCase().includes('quota') || error.message.toLowerCase().includes('rate limit')) {
-                if (model === this.models.text.primary) {
-                    this.markQuotaExhausted('primary');
-                    return this.integrerResultats(resultats, question, historique);
-                } else if (model === this.models.text.fallback) {
-                    this.markQuotaExhausted('fallback');
-                    return {
-                        reponse: "Voici ce que j'ai trouvé ! Contacte le support pour commander 📲"
-                    };
-                }
-            }
-            
-            log('error', `Intégration error: ${error.message}`);
-            return {
-                reponse: "Voici ce que j'ai trouvé ! Contacte le support pour commander 📲"
-            };
-        }
-    }
-
-    async analyserImage(imageBuffer) {
-        // Vérifier quota vision
-        if (!this.checkQuotaAvailability('vision')) {
-            return { 
-                medicaments: [],
-                error: "quota_exhausted"
-            };
-        }
-
-        try {
-            const base64Image = imageBuffer.toString('base64');
-            
-            const completion = await this.client.chat.completions.create({
-                model: this.models.vision,
-                messages: [
-                    {
-                        role: "user",
-                        content: [
-                            {
-                                type: "text",
-                                text: "Liste les médicaments que tu vois sur cette image au format JSON. Réponds uniquement avec {\"medicaments\": [\"nom1\", \"nom2\"]}"
-                            },
-                            {
-                                type: "image_url",
-                                image_url: {
-                                    url: `data:image/jpeg;base64,${base64Image}`
-                                }
-                            }
-                        ]
-                    }
-                ],
-                temperature: 0.1,
                 max_completion_tokens: 300,
                 response_format: { type: "json_object" }
             });
@@ -758,17 +834,10 @@ FORMAT DE REPONSE (JSON uniquement) :
             return JSON.parse(completion.choices[0].message.content);
             
         } catch (error) {
-            log('error', `Analyser image error: ${error.message}`);
-            
-            if (error.message.toLowerCase().includes('quota')) {
-                this.markQuotaExhausted('vision');
-                return { 
-                    medicaments: [],
-                    error: "quota_exhausted"
-                };
-            }
-            
-            return { medicaments: [] };
+            log('error', `Intégration error: ${error.message}`);
+            return {
+                reponse: "Voici les résultats. Lequel veux-tu commander ?"
+            };
         }
     }
 }
@@ -782,6 +851,7 @@ class ConversationManager {
         this.whatsapp = new WhatsAppService();
         this.fuse = new FuseService();
         this.llm = new LLMService();
+        this.orders = new OrderManager(this.whatsapp);
         this.smartCache = null;
         this.processedMessages = new Set();
     }
@@ -789,14 +859,16 @@ class ConversationManager {
     async init() {
         await this.fuse.initialize();
         this.smartCache = new SmartCacheManager(this.fuse);
-        log('info', '🚀 MARIAM IA prête');
+        log('info', '🚀 MARIAM IA prête avec système de commande');
     }
 
     getConversation(phone) {
         if (!this.conversations.has(phone)) {
             this.conversations.set(phone, {
                 historique: [],
-                derniereActivite: Date.now()
+                derniereActivite: Date.now(),
+                etape: null,
+                orderInProgress: false
             });
         }
         return this.conversations.get(phone);
@@ -806,14 +878,12 @@ class ConversationManager {
         const conv = this.getConversation(phone);
         const { text, mediaId, messageId } = input;
 
-        // Éviter les doublons
         if (this.processedMessages.has(messageId)) return;
         this.processedMessages.add(messageId);
 
         try {
             await this.whatsapp.sendTyping(phone);
 
-            // Sauvegarder message utilisateur
             if (text) {
                 conv.historique.push({
                     role: "user",
@@ -823,160 +893,306 @@ class ConversationManager {
             }
 
             // ===========================================
-            // CAS 1: IMAGE REÇUE
+            // IMAGE REÇUE
             // ===========================================
             if (mediaId) {
                 await this.whatsapp.sendMessage(phone, "J'analyse ton image... 📸");
                 
                 const media = await this.whatsapp.downloadMedia(mediaId);
                 if (!media.success) {
-                    await this.whatsapp.sendMessage(phone, "Je n'ai pas pu télécharger l'image. Envoie le nom du médicament par texte stp !");
+                    await this.whatsapp.sendMessage(phone, "Image non téléchargée. Envoie le nom du médicament !");
                     return;
                 }
 
                 const visionResult = await this.llm.analyserImage(media.buffer);
                 
-                if (visionResult.error === "quota_exhausted") {
-                    await this.whatsapp.sendMessage(phone, 
-                        "⏳ Mon modèle d'analyse d'image est temporairement épuisé. Envoie le nom du médicament par texte stp !");
-                    return;
-                }
-                
                 if (visionResult.medicaments && visionResult.medicaments.length > 0) {
                     const results = [];
                     for (const med of visionResult.medicaments) {
                         const searchResults = await this.fuse.search(med, 1);
-                        if (searchResults.length > 0) {
-                            results.push(searchResults[0]);
-                        }
+                        if (searchResults.length > 0) results.push(searchResults[0]);
                     }
 
                     if (results.length > 0) {
-                        let reponse = "Médicaments détectés ! 📸\n\n";
+                        let reponse = "Médicaments détectés !\n\n";
                         results.forEach(med => {
-                            reponse += `- ${med.nom_commercial} : ${med.prix}F CFA\n`;
+                            reponse += `• ${med.nom_commercial}: ${med.prix}F\n`;
                         });
-                        reponse += "\nIls sont disponibles. Tu veux commander ?";
+                        reponse += "\nLesquel veux-tu commander ? Dis-moi le nom et la quantité.";
 
                         await this.whatsapp.sendMessage(phone, reponse);
                         
-                        conv.historique.push({
-                            role: "assistant",
-                            content: reponse,
-                            timestamp: Date.now(),
-                            source: 'vision'
-                        });
-                    } else {
-                        await this.whatsapp.sendMessage(phone, 
-                            "J'ai détecté des médicaments mais ils ne sont pas dans ma base. Envoie les noms par texte stp ! 💊");
+                        // Démarrer processus commande
+                        this.orders.createOrder(phone);
+                        conv.orderInProgress = true;
+                        conv.etape = 'medicaments';
                     }
-                } else {
-                    await this.whatsapp.sendMessage(phone, 
-                        "Je ne vois pas de médicament clairement sur cette image. Envoie le nom par texte stp !");
                 }
-                
-                conv.derniereActivite = Date.now();
                 return;
             }
 
             // ===========================================
-            // CAS 2: TEXTE REÇU - AVEC SMART CACHE
+            // TEXTE REÇU
             // ===========================================
             if (text) {
-                // 1️⃣ D'abord, essayer le Smart Cache (pas de LLM)
-                const cachedResponse = await this.smartCache.generateSimpleResponse(
-                    { text, messageId }, 
-                    phone
-                );
+                // 1️⃣ Vérifier si réponse à un récapitulatif (1,2,3)
+                if (conv.etape === 'recap' && ['1', '2', '3'].includes(text.trim())) {
+                    await this.handleRecapResponse(phone, text.trim(), conv);
+                    return;
+                }
+
+                // 2️⃣ Vérifier si commande en cours
+                const order = this.orders.getOrder(phone);
                 
+                if (order) {
+                    // Collecte des informations étape par étape
+                    await this.handleOrderProcess(phone, text, order, conv);
+                    return;
+                }
+
+                // 3️⃣ Essayer le cache simple
+                const cachedResponse = await this.smartCache.generateSimpleResponse({ text, messageId }, phone);
                 if (cachedResponse) {
-                    log('info', `📦 Réponse depuis le cache pour: ${text.substring(0, 30)}...`);
                     await this.whatsapp.sendMessage(phone, cachedResponse);
-                    
-                    conv.historique.push({
-                        role: "assistant",
-                        content: cachedResponse,
-                        timestamp: Date.now(),
-                        source: 'cache'
-                    });
-                    
+                    conv.historique.push({ role: "assistant", content: cachedResponse, timestamp: Date.now() });
                     conv.derniereActivite = Date.now();
                     return;
                 }
-                
-                // 2️⃣ Si pas en cache, utiliser le LLM
-                log('info', `🤖 Utilisation du LLM pour: ${text.substring(0, 30)}...`);
-                
-                const comprehension = await this.llm.comprendre(text, conv.historique);
+
+                // 4️⃣ Utiliser le LLM
+                const comprehension = await this.llm.comprendre(text, conv.historique, order);
                 
                 if (comprehension.intention === "quota_exhausted") {
                     await this.whatsapp.sendMessage(phone, comprehension.reponse);
-                    
-                    conv.historique.push({
-                        role: "assistant",
-                        content: comprehension.reponse,
-                        timestamp: Date.now()
-                    });
-                    
-                    conv.derniereActivite = Date.now();
                     return;
                 }
-                
-                if (comprehension.intention === "search" && comprehension.medicament) {
-                    const results = await this.fuse.search(comprehension.medicament, 3);
+
+                // Démarrer commande si détectée
+                if (comprehension.intention === "order") {
+                    this.orders.createOrder(phone);
+                    conv.orderInProgress = true;
+                    conv.etape = 'medicaments';
                     
-                    if (results.length > 0) {
-                        const reponseAvecResultats = await this.llm.integrerResultats(
-                            results, 
-                            text, 
-                            conv.historique
-                        );
-                        
-                        const reponse = reponseAvecResultats.reponse || reponseAvecResultats;
-                        
-                        const cacheKey = `search:${Utils.normalizeText(comprehension.medicament)}`;
-                        await cache.set(cacheKey, reponse, 1800);
-                        
-                        await this.whatsapp.sendMessage(phone, reponse);
-                        
-                        conv.historique.push({
-                            role: "assistant",
-                            content: reponse,
-                            timestamp: Date.now()
-                        });
+                    if (comprehension.medicament) {
+                        const results = await this.fuse.search(comprehension.medicament, 3);
+                        if (results.length > 0) {
+                            const reponse = await this.llm.integrerResultats(results, text, conv.historique);
+                            await this.whatsapp.sendMessage(phone, reponse.reponse || reponse);
+                        }
                     } else {
-                        const reponse = `Désolé, je n'ai pas trouvé "${comprehension.medicament}" dans ma base. 💊\n\nPeux-tu vérifier l'orthographe ou envoyer une photo ?`;
-                        
-                        await this.whatsapp.sendMessage(phone, reponse);
-                        
-                        conv.historique.push({
-                            role: "assistant",
-                            content: reponse,
-                            timestamp: Date.now()
-                        });
-                    }
-                } else {
-                    await this.whatsapp.sendMessage(phone, comprehension.reponse);
-                    
-                    conv.historique.push({
-                        role: "assistant",
-                        content: comprehension.reponse,
-                        timestamp: Date.now()
-                    });
-                    
-                    if (['delivery', 'creator', 'purpose', 'support'].includes(comprehension.intention)) {
-                        const cacheKey = `intention:${comprehension.intention}`;
-                        await cache.set(cacheKey, comprehension.reponse, 3600);
+                        await this.whatsapp.sendMessage(phone, comprehension.reponse);
                     }
                 }
-                
+                // Recherche de médicaments
+                else if (comprehension.intention === "search" && comprehension.medicament) {
+                    const results = await this.fuse.search(comprehension.medicament, 5);
+                    if (results.length > 0) {
+                        const reponse = await this.llm.integrerResultats(results, text, conv.historique);
+                        await this.whatsapp.sendMessage(phone, reponse.reponse || reponse);
+                    } else {
+                        await this.whatsapp.sendMessage(phone, 
+                            `Désolé, je n'ai pas trouvé "${comprehension.medicament}". Envoie une photo ?`);
+                    }
+                }
+                // Autres intentions
+                else {
+                    await this.whatsapp.sendMessage(phone, comprehension.reponse);
+                }
+
+                conv.historique.push({ role: "assistant", content: comprehension.reponse, timestamp: Date.now() });
                 conv.derniereActivite = Date.now();
             }
 
         } catch (error) {
             log('error', `Process error: ${error.message}`);
+            await this.whatsapp.sendMessage(phone, "Désolé, erreur technique ! Réessaie ⏱️");
+        }
+    }
+
+    async handleOrderProcess(phone, text, order, conv) {
+        if (!order.step) order.step = 'medicaments';
+
+        switch (order.step) {
+            case 'medicaments':
+                // Extraire médicament et quantité du message
+                const match = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
+                if (match) {
+                    const nomMedicament = match[1].trim();
+                    const quantite = parseInt(match[2]);
+                    
+                    const results = await this.fuse.search(nomMedicament, 1);
+                    if (results.length > 0) {
+                        await this.orders.addMedicament(phone, results[0], quantite);
+                        
+                        order.step = 'nom';
+                        await this.whatsapp.sendMessage(phone, 
+                            "✅ Médicament ajouté !\n\nQuel est ton nom complet ?");
+                    } else {
+                        await this.whatsapp.sendMessage(phone, 
+                            "Médicament non trouvé. Vérifie le nom ou envoie une photo.");
+                    }
+                } else {
+                    await this.whatsapp.sendMessage(phone, 
+                        "Dis-moi le médicament et la quantité.\nExemple: Doliprane 2");
+                }
+                break;
+
+            case 'nom':
+                order.client.nom = text;
+                order.step = 'quartier';
+                await this.whatsapp.sendMessage(phone, 
+                    `Merci ${text} ! Dans quel quartier habites-tu à San Pedro ?`);
+                break;
+
+            case 'quartier':
+                order.client.quartier = text;
+                order.step = 'age';
+                await this.whatsapp.sendMessage(phone, "Quel est ton âge ?");
+                break;
+
+            case 'age':
+                if (!isNaN(text) && parseInt(text) > 0) {
+                    order.client.age = parseInt(text);
+                    order.step = 'taille';
+                    await this.whatsapp.sendMessage(phone, "Ta taille en cm ? (ex: 175)");
+                } else {
+                    await this.whatsapp.sendMessage(phone, "Donne un âge valide stp (nombre)");
+                }
+                break;
+
+            case 'taille':
+                if (!isNaN(text) && parseInt(text) > 0) {
+                    order.client.taille = parseInt(text);
+                    order.step = 'poids';
+                    await this.whatsapp.sendMessage(phone, "Ton poids en kg ? (ex: 70)");
+                } else {
+                    await this.whatsapp.sendMessage(phone, "Donne une taille valide en cm");
+                }
+                break;
+
+            case 'poids':
+                if (!isNaN(text) && parseInt(text) > 0) {
+                    order.client.poids = parseInt(text);
+                    order.step = 'telephone_joindre';
+                    await this.whatsapp.sendMessage(phone, 
+                        "Numéro de téléphone à joindre (celui qui répondra) ?");
+                } else {
+                    await this.whatsapp.sendMessage(phone, "Donne un poids valide en kg");
+                }
+                break;
+
+            case 'telephone_joindre':
+                order.client.telephone_joindre = text.replace(/\s+/g, '');
+                order.step = 'telephone_whatsapp';
+                await this.whatsapp.sendMessage(phone, 
+                    "Même numéro pour WhatsApp ? (oui/non ou donne un autre numéro)");
+                break;
+
+            case 'telephone_whatsapp':
+                if (text.toLowerCase() === 'oui') {
+                    order.client.telephone_whatsapp = order.client.telephone_joindre;
+                } else if (text.toLowerCase() === 'non') {
+                    order.step = 'telephone_whatsapp_nouveau';
+                    await this.whatsapp.sendMessage(phone, "Donne le numéro WhatsApp stp :");
+                    return;
+                } else {
+                    order.client.telephone_whatsapp = text.replace(/\s+/g, '');
+                }
+                
+                if (order.client.telephone_whatsapp) {
+                    order.step = 'indications';
+                    await this.whatsapp.sendMessage(phone, 
+                        "Indications particulières pour la livraison ? (sinon réponds 'aucune')");
+                }
+                break;
+
+            case 'telephone_whatsapp_nouveau':
+                order.client.telephone_whatsapp = text.replace(/\s+/g, '');
+                order.step = 'indications';
+                await this.whatsapp.sendMessage(phone, 
+                    "Indications particulières pour la livraison ? (sinon réponds 'aucune')");
+                break;
+
+            case 'indications':
+                order.indications = text.toLowerCase() === 'aucune' ? '' : text;
+                
+                // Finaliser la commande
+                const finalizedOrder = await this.orders.finalizeOrder(phone);
+                
+                // Afficher récapitulatif
+                const recap = Utils.formatOrderConfirmation(finalizedOrder);
+                await this.whatsapp.sendMessage(phone, recap);
+                
+                order.step = 'recap';
+                conv.etape = 'recap';
+                break;
+        }
+    }
+
+    async handleRecapResponse(phone, choice, conv) {
+        const order = await this.orders.getOrderByPhone(phone);
+        
+        if (!order) {
+            await this.whatsapp.sendMessage(phone, "Commande non trouvée. Recommence !");
+            return;
+        }
+
+        switch(choice) {
+            case '1': // CONFIRMER
+                await this.orders.confirmOrder(order.code);
+                await this.orders.sendOrderToSupport(order);
+                
+                await this.whatsapp.sendMessage(phone, 
+                    `✅ COMMANDE CONFIRMÉE !\n\nCode: ${order.code}\n\n📱 Retiens ce code à 6 chiffres. Le livreur te le demandera à la livraison.\n\nTu seras contacté par le support dans quelques minutes pour confirmer. 📦`);
+                
+                // Demander avis
+                await this.whatsapp.sendMessage(phone, 
+                    "En attendant, peux-tu donner une note (1-5) à MARIAM ? ⭐");
+                
+                conv.etape = 'avis_note';
+                break;
+
+            case '2': // MODIFIER
+                this.orders.updateOrder(phone, { step: 'medicaments' });
+                conv.etape = null;
+                await this.whatsapp.sendMessage(phone, 
+                    "On modifie ! Dis-moi les nouveaux médicaments et quantités.");
+                break;
+
+            case '3': // ANNULER
+                await this.orders.cancelOrder(order.code);
+                this.orders.orders.delete(phone);
+                conv.orderInProgress = false;
+                conv.etape = null;
+                await this.whatsapp.sendMessage(phone, 
+                    "❌ Commande annulée. À bientôt !");
+                break;
+        }
+    }
+
+    async handleAvis(phone, text, conv) {
+        if (conv.etape === 'avis_note') {
+            if (!isNaN(text) && parseInt(text) >= 1 && parseInt(text) <= 5) {
+                conv.avis_note = parseInt(text);
+                conv.etape = 'avis_commentaire';
+                await this.whatsapp.sendMessage(phone, 
+                    "Merci ! Un commentaire à ajouter ? (ou réponds 'non')");
+            } else {
+                await this.whatsapp.sendMessage(phone, "Donne une note entre 1 et 5 ⭐");
+            }
+        } 
+        else if (conv.etape === 'avis_commentaire') {
+            const commentaire = text.toLowerCase() === 'non' ? '' : text;
+            
+            await this.orders.saveAvis(phone, conv.avis_note, commentaire);
+            
             await this.whatsapp.sendMessage(phone, 
-                "Désolé, erreur technique ! Réessaie dans une minute ⏱️");
+                "🙏 Merci pour ton retour ! Ça aide à m'améliorer.\n\nÀ très bientôt sur MARIAM ! 💊");
+            
+            // Nettoyer
+            this.orders.orders.delete(phone);
+            conv.orderInProgress = false;
+            conv.etape = null;
         }
     }
 }
@@ -985,6 +1201,7 @@ class ConversationManager {
 // INITIALISATION BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
+    // Table médicaments
     await pool.query(`
         CREATE TABLE IF NOT EXISTS medicaments (
             code_produit VARCHAR(50) PRIMARY KEY,
@@ -996,6 +1213,44 @@ async function initDatabase() {
         );
     `);
 
+    // Table commandes
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            code VARCHAR(6) UNIQUE NOT NULL,
+            phone VARCHAR(20) NOT NULL,
+            client_nom VARCHAR(200),
+            client_quartier VARCHAR(200),
+            client_age INTEGER,
+            client_taille INTEGER,
+            client_poids INTEGER,
+            client_telephone_joindre VARCHAR(20),
+            client_telephone_whatsapp VARCHAR(20),
+            medicaments JSONB,
+            total DECIMAL(10,2),
+            frais_livraison DECIMAL(10,2),
+            indications TEXT,
+            status VARCHAR(50) DEFAULT 'en_cours',
+            avis_note INTEGER,
+            avis_commentaire TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            confirmed_at TIMESTAMP,
+            cancelled_at TIMESTAMP
+        );
+    `);
+
+    // Table avis
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS avis (
+            id SERIAL PRIMARY KEY,
+            phone VARCHAR(20),
+            note INTEGER CHECK (note >= 1 AND note <= 5),
+            commentaire TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    // Table logs requêtes
     await pool.query(`
         CREATE TABLE IF NOT EXISTS queries_log (
             id SERIAL PRIMARY KEY,
@@ -1007,10 +1262,11 @@ async function initDatabase() {
         );
     `);
 
+    // Index
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_type ON queries_log(type);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_timestamp ON queries_log(timestamp);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(phone);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);`);
 
     log('info', 'Base de données prête');
 }
@@ -1065,9 +1321,6 @@ app.post('/webhook', async (req, res) => {
                 mediaId: msg.image.id, 
                 messageId: msg.id 
             });
-        } else if (msg.type === 'audio') {
-            await bot.whatsapp.sendMessage(phone, 
-                "Désolé, je ne traite pas les audios. Envoie-moi du texte ou une image stp ! 📸");
         }
     } catch (error) {
         log('error', `Webhook error: ${error.message}`);
@@ -1078,13 +1331,10 @@ app.get('/health', async (req, res) => {
     const health = {
         status: 'healthy',
         conversations: bot.conversations.size,
+        orders: bot.orders.orders.size,
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
-        db: 'checking',
-        cache: {
-            local: 'ok',
-            redis: redis ? 'ok' : 'disabled'
-        }
+        db: 'checking'
     };
 
     try {
@@ -1097,44 +1347,19 @@ app.get('/health', async (req, res) => {
     res.json(health);
 });
 
-app.get('/stats', async (req, res) => {
-    try {
-        const stats = {
-            uptime: process.uptime(),
-            conversations: bot.conversations.size,
-            memory: process.memoryUsage(),
-            cache: {
-                redis: redis ? 'connected' : 'disabled'
-            }
-        };
-
-        // Stats DB
-        const result = await pool.query(`
-            SELECT 
-                COUNT(*) as total_queries,
-                COUNT(DISTINCT phone) as unique_users,
-                type,
-                COUNT(*) as type_count
-            FROM queries_log 
-            WHERE timestamp > NOW() - INTERVAL '24 hours'
-            GROUP BY type
-        `);
-        
-        stats.queries = result.rows;
-
-        res.json(stats);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
 // Nettoyage périodique
 setInterval(() => {
     const now = Date.now();
+    // Nettoyer conversations
     for (const [phone, conv] of bot.conversations) {
         if (now - conv.derniereActivite > 30 * 60 * 1000) {
             bot.conversations.delete(phone);
-            log('info', `Conversation expirée: ${phone}`);
+        }
+    }
+    // Nettoyer commandes expirées
+    for (const [phone, order] of bot.orders.orders) {
+        if (now - order.updated_at > 60 * 60 * 1000) { // 1h
+            bot.orders.orders.delete(phone);
         }
     }
 }, 5 * 60 * 1000);
@@ -1154,16 +1379,18 @@ async function start() {
 ║   🚀 MARIAM IA - PRODUCTION READY                         ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   🤖 100% IA Conversationnelle                            ║
+║   🤖 100% IA Conversationnelle avec système de commande   ║
+║   💊 Commande intelligente étape par étape                ║
+║   🔢 Code unique à 6 chiffres par commande                ║
+║   📱 Envoi automatique au support                         ║
+║   ⭐ Collecte d'avis après chaque commande                ║
+║                                                           ║
 ║   💬 Llama 3.3 70B (texte principal)                     ║
 ║   💬 Llama 3 70B (texte secours)                         ║
 ║   📸 Llama 4 Scout 17B (vision)                          ║
 ║   🔍 Fuse.js (recherche floue)                           ║
 ║   📦 Smart Cache (80-90% réduction appels LLM)           ║
-║   🗄️ Redis + NodeCache                                    ║
-║   🗃️ PostgreSQL                                           ║
-║   ⏱️ Gestion automatique des quotas                      ║
-║   🔄 Fallback après 1h                                    ║
+║   ⏱️ Gestion automatique des quotas + fallback 1h        ║
 ║                                                           ║
 ║   📱 Port: ${PORT}                                        ║
 ║   📞 Support: ${SUPPORT_PHONE}                           ║
@@ -1173,8 +1400,9 @@ async function start() {
             `);
             
             log('info', '🚀 MARIAM IA est opérationnelle');
-            log('info', `📊 Cache intelligent actif - Économie LLM estimée: 80-90%`);
-            log('info', `⏱️ Quotas réinitialisés après 1 heure`);
+            log('info', '📦 Système de commande intelligent actif');
+            log('info', '🔢 Codes à 6 chiffres générés automatiquement');
+            log('info', '📱 Envoi des commandes au support WhatsApp');
         });
     } catch (error) {
         log('error', `Fatal: ${error.message}`);
@@ -1184,19 +1412,7 @@ async function start() {
 
 start();
 
-// ===========================================
-// WORKER POUR ANALYSE D'IMAGE (optionnel)
-// ===========================================
-if (workerData && workerData.action === 'analyzeImage') {
-    const visionService = new LLMService();
-    const buffer = Buffer.from(workerData.imageBuffer, 'base64');
-    
-    visionService.analyserImage(buffer)
-        .then(result => parentPort.postMessage(result))
-        .catch(() => parentPort.postMessage({ medicaments: [] }));
-}
-
-// Gestion gracieuse de l'arrêt
+// Gestion arrêt
 process.on('SIGTERM', async () => {
     log('info', 'SIGTERM reçu, arrêt gracieux...');
     await pool.end();

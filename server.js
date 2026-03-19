@@ -595,7 +595,7 @@ FORMAT JSON : {
                 };
             }
 
-            const prompt = this.buildPrompt(message, historique, orderContext);
+            const prompt = this.buildPrompt(phone, message, historique, orderContext);
             
             let response;
             if (model.provider === 'groq') {
@@ -633,7 +633,7 @@ FORMAT JSON : {
         }
     }
 
-    buildPrompt(message, historique, orderContext) {
+    buildPrompt(phone, message, historique, orderContext) {
         const recentHistory = historique.slice(-3).map(m => ({
             role: m.role,
             content: m.content.substring(0, 100)
@@ -1150,11 +1150,21 @@ async function initDatabase() {
 // SERVEUR EXPRESS
 // ===========================================
 const app = express();
-const bot = new ConversationManager();
+
+// Configuration du proxy trust pour Render
+app.set('trust proxy', 1);
 
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+app.use(rateLimit({ 
+    windowMs: 15 * 60 * 1000, 
+    max: 200,
+    keyGenerator: (req) => {
+        return req.ip || req.connection.remoteAddress;
+    }
+}));
+
+const bot = new ConversationManager();
 
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
@@ -1174,8 +1184,11 @@ app.post('/webhook', async (req, res) => {
         const msg = changes?.value?.messages?.[0];
         
         if (!msg) return;
-        if (processedMessages.has(msg.id)) return;
-        processedMessages.set(msg.id, true);
+        
+        // Vérifier si le message a déjà été traité
+        const messageKey = `msg_${msg.id}`;
+        if (processedMessages.has(messageKey)) return;
+        processedMessages.set(messageKey, true);
 
         await bot.whatsapp.markAsRead(msg.id);
         
@@ -1212,6 +1225,7 @@ app.get('/health', async (req, res) => {
         health.db = 'ok';
     } catch {
         health.db = 'error';
+        health.status = 'degraded';
     }
 
     res.json(health);
@@ -1221,6 +1235,7 @@ app.get('/api/stats', (req, res) => {
     res.json(bot.modelSwitcher.getStats());
 });
 
+// Nettoyage des conversations inactives toutes les 5 minutes
 setInterval(() => {
     const now = Date.now();
     for (const [phone, conv] of bot.conversations) {
@@ -1229,6 +1244,11 @@ setInterval(() => {
         }
     }
 }, 5 * 60 * 1000);
+
+// Nettoyage des messages traités toutes les 10 minutes
+setInterval(() => {
+    processedMessages.flushAll();
+}, 10 * 60 * 1000);
 
 // ===========================================
 // DÉMARRAGE
@@ -1261,5 +1281,20 @@ async function start() {
         process.exit(1);
     }
 }
+
+// Gestion propre de l'arrêt
+process.on('SIGTERM', () => {
+    log('info', 'SIGTERM reçu, arrêt gracieux...');
+    pool.end();
+    if (redis) redis.disconnect();
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    log('info', 'SIGINT reçu, arrêt gracieux...');
+    pool.end();
+    if (redis) redis.disconnect();
+    process.exit(0);
+});
 
 start();

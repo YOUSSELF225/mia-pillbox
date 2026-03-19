@@ -663,16 +663,20 @@ FORMAT JSON : {
             { role: "user", content: prompt.currentMessage }
         ];
 
-        const completion = await groq.chat.completions.create({
-            model: model.model,
-            messages: messages,
-            temperature: 0.7,
-            max_completion_tokens: 150,
-            response_format: { type: "json_object" },
-            timeout: 10000
-        });
+        try {
+            const completion = await groq.chat.completions.create({
+                model: model.model,
+                messages: messages,
+                temperature: 0.7,
+                max_tokens: 150,
+                response_format: { type: "json_object" }
+            });
 
-        return JSON.parse(completion.choices[0].message.content);
+            return JSON.parse(completion.choices[0].message.content);
+        } catch (error) {
+            log('error', `Groq API error: ${error.message}`);
+            throw error;
+        }
     }
 
     async callGithub(prompt, model) {
@@ -682,24 +686,29 @@ FORMAT JSON : {
             { role: "user", content: prompt.currentMessage }
         ];
 
-        const response = await axios.post(
-            'https://models.inference.ai.azure.com/chat/completions',
-            {
-                model: model.model,
-                messages: messages,
-                temperature: 0.7,
-                max_tokens: 150
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${this.githubToken}`,
-                    'Content-Type': 'application/json'
+        try {
+            const response = await axios.post(
+                'https://models.inference.ai.azure.com/chat/completions',
+                {
+                    model: model.model,
+                    messages: messages,
+                    temperature: 0.7,
+                    max_tokens: 150
                 },
-                timeout: 10000
-            }
-        );
+                {
+                    headers: {
+                        'Authorization': `Bearer ${this.githubToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 10000
+                }
+            );
 
-        return JSON.parse(response.data.choices[0].message.content);
+            return JSON.parse(response.data.choices[0].message.content);
+        } catch (error) {
+            log('error', `GitHub API error: ${error.message}`);
+            throw error;
+        }
     }
 
     async checkAndSwitchBack(phone) {
@@ -1131,19 +1140,23 @@ class ConversationManager {
 // BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS medicaments (
-            code_produit VARCHAR(50) PRIMARY KEY,
-            nom_commercial VARCHAR(200) NOT NULL,
-            dci TEXT,
-            prix DECIMAL(10,2) NOT NULL,
-            categorie VARCHAR(100),
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    `);
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS medicaments (
+                code_produit VARCHAR(50) PRIMARY KEY,
+                nom_commercial VARCHAR(200) NOT NULL,
+                dci TEXT,
+                prix DECIMAL(10,2) NOT NULL,
+                categorie VARCHAR(100),
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
 
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
-    log('info', 'Base de données prête');
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
+        log('info', 'Base de données prête');
+    } catch (error) {
+        log('error', `Database init error: ${error.message}`);
+    }
 }
 
 // ===========================================
@@ -1217,7 +1230,8 @@ app.get('/health', async (req, res) => {
         status: 'healthy',
         conversations: bot.conversations.size,
         redis: redis ? 'ok' : 'fallback',
-        db: 'checking'
+        db: 'checking',
+        uptime: process.uptime()
     };
 
     try {

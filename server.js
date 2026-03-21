@@ -15,7 +15,6 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const sharp = require('sharp');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const crypto = require('crypto');
 
 // ===========================================
@@ -25,7 +24,6 @@ const PORT = process.env.PORT || 10000;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
@@ -69,7 +67,6 @@ try {
     redis.on('error', (err) => log('error', `Redis: ${err.message}`));
     redis.on('connect', () => log('info', 'Redis connecté'));
     
-    // Redis keep-alive toutes les 30 secondes
     setInterval(async () => {
         try {
             await redis.ping();
@@ -171,20 +168,20 @@ class Utils {
 ════════════════════
 
 👤 CLIENT:
-Nom: ${order.client.nom}
-Quartier: ${order.client.quartier}
-Âge: ${order.client.age} ans
-Taille: ${order.client.taille} cm
-Poids: ${order.client.poids} kg
-Tél joindre: ${order.client.telephone_joindre}
-WhatsApp: ${order.client.telephone_whatsapp}
+Nom: ${order.client.nom || 'Non renseigné'}
+Quartier: ${order.client.quartier || 'Non renseigné'}
+Âge: ${order.client.age || 'Non renseigné'} ans
+Taille: ${order.client.taille || 'Non renseigné'} cm
+Poids: ${order.client.poids || 'Non renseigné'} kg
+Tél joindre: ${order.client.telephone_joindre || 'Non renseigné'}
+WhatsApp: ${order.client.telephone_whatsapp || 'Non renseigné'}
 
 💊 MÉDICAMENTS:
 ${order.medicaments.map(m => `- ${m.nom_commercial}: ${m.quantite} x ${m.prix}F = ${m.prix * m.quantite}F`).join('\n')}
 
-💰 TOTAL: ${order.total} F CFA
-🚚 LIVRAISON: ${order.frais_livraison} F CFA (${order.period_livraison})
-💵 TOTAL À PAYER: ${order.total + order.frais_livraison} F CFA
+💰 TOTAL MÉDICAMENTS: ${order.total || 0} F CFA
+🚚 LIVRAISON: ${order.frais_livraison || 0} F CFA (${order.period_livraison || 'jour'})
+💵 TOTAL À PAYER: ${(order.total || 0) + (order.frais_livraison || 0)} F CFA
 
 📝 INDICATIONS:
 ${order.indications || 'Aucune indication particulière'}
@@ -198,7 +195,7 @@ ${order.indications || 'Aucune indication particulière'}
 }
 
 // ===========================================
-// BASE DE DONNÉES POSTGRESQL AVEC KEEP-ALIVE
+// BASE DE DONNÉES POSTGRESQL
 // ===========================================
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -215,7 +212,7 @@ pool.on('connect', () => log('info', '📊 Nouvelle connexion PostgreSQL'));
 pool.on('remove', () => log('info', '📊 Connexion PostgreSQL fermée'));
 
 // ===========================================
-// WHATSAPP SERVICE AVEC CLIENT PERSISTANT
+// WHATSAPP SERVICE
 // ===========================================
 class WhatsAppService {
     constructor() {
@@ -231,7 +228,7 @@ class WhatsAppService {
         try {
             if (!text) text = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊";
             const safeText = text.substring(0, 4096);
-            await this.apiClient.post(`/${PHONE_NUMBER_ID}/messages`, {
+            await this.apiClient.post(`/${process.env.PHONE_NUMBER_ID}/messages`, {
                 messaging_product: 'whatsapp',
                 to: to,
                 type: 'text',
@@ -248,7 +245,7 @@ class WhatsAppService {
         try {
             const lastTyping = this.lastTyping.get(to);
             if (!lastTyping || Date.now() - lastTyping > 10000) {
-                await this.apiClient.post(`/${PHONE_NUMBER_ID}/messages`, {
+                await this.apiClient.post(`/${process.env.PHONE_NUMBER_ID}/messages`, {
                     messaging_product: 'whatsapp',
                     to: to,
                     type: 'typing',
@@ -287,7 +284,7 @@ class WhatsAppService {
 
     async markAsRead(messageId) {
         try {
-            await this.apiClient.post(`/${PHONE_NUMBER_ID}/messages`, {
+            await this.apiClient.post(`/${process.env.PHONE_NUMBER_ID}/messages`, {
                 messaging_product: 'whatsapp',
                 status: 'read',
                 message_id: messageId
@@ -377,11 +374,11 @@ class OrderManager {
                     indications, status, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
                 [
-                    order.code, order.phone, order.client.nom, order.client.quartier,
-                    order.client.age, order.client.taille, order.client.poids,
-                    order.client.telephone_joindre, order.client.telephone_whatsapp,
-                    JSON.stringify(order.medicaments), order.total, order.frais_livraison,
-                    order.indications, order.status, new Date(order.created_at)
+                    order.code, order.phone, order.client.nom || null, order.client.quartier || null,
+                    order.client.age || null, order.client.taille || null, order.client.poids || null,
+                    order.client.telephone_joindre || null, order.client.telephone_whatsapp || null,
+                    JSON.stringify(order.medicaments), order.total || 0, order.frais_livraison || 0,
+                    order.indications || null, order.status, new Date(order.created_at)
                 ]
             );
             log('info', `Commande ${order.code} sauvegardée en DB`);
@@ -475,7 +472,7 @@ class FuseService {
     async initialize() {
         try {
             const cached = await this.cache.get("all_medicaments");
-            if (cached) {
+            if (cached && cached.length > 0) {
                 this.medicaments = cached;
                 this.fuse = new Fuse(this.medicaments, {
                     keys: ['nom_commercial', 'dci'],
@@ -491,24 +488,28 @@ class FuseService {
             const result = await pool.query("SELECT * FROM medicaments");
             this.medicaments = result.rows;
 
-            this.fuse = new Fuse(this.medicaments, {
-                keys: ['nom_commercial', 'dci'],
-                threshold: 0.3,
-                ignoreLocation: true,
-                minMatchCharLength: 2,
-                includeScore: true
-            });
-
-            await this.cache.set("all_medicaments", this.medicaments, 3600);
-            log('info', `${this.medicaments.length} médicaments chargés (DB)`);
+            if (this.medicaments.length > 0) {
+                this.fuse = new Fuse(this.medicaments, {
+                    keys: ['nom_commercial', 'dci'],
+                    threshold: 0.3,
+                    ignoreLocation: true,
+                    minMatchCharLength: 2,
+                    includeScore: true
+                });
+                await this.cache.set("all_medicaments", this.medicaments, 3600);
+                log('info', `${this.medicaments.length} médicaments chargés (DB)`);
+            } else {
+                log('warn', 'Aucun médicament trouvé dans la base de données');
+                this.fuse = new Fuse([], { keys: ['nom_commercial'] });
+            }
         } catch (error) {
             log('error', `Fuse init error: ${error.message}`);
-            throw error;
+            this.fuse = new Fuse([], { keys: ['nom_commercial'] });
         }
     }
 
     async search(query, limit = 5) {
-        if (!query || query.length < 2) return [];
+        if (!query || query.length < 2 || !this.fuse) return [];
         
         const cacheKey = `search:${Utils.normalizeText(query)}`;
         const cached = await this.cache.get(cacheKey);
@@ -603,6 +604,14 @@ class SmartCacheManager {
                 const delivery = Utils.getDeliveryPrice();
                 response = `Livraison: ${delivery.price}F (${delivery.period}) - ${delivery.time}min`;
                 break;
+                
+            case 'creator':
+                response = "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙";
+                break;
+                
+            case 'salut':
+                response = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊\n\nJe cherche tes médicaments et je les livre. Qu'est-ce qu'il te faut ?";
+                break;
         }
         
         if (response) {
@@ -625,8 +634,6 @@ class DegradedModeService {
     }
 
     async processQuery(phone, text, conv) {
-        const normalizedText = Utils.normalizeText(text);
-        
         const orderMatch = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
         
         if (orderMatch) {
@@ -675,22 +682,6 @@ class DegradedModeService {
             }
         }
         
-        const dispoMatch = text.match(/disponible\s+(.+)|vous\s+avez\s+(.+)|(\w+)\s+disponible/i);
-        if (dispoMatch) {
-            const medicament = dispoMatch[1] || dispoMatch[2] || dispoMatch[3];
-            if (medicament) {
-                const results = await this.fuse.search(medicament, 5);
-                if (results.length > 0) {
-                    let reponse = "✅ Médicaments disponibles :\n\n";
-                    results.forEach(med => {
-                        reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
-                    });
-                    reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
-                    return { reponse };
-                }
-            }
-        }
-        
         if (text.length > 2) {
             const results = await this.fuse.search(text, 5);
             if (results.length > 0) {
@@ -700,11 +691,6 @@ class DegradedModeService {
                 });
                 reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
                 return { reponse };
-            } else {
-                return {
-                    reponse: "🔍 Je n'ai pas trouvé de médicament correspondant.\n\n" +
-                        `📲 Contacte directement le support avec le nom du médicament :\nhttps://wa.me/${this.supportPhone}`
-                };
             }
         }
         
@@ -712,7 +698,7 @@ class DegradedModeService {
             salut: "👋 Bonjour ! Mes modèles IA sont temporairement indisponibles.\n\nMais je peux encore t'aider à trouver tes médicaments ! Dis-moi ce que tu cherches 💊",
             livraison: `🚚 Livraison à San Pedro :\n• Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n• Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n• Délai : ${DELIVERY_CONFIG.DELIVERY_TIME}min\n\n📲 Pour commander, contacte le support :\nhttps://wa.me/${this.supportPhone}`,
             support: `📞 Besoin d'aide ? Contacte directement le support :\nhttps://wa.me/${this.supportPhone}`,
-            creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !",
+            creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙",
             merci: "Avec plaisir ! Mes modèles reviennent dans environ 1h. Bonne journée ! 💙",
             default: "👋 Je suis MARIAM ! Mes modèles IA sont temporairement indisponibles, mais je peux toujours te trouver des médicaments.\n\nDis-moi ce que tu cherches, je te dirai le prix et comment commander 💊"
         };
@@ -856,7 +842,6 @@ STYLE DE COMMUNICATION:
 - Naturel et conversationnel
 - Emojis discrets (💊 📦 ✅)
 - Questions claires et précises
-- Pas de réponses pré-définies
 
 FORMAT DE RÉPONSE (JSON uniquement):
 {
@@ -1066,9 +1051,9 @@ class ConversationManager {
         this.smartCache = null;
         this.degradedMode = null;
         this.processedMessages = new Set();
-        this.relanceTimers = new Map();
         this.warmConversations = new Set();
         this.preloadTimer = null;
+        this.keepAlive = null;
     }
 
     async init() {
@@ -1079,25 +1064,8 @@ class ConversationManager {
         this.keepAlive = new KeepAliveService();
         this.keepAlive.start();
         
-        await this.preloadFrequentData();
-        this.preloadTimer = setInterval(() => this.preloadFrequentData(), 5 * 60 * 1000);
-        
         log('info', '🚀 MARIAM IA prête avec système de commande');
         setInterval(() => this.checkRelance(), 60 * 1000);
-    }
-    
-    async preloadFrequentData() {
-        try {
-            const popularMedicaments = await pool.query(`
-                SELECT DISTINCT ON (nom_commercial) * FROM medicaments 
-                ORDER BY created_at DESC LIMIT 100
-            `);
-            
-            await cache.set('popular_medicaments', popularMedicaments.rows, 300);
-            log('info', '📦 Pré-chargement des données fréquentes terminé');
-        } catch (error) {
-            log('error', `Pré-chargement échoué: ${error.message}`);
-        }
     }
     
     async keepConversationAlive(phone) {
@@ -1524,72 +1492,97 @@ class ConversationManager {
 // INITIALISATION BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS medicaments (
-            code_produit VARCHAR(50) PRIMARY KEY,
-            nom_commercial VARCHAR(200) NOT NULL,
-            dci TEXT,
-            prix DECIMAL(10,2) NOT NULL,
-            categorie VARCHAR(100),
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    `);
+    try {
+        // Table medicaments
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS medicaments (
+                code_produit VARCHAR(50) PRIMARY KEY,
+                nom_commercial VARCHAR(200) NOT NULL,
+                dci TEXT,
+                prix DECIMAL(10,2) NOT NULL,
+                categorie VARCHAR(100),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            code VARCHAR(6) UNIQUE NOT NULL,
-            client_phone VARCHAR(20) NOT NULL,
-            client_nom VARCHAR(200),
-            client_quartier VARCHAR(200),
-            client_age INTEGER,
-            client_taille INTEGER,
-            client_poids INTEGER,
-            client_telephone_joindre VARCHAR(20),
-            client_telephone_whatsapp VARCHAR(20),
-            medicaments JSONB,
-            total DECIMAL(10,2),
-            frais_livraison DECIMAL(10,2),
-            indications TEXT,
-            status VARCHAR(50) DEFAULT 'en_cours',
-            avis_note INTEGER,
-            avis_commentaire TEXT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            confirmed_at TIMESTAMP,
-            cancelled_at TIMESTAMP
-        );
-    `);
+        // Table orders
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                code VARCHAR(6) UNIQUE NOT NULL,
+                client_phone VARCHAR(20) NOT NULL,
+                client_nom VARCHAR(200),
+                client_quartier VARCHAR(200),
+                client_age INTEGER,
+                client_taille INTEGER,
+                client_poids INTEGER,
+                client_telephone_joindre VARCHAR(20),
+                client_telephone_whatsapp VARCHAR(20),
+                medicaments JSONB,
+                total DECIMAL(10,2),
+                frais_livraison DECIMAL(10,2),
+                indications TEXT,
+                status VARCHAR(50) DEFAULT 'en_cours',
+                avis_note INTEGER,
+                avis_commentaire TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                confirmed_at TIMESTAMP,
+                cancelled_at TIMESTAMP
+            )
+        `);
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS avis (
-            id SERIAL PRIMARY KEY,
-            client_phone VARCHAR(20),
-            note INTEGER CHECK (note >= 1 AND note <= 5),
-            commentaire TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    `);
+        // Table avis
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS avis (
+                id SERIAL PRIMARY KEY,
+                client_phone VARCHAR(20),
+                note INTEGER CHECK (note >= 1 AND note <= 5),
+                commentaire TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS queries_log (
-            id SERIAL PRIMARY KEY,
-            client_phone VARCHAR(20),
-            message TEXT,
-            type VARCHAR(50),
-            medicament VARCHAR(200),
-            timestamp TIMESTAMP DEFAULT NOW()
-        );
-    `);
+        // Table queries_log
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS queries_log (
+                id SERIAL PRIMARY KEY,
+                client_phone VARCHAR(20),
+                message TEXT,
+                type VARCHAR(50),
+                medicament VARCHAR(200),
+                timestamp TIMESTAMP DEFAULT NOW()
+            )
+        `);
 
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_client_phone ON orders(client_phone);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_avis_client_phone ON avis(client_phone);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_client_phone ON queries_log(client_phone);`);
+        // Index
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_client_phone ON orders(client_phone)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_avis_client_phone ON avis(client_phone)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_client_phone ON queries_log(client_phone)`);
 
-    log('info', 'Base de données prête');
+        log('info', 'Base de données prête');
+        
+        // Insertion de médicaments de test si la table est vide
+        const result = await pool.query('SELECT COUNT(*) FROM medicaments');
+        if (parseInt(result.rows[0].count) === 0) {
+            await pool.query(`
+                INSERT INTO medicaments (code_produit, nom_commercial, dci, prix, categorie) VALUES
+                ('MED001', 'Doliprane 500mg', 'Paracétamol', 1500, 'Antalgique'),
+                ('MED002', 'Doliprane 1000mg', 'Paracétamol', 2500, 'Antalgique'),
+                ('MED003', 'Ibuprofène 400mg', 'Ibuprofène', 1800, 'Anti-inflammatoire'),
+                ('MED004', 'Aspirine 500mg', 'Acide acétylsalicylique', 1200, 'Antalgique'),
+                ('MED005', 'Amoxicilline 500mg', 'Amoxicilline', 2000, 'Antibiotique')
+            `);
+            log('info', 'Médicaments de test insérés');
+        }
+        
+    } catch (error) {
+        log('error', `Init DB error: ${error.message}`);
+        throw error;
+    }
 }
 
 // ===========================================
@@ -1685,8 +1678,6 @@ app.post('/warmup', async (req, res) => {
             await bot.fuse.initialize();
         }
         
-        await bot.preloadFrequentData();
-        
         res.json({ 
             status: 'warmed', 
             duration: Date.now() - start,
@@ -1697,6 +1688,7 @@ app.post('/warmup', async (req, res) => {
     }
 });
 
+// Nettoyage périodique
 setInterval(() => {
     const now = Date.now();
     for (const [phone, conv] of bot.conversations) {
@@ -1732,8 +1724,6 @@ async function start() {
             try {
                 await bot.init();
                 log('info', '✅ MARIAM IA prête');
-                await bot.preloadFrequentData();
-                log('info', '✅ Pré-chargement terminé');
             } catch (error) {
                 log('error', `Erreur initialisation bot: ${error.message}`);
             }
@@ -1752,7 +1742,6 @@ async function start() {
 ║   ⭐ Collecte d'avis après commande                       ║
 ║   ⏰ Relance après 10min d'inactivité                     ║
 ║   🔥 Keep-Alive actif (ping toutes les 2min)             ║
-║   📦 Warm-up toutes les 3min                              ║
 ║   ⚡ Mode dégradé quand LLM indisponible                  ║
 ║                                                           ║
 ║   💬 Llama 3.3 70B (texte principal)                     ║
@@ -1776,6 +1765,7 @@ async function start() {
 
 start();
 
+// Gestion arrêt
 process.on('SIGTERM', async () => {
     log('info', 'SIGTERM reçu, arrêt gracieux...');
     await pool.end();

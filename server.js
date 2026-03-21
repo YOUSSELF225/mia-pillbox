@@ -126,14 +126,20 @@ class Utils {
     }
 
     static getSupportLink() {
-        const phone = SUPPORT_PHONE.startsWith('+') ? SUPPORT_PHONE : `+${SUPPORT_PHONE}`;
-        return `https://wa.me/${phone.replace('+', '')}`;
+        let phone = SUPPORT_PHONE.replace(/\D/g, '');
+        if (!phone.startsWith('225')) {
+            phone = '225' + phone;
+        }
+        return `https://wa.me/${phone}`;
     }
 
     static getOrderLink() {
-        const phone = SUPPORT_PHONE.startsWith('+') ? SUPPORT_PHONE : `+${SUPPORT_PHONE}`;
+        let phone = SUPPORT_PHONE.replace(/\D/g, '');
+        if (!phone.startsWith('225')) {
+            phone = '225' + phone;
+        }
         const message = encodeURIComponent("L'IA Mariam m'a dit pour commander de vous contacter");
-        return `https://wa.me/${phone.replace('+', '')}?text=${message}`;
+        return `https://wa.me/${phone}?text=${message}`;
     }
 
     static formatOrderMessage(medicaments) {
@@ -161,6 +167,10 @@ class Utils {
     static getWelcomeMessage() {
         const delivery = this.getDeliveryPrice();
         return `Salut ! 👋\n\nJe suis MARIAM, ton IA santé à San Pedro 💊\n\n🔍 Je cherche tes médicaments\n💰 Prix transparents\n🚚 Livraison rapide (${delivery.price}F, ${delivery.time}min)\n\nQu'est-ce qu'il te faut aujourd'hui ?`;
+    }
+
+    static getCreatorMessage() {
+        return `J'ai été créée par Yousself, étudiant en Licence 2 à l'UPSP, aidé et soutenu par son ami Coulibaly Yaya. 🎓\n\nC'est dans sa chambre d'étudiant qu'il m'a donnée vie en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !`;
     }
 }
 
@@ -351,6 +361,7 @@ class LLMService {
     getSystemPrompt() {
         const delivery = Utils.getDeliveryPrice();
         const supportLink = Utils.getSupportLink();
+        const creatorMessage = Utils.getCreatorMessage();
         
         return `Tu es MARIAM, une IA santé à San Pedro, Côte d'Ivoire.
 
@@ -363,13 +374,16 @@ STYLE PAYPARROT :
 CONTEXTE :
 - Livraison: ${delivery.price}F (${delivery.period}), délai: ${delivery.time}min
 - Support: ${supportLink}
+- Créateur: ${creatorMessage}
 
 FORMAT DE REPONSE (JSON uniquement) :
 {
     "intention": "greet|search|support|delivery|creator|purpose|unknown",
     "medicament": "nom extrait ou null",
     "reponse": "ta réponse style PayParrot"
-}`;
+}
+
+Pour la question "qui t'as créée", réponds avec le message exact du créateur.`;
     }
 
     async _handleRateLimit(error) {
@@ -445,27 +459,27 @@ FORMAT DE REPONSE (JSON uniquement) :
     _fallbackComprendre(message) {
         const msg = message.toLowerCase();
         
-        if (msg.match(/salut|bonjour|hi|hello|yo/)) {
+        if (msg.match(/salut|bonjour|hi|hello|yo/) && message.length < 15) {
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: Utils.getWelcomeMessage()
+                reponse: "Salut ! Je suis MARIAM. Comment puis-je t'aider aujourd'hui ? 💊\n\nCherche un médicament ? Demande-moi !"
             };
         }
         
-        if (msg.match(/qui t'as crée|qui t'a crée|ton créateur|youssef/)) {
+        if (msg.match(/qui t'as crée|qui t'a crée|ton créateur|yousself|qui t'a fait|qui est ton papa|ton père|youssef/)) {
             return {
                 intention: "creator",
                 medicament: null,
-                reponse: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !"
+                reponse: Utils.getCreatorMessage()
             };
         }
         
-        if (msg.match(/à quoi tu sers|tu fais quoi|utilité/)) {
+        if (msg.match(/à quoi tu sers|tu fais quoi|utilité|ton rôle/)) {
             return {
                 intention: "purpose",
                 medicament: null,
-                reponse: "Je simplifie l'accès aux médicaments à San Pedro ! 💊\n\nPrix transparents, disponibilité en direct, livraison rapide. Ta santé mérite le meilleur."
+                reponse: "Je t'aide à trouver des médicaments à San Pedro ! 💊\n\n- Recherche par nom\n- Prix transparents\n- Livraison rapide\n\nBesoin d'un médicament ? Donne-moi le nom !"
             };
         }
         
@@ -586,7 +600,8 @@ class ConversationManager {
             this.conversations.set(phone, {
                 historique: [],
                 derniereActivite: Date.now(),
-                firstMessage: true
+                firstMessage: true,
+                welcomeSent: false
             });
         }
         return this.conversations.get(phone);
@@ -602,8 +617,9 @@ class ConversationManager {
         try {
             await this.whatsapp.sendTyping(phone);
 
-            if (conv.firstMessage) {
+            if (conv.firstMessage && !conv.welcomeSent && !text && !mediaId) {
                 conv.firstMessage = false;
+                conv.welcomeSent = true;
                 const welcomeMsg = Utils.getWelcomeMessage();
                 await this.whatsapp.sendMessage(phone, welcomeMsg);
                 
@@ -612,11 +628,13 @@ class ConversationManager {
                     content: welcomeMsg,
                     timestamp: Date.now()
                 });
-                
-                if (!text && !mediaId) {
-                    conv.derniereActivite = Date.now();
-                    return;
-                }
+                conv.derniereActivite = Date.now();
+                return;
+            }
+
+            if (conv.firstMessage) {
+                conv.firstMessage = false;
+                conv.welcomeSent = true;
             }
 
             if (text) {
@@ -727,12 +745,32 @@ class ConversationManager {
                         timestamp: Date.now()
                     });
                 }
-                else {
-                    await this.whatsapp.sendMessage(phone, comprehension.reponse);
+                else if (comprehension.intention === "creator") {
+                    const reponse = Utils.getCreatorMessage();
+                    await this.whatsapp.sendMessage(phone, reponse);
                     
                     conv.historique.push({
                         role: "assistant",
-                        content: comprehension.reponse,
+                        content: reponse,
+                        timestamp: Date.now()
+                    });
+                }
+                else {
+                    let reponse = comprehension.reponse;
+                    
+                    if (!reponse || reponse.trim() === "") {
+                        reponse = "Je n'ai pas bien compris. Peux-tu reformuler ? 💊";
+                    }
+                    
+                    if ((reponse.includes("Je suis MARIAM") || reponse.includes("créée par")) && conv.welcomeSent) {
+                        reponse = "Comment puis-je t'aider ? 💊\n\nCherche un médicament ? Donne-moi le nom !";
+                    }
+                    
+                    await this.whatsapp.sendMessage(phone, reponse);
+                    
+                    conv.historique.push({
+                        role: "assistant",
+                        content: reponse,
                         timestamp: Date.now()
                     });
                 }
@@ -882,7 +920,7 @@ async function start() {
 ║                                                           ║
 ║   📱 Port: ${PORT}                                        ║
 ║   📞 Support: ${SUPPORT_PHONE}                           ║
-║   👨💻 Créé par Youssef - UPSP 2026                       ║
+║   👨💻 Créé par Yousself - UPSP 2026                      ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
             `);

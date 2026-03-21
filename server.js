@@ -1,6 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version complète avec système de commande, relance, keep-alive et mode dégradé
+// Version complète avec mode dégradé quand LLM indisponible
 // ===========================================
 
 require('dotenv').config();
@@ -15,6 +15,7 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const sharp = require('sharp');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const crypto = require('crypto');
 
 // ===========================================
@@ -24,6 +25,7 @@ const PORT = process.env.PORT || 10000;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_API_URL = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '2250701406880';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
@@ -62,18 +64,9 @@ try {
         retryStrategy: (times) => Math.min(times * 100, 5000),
         maxRetriesPerRequest: 3,
         enableOfflineQueue: false,
-        keepAlive: 30000,
     });
     redis.on('error', (err) => log('error', `Redis: ${err.message}`));
     redis.on('connect', () => log('info', 'Redis connecté'));
-    
-    setInterval(async () => {
-        try {
-            await redis.ping();
-        } catch (error) {
-            log('error', `Redis ping failed: ${error.message}`);
-        }
-    }, 30000);
 } catch (error) {
     log('error', `Redis non disponible: ${error.message}`);
     redis = null;
@@ -168,20 +161,20 @@ class Utils {
 ════════════════════
 
 👤 CLIENT:
-Nom: ${order.client.nom || 'Non renseigné'}
-Quartier: ${order.client.quartier || 'Non renseigné'}
-Âge: ${order.client.age || 'Non renseigné'} ans
-Taille: ${order.client.taille || 'Non renseigné'} cm
-Poids: ${order.client.poids || 'Non renseigné'} kg
-Tél joindre: ${order.client.telephone_joindre || 'Non renseigné'}
-WhatsApp: ${order.client.telephone_whatsapp || 'Non renseigné'}
+Nom: ${order.client.nom}
+Quartier: ${order.client.quartier}
+Âge: ${order.client.age} ans
+Taille: ${order.client.taille} cm
+Poids: ${order.client.poids} kg
+Tél joindre: ${order.client.telephone_joindre}
+WhatsApp: ${order.client.telephone_whatsapp}
 
 💊 MÉDICAMENTS:
 ${order.medicaments.map(m => `- ${m.nom_commercial}: ${m.quantite} x ${m.prix}F = ${m.prix * m.quantite}F`).join('\n')}
 
-💰 TOTAL MÉDICAMENTS: ${order.total || 0} F CFA
-🚚 LIVRAISON: ${order.frais_livraison || 0} F CFA (${order.period_livraison || 'jour'})
-💵 TOTAL À PAYER: ${(order.total || 0) + (order.frais_livraison || 0)} F CFA
+💰 TOTAL: ${order.total} F CFA
+🚚 LIVRAISON: ${order.frais_livraison} F CFA (${order.period_livraison})
+💵 TOTAL À PAYER: ${order.total + order.frais_livraison} F CFA
 
 📝 INDICATIONS:
 ${order.indications || 'Aucune indication particulière'}
@@ -200,16 +193,12 @@ ${order.indications || 'Aucune indication particulière'}
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    max: 20,
-    min: 5,
+    max: 10,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
-    keepAlive: true,
 });
 
 pool.on('error', (err) => log('error', `DB Error: ${err.message}`));
-pool.on('connect', () => log('info', '📊 Nouvelle connexion PostgreSQL'));
-pool.on('remove', () => log('info', '📊 Connexion PostgreSQL fermée'));
 
 // ===========================================
 // WHATSAPP SERVICE
@@ -217,22 +206,20 @@ pool.on('remove', () => log('info', '📊 Connexion PostgreSQL fermée'));
 class WhatsAppService {
     constructor() {
         this.lastTyping = new NodeCache({ stdTTL: 10 });
-        this.apiClient = axios.create({
-            baseURL: 'https://graph.facebook.com/v18.0',
-            timeout: 10000,
-            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-        });
     }
 
     async sendMessage(to, text) {
         try {
             if (!text) text = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊";
             const safeText = text.substring(0, 4096);
-            await this.apiClient.post(`/${process.env.PHONE_NUMBER_ID}/messages`, {
+            await axios.post(WHATSAPP_API_URL, {
                 messaging_product: 'whatsapp',
                 to: to,
                 type: 'text',
                 text: { body: safeText }
+            }, {
+                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                timeout: 10000
             });
             return true;
         } catch (error) {
@@ -245,11 +232,14 @@ class WhatsAppService {
         try {
             const lastTyping = this.lastTyping.get(to);
             if (!lastTyping || Date.now() - lastTyping > 10000) {
-                await this.apiClient.post(`/${process.env.PHONE_NUMBER_ID}/messages`, {
+                await axios.post(WHATSAPP_API_URL, {
                     messaging_product: 'whatsapp',
                     to: to,
                     type: 'typing',
                     typing: { action: 'typing', duration_ms: 3000 }
+                }, {
+                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                    timeout: 5000
                 });
                 this.lastTyping.set(to, Date.now());
             }
@@ -258,7 +248,10 @@ class WhatsAppService {
 
     async downloadMedia(mediaId) {
         try {
-            const mediaResponse = await this.apiClient.get(`/${mediaId}`);
+            const mediaResponse = await axios.get(
+                `https://graph.facebook.com/v18.0/${mediaId}`,
+                { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }, timeout: 10000 }
+            );
             const imageUrl = mediaResponse.data.url;
             const fileResponse = await axios.get(imageUrl, {
                 responseType: 'arraybuffer',
@@ -284,17 +277,20 @@ class WhatsAppService {
 
     async markAsRead(messageId) {
         try {
-            await this.apiClient.post(`/${process.env.PHONE_NUMBER_ID}/messages`, {
+            await axios.post(WHATSAPP_API_URL, {
                 messaging_product: 'whatsapp',
                 status: 'read',
                 message_id: messageId
+            }, {
+                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+                timeout: 5000
             });
         } catch (error) {}
     }
 }
 
 // ===========================================
-// ORDER MANAGER
+// ORDER MANAGER - Gestion des commandes
 // ===========================================
 class OrderManager {
     constructor(whatsappService) {
@@ -374,11 +370,11 @@ class OrderManager {
                     indications, status, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
                 [
-                    order.code, order.phone, order.client.nom || null, order.client.quartier || null,
-                    order.client.age || null, order.client.taille || null, order.client.poids || null,
-                    order.client.telephone_joindre || null, order.client.telephone_whatsapp || null,
-                    JSON.stringify(order.medicaments), order.total || 0, order.frais_livraison || 0,
-                    order.indications || null, order.status, new Date(order.created_at)
+                    order.code, order.phone, order.client.nom, order.client.quartier,
+                    order.client.age, order.client.taille, order.client.poids,
+                    order.client.telephone_joindre, order.client.telephone_whatsapp,
+                    JSON.stringify(order.medicaments), order.total, order.frais_livraison,
+                    order.indications, order.status, new Date(order.created_at)
                 ]
             );
             log('info', `Commande ${order.code} sauvegardée en DB`);
@@ -457,10 +453,33 @@ class OrderManager {
             log('error', `Erreur sauvegarde avis: ${error.message}`);
         }
     }
+
+    async sendManualOrderToSupport(phone, medicament, quantite, clientNom) {
+        const message = `🆕 COMMANDE MANUELLE (Mode dégradé)
+════════════════════
+
+👤 CLIENT:
+Nom: ${clientNom || 'Non renseigné'}
+WhatsApp: ${phone}
+
+💊 MÉDICAMENT:
+• ${medicament.nom_commercial} x${quantite}
+• Prix unitaire: ${medicament.prix}F
+• Total: ${medicament.prix * parseInt(quantite)}F
+
+🚚 Livraison: ${Utils.getDeliveryPrice().price}F (${Utils.getDeliveryPrice().period})
+
+⏰ Commande passée: ${new Date().toLocaleString('fr-FR')}
+
+════════════════════
+⚠️ À traiter manuellement - Mode dégradé`;
+        
+        return await this.whatsapp.sendMessage(SUPPORT_PHONE, message);
+    }
 }
 
 // ===========================================
-// FUSE SERVICE
+// FUSE SERVICE - Recherche floue
 // ===========================================
 class FuseService {
     constructor() {
@@ -472,7 +491,7 @@ class FuseService {
     async initialize() {
         try {
             const cached = await this.cache.get("all_medicaments");
-            if (cached && cached.length > 0) {
+            if (cached) {
                 this.medicaments = cached;
                 this.fuse = new Fuse(this.medicaments, {
                     keys: ['nom_commercial', 'dci'],
@@ -488,28 +507,24 @@ class FuseService {
             const result = await pool.query("SELECT * FROM medicaments");
             this.medicaments = result.rows;
 
-            if (this.medicaments.length > 0) {
-                this.fuse = new Fuse(this.medicaments, {
-                    keys: ['nom_commercial', 'dci'],
-                    threshold: 0.3,
-                    ignoreLocation: true,
-                    minMatchCharLength: 2,
-                    includeScore: true
-                });
-                await this.cache.set("all_medicaments", this.medicaments, 3600);
-                log('info', `${this.medicaments.length} médicaments chargés (DB)`);
-            } else {
-                log('warn', 'Aucun médicament trouvé dans la base de données');
-                this.fuse = new Fuse([], { keys: ['nom_commercial'] });
-            }
+            this.fuse = new Fuse(this.medicaments, {
+                keys: ['nom_commercial', 'dci'],
+                threshold: 0.3,
+                ignoreLocation: true,
+                minMatchCharLength: 2,
+                includeScore: true
+            });
+
+            await this.cache.set("all_medicaments", this.medicaments, 3600);
+            log('info', `${this.medicaments.length} médicaments chargés (DB)`);
         } catch (error) {
             log('error', `Fuse init error: ${error.message}`);
-            this.fuse = new Fuse([], { keys: ['nom_commercial'] });
+            throw error;
         }
     }
 
     async search(query, limit = 5) {
-        if (!query || query.length < 2 || !this.fuse) return [];
+        if (!query || query.length < 2) return [];
         
         const cacheKey = `search:${Utils.normalizeText(query)}`;
         const cached = await this.cache.get(cacheKey);
@@ -604,14 +619,6 @@ class SmartCacheManager {
                 const delivery = Utils.getDeliveryPrice();
                 response = `Livraison: ${delivery.price}F (${delivery.period}) - ${delivery.time}min`;
                 break;
-                
-            case 'creator':
-                response = "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙";
-                break;
-                
-            case 'salut':
-                response = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊\n\nJe cherche tes médicaments et je les livre. Qu'est-ce qu'il te faut ?";
-                break;
         }
         
         if (response) {
@@ -623,47 +630,56 @@ class SmartCacheManager {
 }
 
 // ===========================================
-// DEGRADED MODE SERVICE
+// DEGRADED MODE SERVICE - Quand LLM est indisponible
 // ===========================================
 class DegradedModeService {
-    constructor(fuseService, whatsappService) {
+    constructor(fuseService, orderManager, whatsappService) {
         this.fuse = fuseService;
+        this.orderManager = orderManager;
         this.whatsapp = whatsappService;
         this.supportPhone = SUPPORT_PHONE;
         this.lastSearchResults = new Map();
     }
 
     async processQuery(phone, text, conv) {
+        const lowerText = text.toLowerCase().trim();
+        
+        // 1️⃣ Vérifier si c'est une commande (contient médicament + quantité)
         const orderMatch = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
         
         if (orderMatch) {
             const nomMedicament = orderMatch[1].trim();
-            const quantite = orderMatch[2];
+            const quantite = parseInt(orderMatch[2]);
             
-            const results = await this.fuse.search(nomMedicament, 3);
+            const results = await this.fuse.search(nomMedicament, 1);
             
             if (results.length > 0) {
                 const med = results[0];
-                const message = `🆕 COMMANDE MANUELLE\n\n` +
-                    `👤 Client: ${conv.client_nom || 'Non renseigné'}\n` +
-                    `📞 Tél: ${phone}\n` +
-                    `💊 Médicament: ${med.nom_commercial}\n` +
-                    `📦 Quantité: ${quantite}\n` +
-                    `💰 Prix: ${med.prix * parseInt(quantite)}F\n\n` +
-                    `📱 WhatsApp: ${phone}\n\n` +
-                    `⚠️ Mode dégradé - À traiter manuellement`;
                 
-                await this.whatsapp.sendMessage(this.supportPhone, message);
+                await this.orderManager.sendManualOrderToSupport(
+                    phone, 
+                    med, 
+                    quantite, 
+                    conv.client_nom
+                );
                 
                 return {
                     reponse: `✅ Commande envoyée au support !\n\n` +
                         `💊 ${med.nom_commercial} x${quantite}\n` +
-                        `💰 ${med.prix * parseInt(quantite)}F\n\n` +
-                        `Tu seras contacté dans quelques minutes. 📦`
+                        `💰 ${med.prix * quantite}F\n\n` +
+                        `Tu seras contacté dans quelques minutes. 📦\n\n` +
+                        `Retiens ton code de suivi si besoin.\n` +
+                        `📱 Support: ${Utils.getSupportLink()}`
+                };
+            } else {
+                return {
+                    reponse: `🔍 Je n'ai pas trouvé "${nomMedicament}" dans ma base.\n\n` +
+                        `📲 Contacte directement le support avec le nom exact :\n${Utils.getSupportLink()}`
                 };
             }
         }
         
+        // 2️⃣ Vérifier si c'est une recherche de prix
         const priceMatch = text.match(/prix\s+(.+)|combien\s+co[uû]te\s+(.+)|(\w+)\s+prix/i);
         if (priceMatch) {
             const medicament = priceMatch[1] || priceMatch[2] || priceMatch[3];
@@ -674,50 +690,91 @@ class DegradedModeService {
                     results.forEach(med => {
                         reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
                     });
-                    reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' au support :\nhttps://wa.me/${this.supportPhone}`;
+                    reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' et je transmets au support !`;
                     
                     this.lastSearchResults.set(phone, results);
+                    return { reponse };
+                } else {
+                    return {
+                        reponse: `🔍 Je n'ai pas trouvé "${medicament}".\n\n` +
+                            `📲 Contacte le support : ${Utils.getSupportLink()}`
+                    };
+                }
+            }
+        }
+        
+        // 3️⃣ Vérifier si c'est une recherche de disponibilité
+        const dispoMatch = text.match(/disponible\s+(.+)|vous\s+avez\s+(.+)|(\w+)\s+disponible/i);
+        if (dispoMatch) {
+            const medicament = dispoMatch[1] || dispoMatch[2] || dispoMatch[3];
+            if (medicament) {
+                const results = await this.fuse.search(medicament, 5);
+                if (results.length > 0) {
+                    let reponse = "✅ Médicaments disponibles :\n\n";
+                    results.forEach(med => {
+                        reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
+                    });
+                    reponse += `\n📲 Pour commander, envoie le nom et la quantité (ex: ${results[0].nom_commercial} 2)`;
                     return { reponse };
                 }
             }
         }
         
-        if (text.length > 2) {
+        // 4️⃣ Vérifier si c'est une recherche de livraison
+        if (/livraison|délai|transport|prix livraison/.test(lowerText)) {
+            const delivery = Utils.getDeliveryPrice();
+            return {
+                reponse: `🚚 Livraison à San Pedro :\n\n` +
+                    `• Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n` +
+                    `• Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n` +
+                    `• Délai : ${DELIVERY_CONFIG.DELIVERY_TIME}min\n` +
+                    `• Période actuelle : ${delivery.period}\n\n` +
+                    `📲 Pour commander, envoie 'Médicament quantité'`
+            };
+        }
+        
+        // 5️⃣ Recherche générique
+        if (text.length > 2 && !/^(salut|bonjour|merci|support|aide)$/i.test(lowerText)) {
             const results = await this.fuse.search(text, 5);
             if (results.length > 0) {
                 let reponse = "🔍 Résultats trouvés :\n\n";
                 results.forEach(med => {
                     reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
                 });
-                reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
+                reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' (nom + quantité)`;
                 return { reponse };
+            } else {
+                return {
+                    reponse: "🔍 Je n'ai pas trouvé de médicament correspondant.\n\n" +
+                        `📲 Contacte directement le support avec le nom du médicament :\n${Utils.getSupportLink()}`
+                };
             }
         }
         
+        // 6️⃣ Messages standards
         const responses = {
-            salut: "👋 Bonjour ! Mes modèles IA sont temporairement indisponibles.\n\nMais je peux encore t'aider à trouver tes médicaments ! Dis-moi ce que tu cherches 💊",
-            livraison: `🚚 Livraison à San Pedro :\n• Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n• Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n• Délai : ${DELIVERY_CONFIG.DELIVERY_TIME}min\n\n📲 Pour commander, contacte le support :\nhttps://wa.me/${this.supportPhone}`,
-            support: `📞 Besoin d'aide ? Contacte directement le support :\nhttps://wa.me/${this.supportPhone}`,
-            creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙",
+            salut: "👋 Bonjour ! Mes modèles IA sont temporairement indisponibles.\n\nMais je peux encore t'aider à trouver tes médicaments !\n\n🔍 Cherche par nom, je te donnerai le prix et comment commander 💊",
             merci: "Avec plaisir ! Mes modèles reviennent dans environ 1h. Bonne journée ! 💙",
+            support: `📞 Besoin d'aide ? Contacte directement le support :\n${Utils.getSupportLink()}`,
+            creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !",
+            purpose: "Je simplifie l'accès aux médicaments à San Pedro ! 💊\n\nPrix transparents, disponibilité en direct, livraison rapide. Ta santé mérite le meilleur.",
             default: "👋 Je suis MARIAM ! Mes modèles IA sont temporairement indisponibles, mais je peux toujours te trouver des médicaments.\n\nDis-moi ce que tu cherches, je te dirai le prix et comment commander 💊"
         };
         
-        const lowerText = text.toLowerCase();
-        if (/^(salut|bonjour|bonsoir|coucou|hello|hi|cc|slt)$/.test(lowerText)) {
+        if (/^(salut|bonjour|bonsoir|coucou|hello|hi|cc|slt)$/i.test(lowerText)) {
             return { reponse: responses.salut };
-        }
-        if (/livraison|délai|transport/.test(lowerText)) {
-            return { reponse: responses.livraison };
-        }
-        if (/support|aide|contact|assistance/.test(lowerText)) {
-            return { reponse: responses.support };
-        }
-        if (/qui.*créée|youssef|upsp|créateur/.test(lowerText)) {
-            return { reponse: responses.creator };
         }
         if (/merci|thanks/.test(lowerText)) {
             return { reponse: responses.merci };
+        }
+        if (/support|aide|contact|assistance|problème|SOS/.test(lowerText)) {
+            return { reponse: responses.support };
+        }
+        if (/qui.*créée|youssef|upsp|créateur|qui t'a fait/.test(lowerText)) {
+            return { reponse: responses.creator };
+        }
+        if (/à quoi tu sers|rôle|utilite|pourquoi/.test(lowerText)) {
+            return { reponse: responses.purpose };
         }
         
         return { reponse: responses.default };
@@ -725,84 +782,11 @@ class DegradedModeService {
 }
 
 // ===========================================
-// KEEP-ALIVE & WARM-UP SERVICE
-// ===========================================
-class KeepAliveService {
-    constructor() {
-        this.pingInterval = null;
-        this.warmupInterval = null;
-        this.isWarmingUp = false;
-    }
-
-    start() {
-        this.pingInterval = setInterval(() => {
-            this.pingServer();
-        }, 2 * 60 * 1000);
-        
-        this.warmupInterval = setInterval(() => {
-            this.warmup();
-        }, 3 * 60 * 1000);
-        
-        log('info', '🔥 Keep-alive service démarré');
-    }
-    
-    async pingServer() {
-        try {
-            const response = await axios.get(`http://localhost:${PORT}/ping`, { timeout: 5000 });
-            if (response.status === 200) {
-                log('info', '🏓 Ping serveur réussi');
-            }
-        } catch (error) {
-            log('warn', `🏓 Ping serveur échoué: ${error.message}`);
-        }
-    }
-    
-    async warmup() {
-        if (this.isWarmingUp) return;
-        this.isWarmingUp = true;
-        
-        try {
-            log('info', '🔥 Warm-up en cours...');
-            
-            if (redis) {
-                await redis.ping();
-                log('info', '✅ Redis réchauffé');
-            }
-            
-            await pool.query('SELECT 1');
-            log('info', '✅ PostgreSQL réchauffé');
-            
-            if (bot && bot.fuse && bot.fuse.medicaments.length === 0) {
-                await bot.fuse.initialize();
-                log('info', '✅ Fuse réinitialisé');
-            }
-            
-            log('info', '🔥 Warm-up terminé');
-            
-        } catch (error) {
-            log('error', `Warm-up échoué: ${error.message}`);
-        } finally {
-            this.isWarmingUp = false;
-        }
-    }
-    
-    stop() {
-        if (this.pingInterval) clearInterval(this.pingInterval);
-        if (this.warmupInterval) clearInterval(this.warmupInterval);
-        log('info', '🛑 Keep-alive service arrêté');
-    }
-}
-
-// ===========================================
-// LLM SERVICE
+// LLM SERVICE - Groq avec gestion de quota
 // ===========================================
 class LLMService {
     constructor() {
-        this.client = new Groq({ 
-            apiKey: GROQ_API_KEY,
-            maxRetries: 3,
-            timeout: 30000
-        });
+        this.client = new Groq({ apiKey: GROQ_API_KEY });
         this.models = {
             vision: "meta-llama/llama-4-scout-17b-16e-instruct",
             text: {
@@ -842,6 +826,7 @@ STYLE DE COMMUNICATION:
 - Naturel et conversationnel
 - Emojis discrets (💊 📦 ✅)
 - Questions claires et précises
+- Pas de réponses pré-définies
 
 FORMAT DE RÉPONSE (JSON uniquement):
 {
@@ -936,10 +921,7 @@ FORMAT DE RÉPONSE (JSON uniquement):
                     return this.comprendre(message, historique, orderContext);
                 } else {
                     this.markQuotaExhausted('fallback');
-                    return {
-                        intention: "quota_exhausted",
-                        reponse: null
-                    };
+                    return { intention: "quota_exhausted", reponse: null };
                 }
             }
             
@@ -1039,7 +1021,7 @@ FORMAT DE RÉPONSE (JSON uniquement):
 }
 
 // ===========================================
-// CONVERSATION MANAGER
+// CONVERSATION MANAGER - Cœur de l'IA
 // ===========================================
 class ConversationManager {
     constructor() {
@@ -1051,30 +1033,17 @@ class ConversationManager {
         this.smartCache = null;
         this.degradedMode = null;
         this.processedMessages = new Set();
-        this.warmConversations = new Set();
-        this.preloadTimer = null;
-        this.keepAlive = null;
+        
+        this.relanceTimers = new Map();
     }
 
     async init() {
         await this.fuse.initialize();
         this.smartCache = new SmartCacheManager(this.fuse);
-        this.degradedMode = new DegradedModeService(this.fuse, this.whatsapp);
+        this.degradedMode = new DegradedModeService(this.fuse, this.orders, this.whatsapp);
+        log('info', '🚀 MARIAM IA prête avec système de commande et mode dégradé');
         
-        this.keepAlive = new KeepAliveService();
-        this.keepAlive.start();
-        
-        log('info', '🚀 MARIAM IA prête avec système de commande');
         setInterval(() => this.checkRelance(), 60 * 1000);
-    }
-    
-    async keepConversationAlive(phone) {
-        if (!this.warmConversations.has(phone)) {
-            this.warmConversations.add(phone);
-            setTimeout(() => {
-                this.warmConversations.delete(phone);
-            }, 30 * 60 * 1000);
-        }
     }
 
     getConversation(phone) {
@@ -1148,8 +1117,6 @@ class ConversationManager {
     }
 
     async process(phone, input) {
-        await this.keepConversationAlive(phone);
-        
         const conv = this.getConversation(phone);
         const { text, mediaId, messageId } = input;
 
@@ -1165,35 +1132,16 @@ class ConversationManager {
                     content: text,
                     timestamp: Date.now()
                 });
+                
+                // Extraire le nom s'il est donné
+                const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)|je suis\s+(.+)/i);
+                if (nameMatch) {
+                    conv.client_nom = nameMatch[1] || nameMatch[2] || nameMatch[3];
+                }
             }
 
             conv.relanceEnvoyee = false;
             conv.derniereActivite = Date.now();
-
-            const modelAvailable = this.llm.getAvailableTextModel();
-            
-            if (!modelAvailable && !conv.orderInProgress && !conv.etape) {
-                log('info', `⚠️ Mode dégradé activé pour ${phone} - LLM indisponible`);
-                
-                const result = await this.degradedMode.processQuery(phone, text, conv);
-                
-                await this.whatsapp.sendMessage(phone, result.reponse);
-                
-                if (text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i)) {
-                    const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i);
-                    conv.client_nom = nameMatch[1] || nameMatch[2];
-                }
-                
-                conv.historique.push({ 
-                    role: "assistant", 
-                    content: result.reponse, 
-                    timestamp: Date.now(),
-                    source: 'degraded'
-                });
-                
-                conv.derniereActivite = Date.now();
-                return;
-            }
 
             if (mediaId) {
                 await this.whatsapp.sendMessage(phone, "J'analyse ton image... 📸");
@@ -1205,12 +1153,6 @@ class ConversationManager {
                 }
 
                 const visionResult = await this.llm.analyserImage(media.buffer);
-                
-                if (visionResult.error === "quota_exhausted") {
-                    const result = await this.degradedMode.processQuery(phone, "image reçue", conv);
-                    await this.whatsapp.sendMessage(phone, result.reponse);
-                    return;
-                }
                 
                 if (visionResult.medicaments && visionResult.medicaments.length > 0) {
                     const results = [];
@@ -1238,18 +1180,54 @@ class ConversationManager {
             }
 
             if (text) {
-                if (conv.etape === 'recap' && ['1', '2', '3'].includes(text.trim())) {
-                    await this.handleRecapResponse(phone, text.trim(), conv);
-                    return;
-                }
-
+                // Vérifier si commande en cours
                 const order = this.orders.getOrder(phone);
                 
                 if (order) {
                     await this.handleOrderProcess(phone, text, order, conv);
                     return;
                 }
+                
+                // Vérifier si en attente de confirmation recap
+                if (conv.etape === 'recap' && ['1', '2', '3'].includes(text.trim())) {
+                    await this.handleRecapResponse(phone, text.trim(), conv);
+                    return;
+                }
+                
+                // Vérifier si en attente d'avis
+                if (conv.etape === 'avis_note') {
+                    await this.handleAvis(phone, text, conv);
+                    return;
+                }
+                
+                if (conv.etape === 'avis_commentaire') {
+                    await this.handleAvis(phone, text, conv);
+                    return;
+                }
 
+                // Vérifier si tous les modèles sont indisponibles
+                const modelAvailable = this.llm.getAvailableTextModel();
+                
+                if (!modelAvailable) {
+                    // MODE DÉGRADÉ - Utiliser Fuse.js seulement
+                    log('info', `⚠️ Mode dégradé activé pour ${phone} - LLM indisponible`);
+                    
+                    const result = await this.degradedMode.processQuery(phone, text, conv);
+                    
+                    await this.whatsapp.sendMessage(phone, result.reponse);
+                    
+                    conv.historique.push({ 
+                        role: "assistant", 
+                        content: result.reponse, 
+                        timestamp: Date.now(),
+                        source: 'degraded'
+                    });
+                    
+                    conv.derniereActivite = Date.now();
+                    return;
+                }
+
+                // Essayer le cache simple
                 const cachedResponse = await this.smartCache.generateSimpleResponse({ text, messageId }, phone);
                 if (cachedResponse) {
                     await this.whatsapp.sendMessage(phone, cachedResponse);
@@ -1258,13 +1236,14 @@ class ConversationManager {
                     return;
                 }
 
+                // Utiliser le LLM
                 const comprehension = await this.llm.comprendre(text, conv.historique, order);
                 
-                if (!comprehension.reponse && comprehension.intention === "quota_exhausted") {
+                if (comprehension.intention === "quota_exhausted") {
+                    // Fallback vers mode dégradé
                     const result = await this.degradedMode.processQuery(phone, text, conv);
                     await this.whatsapp.sendMessage(phone, result.reponse);
                     conv.historique.push({ role: "assistant", content: result.reponse, timestamp: Date.now() });
-                    conv.derniereActivite = Date.now();
                     return;
                 }
 
@@ -1279,6 +1258,8 @@ class ConversationManager {
                         if (results.length > 0) {
                             const reponse = await this.llm.integrerResultats(results, text, conv.historique);
                             await this.whatsapp.sendMessage(phone, reponse.reponse || reponse);
+                        } else {
+                            await this.whatsapp.sendMessage(phone, comprehension.reponse);
                         }
                     } else {
                         await this.whatsapp.sendMessage(phone, comprehension.reponse);
@@ -1486,103 +1467,103 @@ class ConversationManager {
                 break;
         }
     }
+
+    async handleAvis(phone, text, conv) {
+        if (conv.etape === 'avis_note') {
+            if (!isNaN(text) && parseInt(text) >= 1 && parseInt(text) <= 5) {
+                conv.avis_note = parseInt(text);
+                conv.etape = 'avis_commentaire';
+                await this.whatsapp.sendMessage(phone, 
+                    "Merci ! Un commentaire à ajouter ? (ou réponds 'non')");
+            } else {
+                await this.whatsapp.sendMessage(phone, "Donne une note entre 1 et 5 ⭐");
+            }
+        } 
+        else if (conv.etape === 'avis_commentaire') {
+            const commentaire = text.toLowerCase() === 'non' ? '' : text;
+            
+            await this.orders.saveAvis(phone, conv.avis_note, commentaire);
+            
+            await this.whatsapp.sendMessage(phone, 
+                "🙏 Merci pour ton retour ! Ça aide à m'améliorer.\n\nÀ très bientôt sur MARIAM ! 💊");
+            
+            this.orders.orders.delete(phone);
+            conv.orderInProgress = false;
+            conv.etape = null;
+        }
+    }
 }
 
 // ===========================================
 // INITIALISATION BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
-    try {
-        // Table medicaments
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS medicaments (
-                code_produit VARCHAR(50) PRIMARY KEY,
-                nom_commercial VARCHAR(200) NOT NULL,
-                dci TEXT,
-                prix DECIMAL(10,2) NOT NULL,
-                categorie VARCHAR(100),
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS medicaments (
+            code_produit VARCHAR(50) PRIMARY KEY,
+            nom_commercial VARCHAR(200) NOT NULL,
+            dci TEXT,
+            prix DECIMAL(10,2) NOT NULL,
+            categorie VARCHAR(100),
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
 
-        // Table orders
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS orders (
-                id SERIAL PRIMARY KEY,
-                code VARCHAR(6) UNIQUE NOT NULL,
-                client_phone VARCHAR(20) NOT NULL,
-                client_nom VARCHAR(200),
-                client_quartier VARCHAR(200),
-                client_age INTEGER,
-                client_taille INTEGER,
-                client_poids INTEGER,
-                client_telephone_joindre VARCHAR(20),
-                client_telephone_whatsapp VARCHAR(20),
-                medicaments JSONB,
-                total DECIMAL(10,2),
-                frais_livraison DECIMAL(10,2),
-                indications TEXT,
-                status VARCHAR(50) DEFAULT 'en_cours',
-                avis_note INTEGER,
-                avis_commentaire TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                confirmed_at TIMESTAMP,
-                cancelled_at TIMESTAMP
-            )
-        `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            code VARCHAR(6) UNIQUE NOT NULL,
+            client_phone VARCHAR(20) NOT NULL,
+            client_nom VARCHAR(200),
+            client_quartier VARCHAR(200),
+            client_age INTEGER,
+            client_taille INTEGER,
+            client_poids INTEGER,
+            client_telephone_joindre VARCHAR(20),
+            client_telephone_whatsapp VARCHAR(20),
+            medicaments JSONB,
+            total DECIMAL(10,2),
+            frais_livraison DECIMAL(10,2),
+            indications TEXT,
+            status VARCHAR(50) DEFAULT 'en_cours',
+            avis_note INTEGER,
+            avis_commentaire TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            confirmed_at TIMESTAMP,
+            cancelled_at TIMESTAMP
+        );
+    `);
 
-        // Table avis
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS avis (
-                id SERIAL PRIMARY KEY,
-                client_phone VARCHAR(20),
-                note INTEGER CHECK (note >= 1 AND note <= 5),
-                commentaire TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS avis (
+            id SERIAL PRIMARY KEY,
+            client_phone VARCHAR(20),
+            note INTEGER CHECK (note >= 1 AND note <= 5),
+            commentaire TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
 
-        // Table queries_log
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS queries_log (
-                id SERIAL PRIMARY KEY,
-                client_phone VARCHAR(20),
-                message TEXT,
-                type VARCHAR(50),
-                medicament VARCHAR(200),
-                timestamp TIMESTAMP DEFAULT NOW()
-            )
-        `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS queries_log (
+            id SERIAL PRIMARY KEY,
+            client_phone VARCHAR(20),
+            message TEXT,
+            type VARCHAR(50),
+            medicament VARCHAR(200),
+            timestamp TIMESTAMP DEFAULT NOW()
+        );
+    `);
 
-        // Index
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial)`);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci)`);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_client_phone ON orders(client_phone)`);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code)`);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_avis_client_phone ON avis(client_phone)`);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_client_phone ON queries_log(client_phone)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_client_phone ON orders(client_phone);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_avis_client_phone ON avis(client_phone);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_client_phone ON queries_log(client_phone);`);
 
-        log('info', 'Base de données prête');
-        
-        // Insertion de médicaments de test si la table est vide
-        const result = await pool.query('SELECT COUNT(*) FROM medicaments');
-        if (parseInt(result.rows[0].count) === 0) {
-            await pool.query(`
-                INSERT INTO medicaments (code_produit, nom_commercial, dci, prix, categorie) VALUES
-                ('MED001', 'Doliprane 500mg', 'Paracétamol', 1500, 'Antalgique'),
-                ('MED002', 'Doliprane 1000mg', 'Paracétamol', 2500, 'Antalgique'),
-                ('MED003', 'Ibuprofène 400mg', 'Ibuprofène', 1800, 'Anti-inflammatoire'),
-                ('MED004', 'Aspirine 500mg', 'Acide acétylsalicylique', 1200, 'Antalgique'),
-                ('MED005', 'Amoxicilline 500mg', 'Amoxicilline', 2000, 'Antibiotique')
-            `);
-            log('info', 'Médicaments de test insérés');
-        }
-        
-    } catch (error) {
-        log('error', `Init DB error: ${error.message}`);
-        throw error;
-    }
+    log('info', 'Base de données prête');
 }
 
 // ===========================================
@@ -1597,14 +1578,6 @@ app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 200
 }));
-
-app.get('/ping', (req, res) => {
-    res.status(200).json({ 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime()
-    });
-});
 
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
@@ -1654,7 +1627,8 @@ app.get('/health', async (req, res) => {
         orders: bot.orders.orders.size,
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
-        db: 'checking'
+        db: 'checking',
+        llm_available: bot.llm.getAvailableTextModel() !== null
     };
 
     try {
@@ -1667,28 +1641,6 @@ app.get('/health', async (req, res) => {
     res.json(health);
 });
 
-app.post('/warmup', async (req, res) => {
-    try {
-        const start = Date.now();
-        
-        if (redis) await redis.ping();
-        await pool.query('SELECT 1');
-        
-        if (bot.fuse.medicaments.length === 0) {
-            await bot.fuse.initialize();
-        }
-        
-        res.json({ 
-            status: 'warmed', 
-            duration: Date.now() - start,
-            medicaments: bot.fuse.medicaments.length
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Nettoyage périodique
 setInterval(() => {
     const now = Date.now();
     for (const [phone, conv] of bot.conversations) {
@@ -1708,55 +1660,43 @@ setInterval(() => {
 // ===========================================
 async function start() {
     try {
-        log('info', '🚀 Démarrage de MARIAM IA...');
-        
         await initDatabase();
+        await bot.init();
         
-        const server = app.listen(PORT, '0.0.0.0', () => {
-            log('info', `✅ Serveur démarré sur le port ${PORT}`);
-        });
-        
-        server.timeout = 120000;
-        server.keepAliveTimeout = 65000;
-        server.headersTimeout = 66000;
-        
-        setTimeout(async () => {
-            try {
-                await bot.init();
-                log('info', '✅ MARIAM IA prête');
-            } catch (error) {
-                log('error', `Erreur initialisation bot: ${error.message}`);
-            }
-        }, 100);
-        
-        console.log(`
+        app.listen(PORT, '0.0.0.0', () => {
+            console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
 ║   🚀 MARIAM IA - PRODUCTION READY                         ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   🤖 IA Conversationnelle avec système de commande        ║
+║   🤖 100% IA Conversationnelle avec système de commande   ║
 ║   💊 Commande intelligente étape par étape                ║
-║   🔢 Code unique à 6 chiffres                             ║
+║   🔢 Code unique à 6 chiffres par commande                ║
 ║   📱 Envoi automatique au support                         ║
-║   ⭐ Collecte d'avis après commande                       ║
-║   ⏰ Relance après 10min d'inactivité                     ║
-║   🔥 Keep-Alive actif (ping toutes les 2min)             ║
-║   ⚡ Mode dégradé quand LLM indisponible                  ║
+║   ⭐ Collecte d'avis après chaque commande                ║
+║   ⏰ Relance automatique après 10min d'inactivité         ║
+║   🔄 MODE DÉGRADÉ : LLM indisponible → Fuse only         ║
 ║                                                           ║
 ║   💬 Llama 3.3 70B (texte principal)                     ║
 ║   💬 Llama 3 70B (texte secours)                         ║
 ║   📸 Llama 4 Scout 17B (vision)                          ║
-║   🔍 Fuse.js (recherche floue)                           ║
+║   🔍 Fuse.js (recherche floue + mode dégradé)            ║
 ║   📦 Smart Cache (80-90% réduction appels LLM)           ║
+║   ⏱️ Gestion automatique des quotas + fallback 1h        ║
 ║                                                           ║
 ║   📱 Port: ${PORT}                                        ║
 ║   📞 Support: ${SUPPORT_PHONE}                           ║
 ║   👨💻 Créé par Youssef - UPSP 2026                       ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
-        `);
-        
+            `);
+            
+            log('info', '🚀 MARIAM IA est opérationnelle');
+            log('info', '📦 Système de commande intelligent actif');
+            log('info', '⏰ Relance automatique après 10min');
+            log('info', '🔄 Mode dégradé prêt (Fuse.js)');
+        });
     } catch (error) {
         log('error', `Fatal: ${error.message}`);
         process.exit(1);
@@ -1765,12 +1705,10 @@ async function start() {
 
 start();
 
-// Gestion arrêt
 process.on('SIGTERM', async () => {
     log('info', 'SIGTERM reçu, arrêt gracieux...');
     await pool.end();
     if (redis) await redis.quit();
-    if (bot.keepAlive) bot.keepAlive.stop();
     process.exit(0);
 });
 
@@ -1778,6 +1716,5 @@ process.on('SIGINT', async () => {
     log('info', 'SIGINT reçu, arrêt gracieux...');
     await pool.end();
     if (redis) await redis.quit();
-    if (bot.keepAlive) bot.keepAlive.stop();
     process.exit(0);
 });

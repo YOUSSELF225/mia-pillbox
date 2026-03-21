@@ -1,6 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version complète avec mode dégradé quand LLM indisponible
+// Version complète avec système de commande intelligent, relance et mode dégradé
 // ===========================================
 
 require('dotenv').config();
@@ -453,29 +453,6 @@ class OrderManager {
             log('error', `Erreur sauvegarde avis: ${error.message}`);
         }
     }
-
-    async sendManualOrderToSupport(phone, medicament, quantite, clientNom) {
-        const message = `🆕 COMMANDE MANUELLE (Mode dégradé)
-════════════════════
-
-👤 CLIENT:
-Nom: ${clientNom || 'Non renseigné'}
-WhatsApp: ${phone}
-
-💊 MÉDICAMENT:
-• ${medicament.nom_commercial} x${quantite}
-• Prix unitaire: ${medicament.prix}F
-• Total: ${medicament.prix * parseInt(quantite)}F
-
-🚚 Livraison: ${Utils.getDeliveryPrice().price}F (${Utils.getDeliveryPrice().period})
-
-⏰ Commande passée: ${new Date().toLocaleString('fr-FR')}
-
-════════════════════
-⚠️ À traiter manuellement - Mode dégradé`;
-        
-        return await this.whatsapp.sendMessage(SUPPORT_PHONE, message);
-    }
 }
 
 // ===========================================
@@ -633,48 +610,43 @@ class SmartCacheManager {
 // DEGRADED MODE SERVICE - Quand LLM est indisponible
 // ===========================================
 class DegradedModeService {
-    constructor(fuseService, orderManager, whatsappService) {
+    constructor(fuseService, whatsappService) {
         this.fuse = fuseService;
-        this.orderManager = orderManager;
         this.whatsapp = whatsappService;
         this.supportPhone = SUPPORT_PHONE;
         this.lastSearchResults = new Map();
     }
 
     async processQuery(phone, text, conv) {
-        const lowerText = text.toLowerCase().trim();
+        const normalizedText = Utils.normalizeText(text);
         
         // 1️⃣ Vérifier si c'est une commande (contient médicament + quantité)
         const orderMatch = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
         
         if (orderMatch) {
             const nomMedicament = orderMatch[1].trim();
-            const quantite = parseInt(orderMatch[2]);
+            const quantite = orderMatch[2];
             
-            const results = await this.fuse.search(nomMedicament, 1);
+            const results = await this.fuse.search(nomMedicament, 3);
             
             if (results.length > 0) {
                 const med = results[0];
+                const message = `🆕 COMMANDE MANUELLE\n\n` +
+                    `👤 Client: ${conv.client_nom || 'Non renseigné'}\n` +
+                    `📞 Tél: ${phone}\n` +
+                    `💊 Médicament: ${med.nom_commercial}\n` +
+                    `📦 Quantité: ${quantite}\n` +
+                    `💰 Prix: ${med.prix * parseInt(quantite)}F\n\n` +
+                    `📱 WhatsApp: ${phone}\n\n` +
+                    `⚠️ Mode dégradé - À traiter manuellement`;
                 
-                await this.orderManager.sendManualOrderToSupport(
-                    phone, 
-                    med, 
-                    quantite, 
-                    conv.client_nom
-                );
+                await this.whatsapp.sendMessage(this.supportPhone, message);
                 
                 return {
                     reponse: `✅ Commande envoyée au support !\n\n` +
                         `💊 ${med.nom_commercial} x${quantite}\n` +
-                        `💰 ${med.prix * quantite}F\n\n` +
-                        `Tu seras contacté dans quelques minutes. 📦\n\n` +
-                        `Retiens ton code de suivi si besoin.\n` +
-                        `📱 Support: ${Utils.getSupportLink()}`
-                };
-            } else {
-                return {
-                    reponse: `🔍 Je n'ai pas trouvé "${nomMedicament}" dans ma base.\n\n` +
-                        `📲 Contacte directement le support avec le nom exact :\n${Utils.getSupportLink()}`
+                        `💰 ${med.prix * parseInt(quantite)}F\n\n` +
+                        `Tu seras contacté dans quelques minutes. 📦`
                 };
             }
         }
@@ -690,15 +662,10 @@ class DegradedModeService {
                     results.forEach(med => {
                         reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
                     });
-                    reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' et je transmets au support !`;
+                    reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' au support :\nhttps://wa.me/${this.supportPhone}`;
                     
                     this.lastSearchResults.set(phone, results);
                     return { reponse };
-                } else {
-                    return {
-                        reponse: `🔍 Je n'ai pas trouvé "${medicament}".\n\n` +
-                            `📲 Contacte le support : ${Utils.getSupportLink()}`
-                    };
                 }
             }
         }
@@ -714,67 +681,55 @@ class DegradedModeService {
                     results.forEach(med => {
                         reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
                     });
-                    reponse += `\n📲 Pour commander, envoie le nom et la quantité (ex: ${results[0].nom_commercial} 2)`;
+                    reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
                     return { reponse };
                 }
             }
         }
         
-        // 4️⃣ Vérifier si c'est une recherche de livraison
-        if (/livraison|délai|transport|prix livraison/.test(lowerText)) {
-            const delivery = Utils.getDeliveryPrice();
-            return {
-                reponse: `🚚 Livraison à San Pedro :\n\n` +
-                    `• Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n` +
-                    `• Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n` +
-                    `• Délai : ${DELIVERY_CONFIG.DELIVERY_TIME}min\n` +
-                    `• Période actuelle : ${delivery.period}\n\n` +
-                    `📲 Pour commander, envoie 'Médicament quantité'`
-            };
-        }
-        
-        // 5️⃣ Recherche générique
-        if (text.length > 2 && !/^(salut|bonjour|merci|support|aide)$/i.test(lowerText)) {
+        // 4️⃣ Recherche générique
+        if (text.length > 2) {
             const results = await this.fuse.search(text, 5);
             if (results.length > 0) {
                 let reponse = "🔍 Résultats trouvés :\n\n";
                 results.forEach(med => {
                     reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
                 });
-                reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' (nom + quantité)`;
+                reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
                 return { reponse };
             } else {
                 return {
                     reponse: "🔍 Je n'ai pas trouvé de médicament correspondant.\n\n" +
-                        `📲 Contacte directement le support avec le nom du médicament :\n${Utils.getSupportLink()}`
+                        `📲 Contacte directement le support avec le nom du médicament :\nhttps://wa.me/${this.supportPhone}`
                 };
             }
         }
         
-        // 6️⃣ Messages standards
+        // 5️⃣ Messages standards
         const responses = {
-            salut: "👋 Bonjour ! Mes modèles IA sont temporairement indisponibles.\n\nMais je peux encore t'aider à trouver tes médicaments !\n\n🔍 Cherche par nom, je te donnerai le prix et comment commander 💊",
-            merci: "Avec plaisir ! Mes modèles reviennent dans environ 1h. Bonne journée ! 💙",
-            support: `📞 Besoin d'aide ? Contacte directement le support :\n${Utils.getSupportLink()}`,
+            salut: "👋 Bonjour ! Mes modèles IA sont temporairement indisponibles.\n\nMais je peux encore t'aider à trouver tes médicaments ! Dis-moi ce que tu cherches 💊",
+            livraison: `🚚 Livraison à San Pedro :\n• Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n• Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n• Délai : ${DELIVERY_CONFIG.DELIVERY_TIME}min\n\n📲 Pour commander, contacte le support :\nhttps://wa.me/${this.supportPhone}`,
+            support: `📞 Besoin d'aide ? Contacte directement le support :\nhttps://wa.me/${this.supportPhone}`,
             creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !",
-            purpose: "Je simplifie l'accès aux médicaments à San Pedro ! 💊\n\nPrix transparents, disponibilité en direct, livraison rapide. Ta santé mérite le meilleur.",
+            merci: "Avec plaisir ! Mes modèles reviennent dans environ 1h. Bonne journée ! 💙",
             default: "👋 Je suis MARIAM ! Mes modèles IA sont temporairement indisponibles, mais je peux toujours te trouver des médicaments.\n\nDis-moi ce que tu cherches, je te dirai le prix et comment commander 💊"
         };
         
-        if (/^(salut|bonjour|bonsoir|coucou|hello|hi|cc|slt)$/i.test(lowerText)) {
+        const lowerText = text.toLowerCase();
+        if (/^(salut|bonjour|bonsoir|coucou|hello|hi|cc|slt)$/.test(lowerText)) {
             return { reponse: responses.salut };
+        }
+        if (/livraison|délai|transport/.test(lowerText)) {
+            return { reponse: responses.livraison };
+        }
+        if (/support|aide|contact|assistance/.test(lowerText)) {
+            return { reponse: responses.support };
+        }
+        if (/qui.*créée|youssef|upsp|créateur/.test(lowerText)) {
+            return { reponse: responses.creator };
         }
         if (/merci|thanks/.test(lowerText)) {
             return { reponse: responses.merci };
-        }
-        if (/support|aide|contact|assistance|problème|SOS/.test(lowerText)) {
-            return { reponse: responses.support };
-        }
-        if (/qui.*créée|youssef|upsp|créateur|qui t'a fait/.test(lowerText)) {
-            return { reponse: responses.creator };
-        }
-        if (/à quoi tu sers|rôle|utilite|pourquoi/.test(lowerText)) {
-            return { reponse: responses.purpose };
         }
         
         return { reponse: responses.default };
@@ -883,9 +838,10 @@ FORMAT DE RÉPONSE (JSON uniquement):
         const model = this.getAvailableTextModel();
         
         if (!model) {
+            const supportLink = Utils.getSupportLink();
             return {
                 intention: "quota_exhausted",
-                reponse: null
+                reponse: `⏳ Désolé, mes modèles sont épuisés ! Réessaie dans 1h ou contacte le support: ${supportLink}`
             };
         }
 
@@ -921,7 +877,10 @@ FORMAT DE RÉPONSE (JSON uniquement):
                     return this.comprendre(message, historique, orderContext);
                 } else {
                     this.markQuotaExhausted('fallback');
-                    return { intention: "quota_exhausted", reponse: null };
+                    return {
+                        intention: "quota_exhausted",
+                        reponse: "⏳ Modèles épuisés. Réessaie dans 1h !"
+                    };
                 }
             }
             
@@ -1040,8 +999,8 @@ class ConversationManager {
     async init() {
         await this.fuse.initialize();
         this.smartCache = new SmartCacheManager(this.fuse);
-        this.degradedMode = new DegradedModeService(this.fuse, this.orders, this.whatsapp);
-        log('info', '🚀 MARIAM IA prête avec système de commande et mode dégradé');
+        this.degradedMode = new DegradedModeService(this.fuse, this.whatsapp);
+        log('info', '🚀 MARIAM IA prête avec système de commande');
         
         setInterval(() => this.checkRelance(), 60 * 1000);
     }
@@ -1132,12 +1091,6 @@ class ConversationManager {
                     content: text,
                     timestamp: Date.now()
                 });
-                
-                // Extraire le nom s'il est donné
-                const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)|je suis\s+(.+)/i);
-                if (nameMatch) {
-                    conv.client_nom = nameMatch[1] || nameMatch[2] || nameMatch[3];
-                }
             }
 
             conv.relanceEnvoyee = false;
@@ -1180,28 +1133,15 @@ class ConversationManager {
             }
 
             if (text) {
-                // Vérifier si commande en cours
-                const order = this.orders.getOrder(phone);
-                
-                if (order) {
-                    await this.handleOrderProcess(phone, text, order, conv);
-                    return;
-                }
-                
-                // Vérifier si en attente de confirmation recap
                 if (conv.etape === 'recap' && ['1', '2', '3'].includes(text.trim())) {
                     await this.handleRecapResponse(phone, text.trim(), conv);
                     return;
                 }
+
+                const order = this.orders.getOrder(phone);
                 
-                // Vérifier si en attente d'avis
-                if (conv.etape === 'avis_note') {
-                    await this.handleAvis(phone, text, conv);
-                    return;
-                }
-                
-                if (conv.etape === 'avis_commentaire') {
-                    await this.handleAvis(phone, text, conv);
+                if (order) {
+                    await this.handleOrderProcess(phone, text, order, conv);
                     return;
                 }
 
@@ -1216,6 +1156,12 @@ class ConversationManager {
                     
                     await this.whatsapp.sendMessage(phone, result.reponse);
                     
+                    // Sauvegarder le nom du client s'il a été donné
+                    if (text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i)) {
+                        const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i);
+                        conv.client_nom = nameMatch[1] || nameMatch[2];
+                    }
+                    
                     conv.historique.push({ 
                         role: "assistant", 
                         content: result.reponse, 
@@ -1227,7 +1173,7 @@ class ConversationManager {
                     return;
                 }
 
-                // Essayer le cache simple
+                // Mode normal avec LLM
                 const cachedResponse = await this.smartCache.generateSimpleResponse({ text, messageId }, phone);
                 if (cachedResponse) {
                     await this.whatsapp.sendMessage(phone, cachedResponse);
@@ -1236,14 +1182,10 @@ class ConversationManager {
                     return;
                 }
 
-                // Utiliser le LLM
                 const comprehension = await this.llm.comprendre(text, conv.historique, order);
                 
                 if (comprehension.intention === "quota_exhausted") {
-                    // Fallback vers mode dégradé
-                    const result = await this.degradedMode.processQuery(phone, text, conv);
-                    await this.whatsapp.sendMessage(phone, result.reponse);
-                    conv.historique.push({ role: "assistant", content: result.reponse, timestamp: Date.now() });
+                    await this.whatsapp.sendMessage(phone, comprehension.reponse);
                     return;
                 }
 
@@ -1258,8 +1200,6 @@ class ConversationManager {
                         if (results.length > 0) {
                             const reponse = await this.llm.integrerResultats(results, text, conv.historique);
                             await this.whatsapp.sendMessage(phone, reponse.reponse || reponse);
-                        } else {
-                            await this.whatsapp.sendMessage(phone, comprehension.reponse);
                         }
                     } else {
                         await this.whatsapp.sendMessage(phone, comprehension.reponse);
@@ -1467,31 +1407,6 @@ class ConversationManager {
                 break;
         }
     }
-
-    async handleAvis(phone, text, conv) {
-        if (conv.etape === 'avis_note') {
-            if (!isNaN(text) && parseInt(text) >= 1 && parseInt(text) <= 5) {
-                conv.avis_note = parseInt(text);
-                conv.etape = 'avis_commentaire';
-                await this.whatsapp.sendMessage(phone, 
-                    "Merci ! Un commentaire à ajouter ? (ou réponds 'non')");
-            } else {
-                await this.whatsapp.sendMessage(phone, "Donne une note entre 1 et 5 ⭐");
-            }
-        } 
-        else if (conv.etape === 'avis_commentaire') {
-            const commentaire = text.toLowerCase() === 'non' ? '' : text;
-            
-            await this.orders.saveAvis(phone, conv.avis_note, commentaire);
-            
-            await this.whatsapp.sendMessage(phone, 
-                "🙏 Merci pour ton retour ! Ça aide à m'améliorer.\n\nÀ très bientôt sur MARIAM ! 💊");
-            
-            this.orders.orders.delete(phone);
-            conv.orderInProgress = false;
-            conv.etape = null;
-        }
-    }
 }
 
 // ===========================================
@@ -1628,7 +1543,7 @@ app.get('/health', async (req, res) => {
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
         db: 'checking',
-        llm_available: bot.llm.getAvailableTextModel() !== null
+        llm_available: bot.llm.getAvailableTextModel() ? true : false
     };
 
     try {
@@ -1676,12 +1591,12 @@ async function start() {
 ║   📱 Envoi automatique au support                         ║
 ║   ⭐ Collecte d'avis après chaque commande                ║
 ║   ⏰ Relance automatique après 10min d'inactivité         ║
-║   🔄 MODE DÉGRADÉ : LLM indisponible → Fuse only         ║
+║   ⚠️ Mode dégradé quand LLM indisponible                  ║
 ║                                                           ║
 ║   💬 Llama 3.3 70B (texte principal)                     ║
 ║   💬 Llama 3 70B (texte secours)                         ║
 ║   📸 Llama 4 Scout 17B (vision)                          ║
-║   🔍 Fuse.js (recherche floue + mode dégradé)            ║
+║   🔍 Fuse.js (recherche floue)                           ║
 ║   📦 Smart Cache (80-90% réduction appels LLM)           ║
 ║   ⏱️ Gestion automatique des quotas + fallback 1h        ║
 ║                                                           ║
@@ -1695,7 +1610,7 @@ async function start() {
             log('info', '🚀 MARIAM IA est opérationnelle');
             log('info', '📦 Système de commande intelligent actif');
             log('info', '⏰ Relance automatique après 10min');
-            log('info', '🔄 Mode dégradé prêt (Fuse.js)');
+            log('info', '⚠️ Mode dégradé prêt en cas d\'indisponibilité LLM');
         });
     } catch (error) {
         log('error', `Fatal: ${error.message}`);

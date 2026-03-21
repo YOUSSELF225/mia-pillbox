@@ -126,14 +126,14 @@ class Utils {
     }
 
     static getSupportLink() {
-        const phone = SUPPORT_PHONE.replace('+', '');
-        return `https://wa.me/${phone}`;
+        const phone = SUPPORT_PHONE.startsWith('+') ? SUPPORT_PHONE : `+${SUPPORT_PHONE}`;
+        return `https://wa.me/${phone.replace('+', '')}`;
     }
 
     static getOrderLink() {
-        const phone = SUPPORT_PHONE.replace('+', '');
+        const phone = SUPPORT_PHONE.startsWith('+') ? SUPPORT_PHONE : `+${SUPPORT_PHONE}`;
         const message = encodeURIComponent("L'IA Mariam m'a dit pour commander de vous contacter");
-        return `https://wa.me/${phone}?text=${message}`;
+        return `https://wa.me/${phone.replace('+', '')}?text=${message}`;
     }
 
     static formatOrderMessage(medicaments) {
@@ -149,13 +149,18 @@ class Utils {
         }
         
         message += `\n📦 Livraison à San Pedro uniquement : ${delivery.price}F (${delivery.period}), délai ${delivery.time}min 🚚`;
-        message += `\n\n💊 Pour commander, contacte le support :\n${orderLink}`;
+        message += `\n\n💊 Pour commander, clique ici :\n${orderLink}`;
         
         return message;
     }
 
     static formatNotFoundMessage(medicamentName) {
         return `Désolé, je n'ai pas trouvé "${medicamentName}" dans ma base. 💊\n\nPeux-tu vérifier l'orthographe ou envoyer une photo de l'emballage ? 📸`;
+    }
+
+    static getWelcomeMessage() {
+        const delivery = this.getDeliveryPrice();
+        return `Salut ! 👋\n\nJe suis MARIAM, ton IA santé à San Pedro 💊\n\n🔍 Je cherche tes médicaments\n💰 Prix transparents\n🚚 Livraison rapide (${delivery.price}F, ${delivery.time}min)\n\nQu'est-ce qu'il te faut aujourd'hui ?`;
     }
 }
 
@@ -182,7 +187,7 @@ class WhatsAppService {
 
     async sendMessage(to, text) {
         try {
-            if (!text) text = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊";
+            if (!text) text = Utils.getWelcomeMessage();
             const safeText = text.substring(0, 4096);
             await axios.post(WHATSAPP_API_URL, {
                 messaging_product: 'whatsapp',
@@ -444,7 +449,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊\n\nJe cherche tes médicaments et je les livre. Qu'est-ce qu'il te faut ?"
+                reponse: Utils.getWelcomeMessage()
             };
         }
         
@@ -478,7 +483,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "support",
                 medicament: null,
-                reponse: `Pour commander, contacte le support 📲\n\n${orderLink}\n\nRéponse rapide !`
+                reponse: `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}\n\nRéponse rapide !`
             };
         }
         
@@ -554,14 +559,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             
         } catch (error) {
             log('error', `Intégration error: ${error.message}`);
-            let reponse = "Voici ce que j'ai trouvé ! 💊\n\n";
-            resultats.forEach((med, idx) => {
-                reponse += `${idx+1}. ${med.nom_commercial} : ${med.prix}F\n`;
-            });
-            reponse += "\n📦 Livraison à San Pedro uniquement : " + Utils.getDeliveryPrice().price + "F";
-            reponse += "\n\n💊 Pour commander, contacte le support : " + Utils.getOrderLink();
-            
-            return { reponse };
+            return { reponse: Utils.formatOrderMessage(resultats) };
         }
     }
 }
@@ -587,7 +585,8 @@ class ConversationManager {
         if (!this.conversations.has(phone)) {
             this.conversations.set(phone, {
                 historique: [],
-                derniereActivite: Date.now()
+                derniereActivite: Date.now(),
+                firstMessage: true
             });
         }
         return this.conversations.get(phone);
@@ -602,6 +601,23 @@ class ConversationManager {
 
         try {
             await this.whatsapp.sendTyping(phone);
+
+            if (conv.firstMessage) {
+                conv.firstMessage = false;
+                const welcomeMsg = Utils.getWelcomeMessage();
+                await this.whatsapp.sendMessage(phone, welcomeMsg);
+                
+                conv.historique.push({
+                    role: "assistant",
+                    content: welcomeMsg,
+                    timestamp: Date.now()
+                });
+                
+                if (!text && !mediaId) {
+                    conv.derniereActivite = Date.now();
+                    return;
+                }
+            }
 
             if (text) {
                 conv.historique.push({
@@ -702,7 +718,7 @@ class ConversationManager {
                 else if (comprehension.intention === "support" || 
                          text.toLowerCase().match(/commander|comment commander|support/)) {
                     const orderLink = Utils.getOrderLink();
-                    const reponse = `Pour commander, contacte le support 📲\n\n${orderLink}\n\nRéponse rapide !`;
+                    const reponse = `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}\n\nRéponse rapide !`;
                     await this.whatsapp.sendMessage(phone, reponse);
                     
                     conv.historique.push({

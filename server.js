@@ -300,8 +300,7 @@ class OrderManager {
 
     createOrder(phone) {
         const order = {
-            phone,
-            client_phone: phone,
+            phone: phone,
             code: Utils.generateOrderCode(),
             status: 'en_cours',
             step: 'medicaments',
@@ -369,11 +368,21 @@ class OrderManager {
                     indications, status, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
                 [
-                    order.code, order.phone, order.client.nom, order.client.quartier,
-                    order.client.age, order.client.taille, order.client.poids,
-                    order.client.telephone_joindre, order.client.telephone_whatsapp,
-                    JSON.stringify(order.medicaments), order.total, order.frais_livraison,
-                    order.indications, order.status, new Date(order.created_at)
+                    order.code, 
+                    order.phone,
+                    order.client.nom || null,
+                    order.client.quartier || null,
+                    order.client.age || null,
+                    order.client.taille || null,
+                    order.client.poids || null,
+                    order.client.telephone_joindre || null,
+                    order.client.telephone_whatsapp || null,
+                    JSON.stringify(order.medicaments),
+                    order.total || 0,
+                    order.frais_livraison || 0,
+                    order.indications || null,
+                    order.status,
+                    new Date(order.created_at)
                 ]
             );
             log('info', `Commande ${order.code} sauvegardée en DB`);
@@ -1407,30 +1416,14 @@ class ConversationManager {
 // INITIALISATION BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
-    // Vérifier et recréer la table orders si nécessaire
+    // Supprimer les anciennes tables si elles existent avec la mauvaise structure
     try {
-        const tableExists = await pool.query(`
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'orders'
-            );
-        `);
-        
-        if (tableExists.rows[0].exists) {
-            const columnExists = await pool.query(`
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_name = 'orders' AND column_name = 'code'
-                );
-            `);
-            
-            if (!columnExists.rows[0].exists) {
-                await pool.query(`DROP TABLE IF EXISTS orders CASCADE;`);
-                log('info', 'Ancienne table orders supprimée');
-            }
-        }
+        await pool.query(`DROP TABLE IF EXISTS orders CASCADE;`);
+        await pool.query(`DROP TABLE IF EXISTS avis CASCADE;`);
+        await pool.query(`DROP TABLE IF EXISTS queries_log CASCADE;`);
+        log('info', 'Anciennes tables supprimées');
     } catch (error) {
-        log('info', 'Vérification table orders');
+        log('info', 'Aucune ancienne table trouvée');
     }
 
     // Table medicaments
@@ -1445,7 +1438,7 @@ async function initDatabase() {
         );
     `);
 
-    // Table orders
+    // Table orders - structure correcte
     await pool.query(`
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,

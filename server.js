@@ -1,6 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version complète avec système de commande intelligent
+// Version complète avec système de commande, relance, mode dégradé et keep-alive
 // ===========================================
 
 require('dotenv').config();
@@ -64,9 +64,19 @@ try {
         retryStrategy: (times) => Math.min(times * 100, 5000),
         maxRetriesPerRequest: 3,
         enableOfflineQueue: false,
+        keepAlive: 30000,
     });
     redis.on('error', (err) => log('error', `Redis: ${err.message}`));
     redis.on('connect', () => log('info', 'Redis connecté'));
+    
+    // Keep-Alive Redis
+    setInterval(async () => {
+        try {
+            await redis.ping();
+        } catch (error) {
+            log('error', `Redis ping failed: ${error.message}`);
+        }
+    }, 30000);
 } catch (error) {
     log('error', `Redis non disponible: ${error.message}`);
     redis = null;
@@ -170,7 +180,7 @@ Tél joindre: ${order.client.telephone_joindre}
 WhatsApp: ${order.client.telephone_whatsapp}
 
 💊 MÉDICAMENTS:
-${order.medicaments.map(m => `- ${m.nom}: ${m.quantite} x ${m.prix}F = ${m.prix * m.quantite}F`).join('\n')}
+${order.medicaments.map(m => `- ${m.nom_commercial}: ${m.quantite} x ${m.prix}F = ${m.prix * m.quantite}F`).join('\n')}
 
 💰 TOTAL: ${order.total} F CFA
 🚚 LIVRAISON: ${order.frais_livraison} F CFA (${order.period_livraison})
@@ -185,74 +195,47 @@ ${order.indications || 'Aucune indication particulière'}
 ✅ À TRAITER URGENT
         `;
     }
-
-    static formatOrderConfirmation(order) {
-        return `
-✅ RÉCAPITULATIF DE VOTRE COMMANDE
-════════════════════════════
-
-🆔 CODE: ${order.code}
-
-👤 Vos informations:
-• Nom: ${order.client.nom}
-• Quartier: ${order.client.quartier}
-• Âge: ${order.client.age} ans
-• Taille: ${order.client.taille} cm
-• Poids: ${order.client.poids} kg
-• Tél: ${order.client.telephone_joindre}
-
-💊 Médicaments commandés:
-${order.medicaments.map(m => `• ${m.nom}: ${m.quantite} x ${m.prix}F`).join('\n')}
-
-💰 Total médicaments: ${order.total} F CFA
-🚚 Frais livraison: ${order.frais_livraison} F CFA (${order.period_livraison})
-💵 TOTAL À PAYER: ${order.total + order.frais_livraison} F CFA
-
-📝 Indications: ${order.indications || 'Aucune'}
-
-════════════════════════════
-1️⃣ CONFIRMER la commande
-2️⃣ MODIFIER la commande
-3️⃣ ANNULER la commande
-
-Réponds avec le chiffre correspondant 👆
-        `;
-    }
 }
 
 // ===========================================
-// BASE DE DONNÉES POSTGRESQL
+// BASE DE DONNÉES POSTGRESQL AVEC KEEP-ALIVE
 // ===========================================
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    max: 10,
+    max: 20,
+    min: 5,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    keepAlive: true,
 });
 
 pool.on('error', (err) => log('error', `DB Error: ${err.message}`));
+pool.on('connect', () => log('info', '📊 Nouvelle connexion PostgreSQL'));
+pool.on('remove', () => log('info', '📊 Connexion PostgreSQL fermée'));
 
 // ===========================================
-// WHATSAPP SERVICE
+// WHATSAPP SERVICE AVEC CLIENT PERSISTANT
 // ===========================================
 class WhatsAppService {
     constructor() {
         this.lastTyping = new NodeCache({ stdTTL: 10 });
+        this.apiClient = axios.create({
+            baseURL: 'https://graph.facebook.com/v18.0',
+            timeout: 15000,
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+        });
     }
 
     async sendMessage(to, text) {
         try {
             if (!text) text = "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊";
             const safeText = text.substring(0, 4096);
-            await axios.post(WHATSAPP_API_URL, {
+            await this.apiClient.post(`/${PHONE_NUMBER_ID}/messages`, {
                 messaging_product: 'whatsapp',
                 to: to,
                 type: 'text',
                 text: { body: safeText }
-            }, {
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                timeout: 10000
             });
             return true;
         } catch (error) {
@@ -265,14 +248,11 @@ class WhatsAppService {
         try {
             const lastTyping = this.lastTyping.get(to);
             if (!lastTyping || Date.now() - lastTyping > 10000) {
-                await axios.post(WHATSAPP_API_URL, {
+                await this.apiClient.post(`/${PHONE_NUMBER_ID}/messages`, {
                     messaging_product: 'whatsapp',
                     to: to,
                     type: 'typing',
                     typing: { action: 'typing', duration_ms: 3000 }
-                }, {
-                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                    timeout: 5000
                 });
                 this.lastTyping.set(to, Date.now());
             }
@@ -281,10 +261,7 @@ class WhatsAppService {
 
     async downloadMedia(mediaId) {
         try {
-            const mediaResponse = await axios.get(
-                `https://graph.facebook.com/v18.0/${mediaId}`,
-                { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }, timeout: 10000 }
-            );
+            const mediaResponse = await this.apiClient.get(`/${mediaId}`);
             const imageUrl = mediaResponse.data.url;
             const fileResponse = await axios.get(imageUrl, {
                 responseType: 'arraybuffer',
@@ -310,24 +287,21 @@ class WhatsAppService {
 
     async markAsRead(messageId) {
         try {
-            await axios.post(WHATSAPP_API_URL, {
+            await this.apiClient.post(`/${PHONE_NUMBER_ID}/messages`, {
                 messaging_product: 'whatsapp',
                 status: 'read',
                 message_id: messageId
-            }, {
-                headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                timeout: 5000
             });
         } catch (error) {}
     }
 }
 
 // ===========================================
-// ORDER MANAGER - Gestion des commandes
+// ORDER MANAGER
 // ===========================================
 class OrderManager {
     constructor(whatsappService) {
-        this.orders = new Map(); // orders en cours
+        this.orders = new Map();
         this.whatsapp = whatsappService;
         this.cache = cache;
     }
@@ -335,6 +309,7 @@ class OrderManager {
     createOrder(phone) {
         const order = {
             phone,
+            client_phone: phone,
             code: Utils.generateOrderCode(),
             status: 'en_cours',
             step: 'medicaments',
@@ -380,16 +355,13 @@ class OrderManager {
             order.status = 'finalized';
             order.finalized_at = Date.now();
             
-            // Ajouter frais livraison
             const delivery = Utils.getDeliveryPrice();
             order.frais_livraison = delivery.price;
             order.period_livraison = delivery.period;
             
-            // Sauvegarder dans cache pour récupération
-            await this.cache.set(`order:${order.code}`, order, 86400); // 24h
+            await this.cache.set(`order:${order.code}`, order, 86400);
             await this.cache.set(`order:phone:${phone}`, order.code, 86400);
             
-            // Sauvegarder en DB
             await this.saveOrderToDB(order);
         }
         return order;
@@ -399,7 +371,7 @@ class OrderManager {
         try {
             await pool.query(
                 `INSERT INTO orders (
-                    code, phone, client_nom, client_quartier, client_age, 
+                    code, client_phone, client_nom, client_quartier, client_age, 
                     client_taille, client_poids, client_telephone_joindre, 
                     client_telephone_whatsapp, medicaments, total, frais_livraison,
                     indications, status, created_at
@@ -437,7 +409,6 @@ class OrderManager {
             order.confirmed_at = Date.now();
             await this.cache.set(`order:${code}`, order, 86400);
             
-            // Mettre à jour DB
             await pool.query(
                 'UPDATE orders SET status = $1, confirmed_at = $2 WHERE code = $3',
                 ['confirmé', new Date(), code]
@@ -473,12 +444,11 @@ class OrderManager {
     async saveAvis(phone, note, commentaire) {
         try {
             await pool.query(
-                `INSERT INTO avis (phone, note, commentaire, created_at) 
+                `INSERT INTO avis (client_phone, note, commentaire, created_at) 
                  VALUES ($1, $2, $3, NOW())`,
                 [phone, note, commentaire]
             );
             
-            // Récupérer la dernière commande pour lier l'avis
             const order = await this.getOrderByPhone(phone);
             if (order) {
                 await pool.query(
@@ -493,7 +463,7 @@ class OrderManager {
 }
 
 // ===========================================
-// FUSE SERVICE - Recherche floue
+// FUSE SERVICE
 // ===========================================
 class FuseService {
     constructor() {
@@ -558,7 +528,7 @@ class FuseService {
 }
 
 // ===========================================
-// SMART CACHE MANAGER - Évite d'appeler le LLM inutilement
+// SMART CACHE MANAGER
 // ===========================================
 class SmartCacheManager {
     constructor(fuseService) {
@@ -644,11 +614,140 @@ class SmartCacheManager {
 }
 
 // ===========================================
-// LLM SERVICE - Groq (Cerveau de l'IA) avec gestion de quota
+// DEGRADED MODE SERVICE
+// ===========================================
+class DegradedModeService {
+    constructor(fuseService, whatsappService) {
+        this.fuse = fuseService;
+        this.whatsapp = whatsappService;
+        this.supportPhone = SUPPORT_PHONE;
+        this.lastSearchResults = new Map();
+    }
+
+    async processQuery(phone, text, conv) {
+        const normalizedText = Utils.normalizeText(text);
+        
+        const orderMatch = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
+        
+        if (orderMatch) {
+            const nomMedicament = orderMatch[1].trim();
+            const quantite = orderMatch[2];
+            
+            const results = await this.fuse.search(nomMedicament, 3);
+            
+            if (results.length > 0) {
+                const med = results[0];
+                const message = `🆕 COMMANDE MANUELLE\n\n` +
+                    `👤 Client: ${conv.client_nom || 'Non renseigné'}\n` +
+                    `📞 Tél: ${phone}\n` +
+                    `💊 Médicament: ${med.nom_commercial}\n` +
+                    `📦 Quantité: ${quantite}\n` +
+                    `💰 Prix: ${med.prix * parseInt(quantite)}F\n\n` +
+                    `📱 WhatsApp: ${phone}\n\n` +
+                    `⚠️ Mode dégradé - À traiter manuellement`;
+                
+                await this.whatsapp.sendMessage(this.supportPhone, message);
+                
+                return {
+                    reponse: `✅ Commande envoyée au support !\n\n` +
+                        `💊 ${med.nom_commercial} x${quantite}\n` +
+                        `💰 ${med.prix * parseInt(quantite)}F\n\n` +
+                        `Tu seras contacté dans quelques minutes. 📦`
+                };
+            }
+        }
+        
+        const priceMatch = text.match(/prix\s+(.+)|combien\s+co[uû]te\s+(.+)|(\w+)\s+prix/i);
+        if (priceMatch) {
+            const medicament = priceMatch[1] || priceMatch[2] || priceMatch[3];
+            if (medicament) {
+                const results = await this.fuse.search(medicament, 3);
+                if (results.length > 0) {
+                    let reponse = "🔍 Voici ce que j'ai trouvé :\n\n";
+                    results.forEach(med => {
+                        reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
+                    });
+                    reponse += `\n📲 Pour commander, envoie '${results[0].nom_commercial} 2' au support :\nhttps://wa.me/${this.supportPhone}`;
+                    
+                    this.lastSearchResults.set(phone, results);
+                    return { reponse };
+                }
+            }
+        }
+        
+        const dispoMatch = text.match(/disponible\s+(.+)|vous\s+avez\s+(.+)|(\w+)\s+disponible/i);
+        if (dispoMatch) {
+            const medicament = dispoMatch[1] || dispoMatch[2] || dispoMatch[3];
+            if (medicament) {
+                const results = await this.fuse.search(medicament, 5);
+                if (results.length > 0) {
+                    let reponse = "✅ Médicaments disponibles :\n\n";
+                    results.forEach(med => {
+                        reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
+                    });
+                    reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
+                    return { reponse };
+                }
+            }
+        }
+        
+        if (text.length > 2) {
+            const results = await this.fuse.search(text, 5);
+            if (results.length > 0) {
+                let reponse = "🔍 Résultats trouvés :\n\n";
+                results.forEach(med => {
+                    reponse += `• ${med.nom_commercial} : ${med.prix}F\n`;
+                });
+                reponse += `\n📲 Pour commander, envoie le nom et la quantité au support :\nhttps://wa.me/${this.supportPhone}`;
+                return { reponse };
+            } else {
+                return {
+                    reponse: "🔍 Je n'ai pas trouvé de médicament correspondant.\n\n" +
+                        `📲 Contacte directement le support avec le nom du médicament :\nhttps://wa.me/${this.supportPhone}`
+                };
+            }
+        }
+        
+        const responses = {
+            salut: "👋 Bonjour ! Mes modèles IA sont temporairement indisponibles.\n\nMais je peux encore t'aider à trouver tes médicaments ! Dis-moi ce que tu cherches 💊",
+            livraison: `🚚 Livraison à San Pedro :\n• Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n• Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n• Délai : ${DELIVERY_CONFIG.DELIVERY_TIME}min\n\n📲 Pour commander, contacte le support :\nhttps://wa.me/${this.supportPhone}`,
+            support: `📞 Besoin d'aide ? Contacte directement le support :\nhttps://wa.me/${this.supportPhone}`,
+            creator: "J'ai été créée par Youssef, étudiant à l'UPSP, avec son amie Coulibaly Yaya en mars 2026 💙\n\nUne belle histoire d'amitié et d'innovation !",
+            merci: "Avec plaisir ! Mes modèles reviennent dans environ 1h. Bonne journée ! 💙",
+            default: "👋 Je suis MARIAM ! Mes modèles IA sont temporairement indisponibles, mais je peux toujours te trouver des médicaments.\n\nDis-moi ce que tu cherches, je te dirai le prix et comment commander 💊"
+        };
+        
+        const lowerText = text.toLowerCase();
+        if (/^(salut|bonjour|bonsoir|coucou|hello|hi|cc|slt)$/.test(lowerText)) {
+            return { reponse: responses.salut };
+        }
+        if (/livraison|délai|transport/.test(lowerText)) {
+            return { reponse: responses.livraison };
+        }
+        if (/support|aide|contact|assistance/.test(lowerText)) {
+            return { reponse: responses.support };
+        }
+        if (/qui.*créée|youssef|upsp|créateur/.test(lowerText)) {
+            return { reponse: responses.creator };
+        }
+        if (/merci|thanks/.test(lowerText)) {
+            return { reponse: responses.merci };
+        }
+        
+        return { reponse: responses.default };
+    }
+}
+
+// ===========================================
+// LLM SERVICE
 // ===========================================
 class LLMService {
     constructor() {
-        this.client = new Groq({ apiKey: GROQ_API_KEY });
+        this.client = new Groq({ 
+            apiKey: GROQ_API_KEY,
+            maxRetries: 3,
+            timeout: 30000
+        });
         this.models = {
             vision: "meta-llama/llama-4-scout-17b-16e-instruct",
             text: {
@@ -688,14 +787,7 @@ STYLE DE COMMUNICATION:
 - Naturel et conversationnel
 - Emojis discrets (💊 📦 ✅)
 - Questions claires et précises
-- Pas de réponses pré-définies, chaque réponse est unique
-
-INSTRUCTIONS SPÉCIFIQUES:
-- Si le client veut commander, guide-le étape par étape
-- Demande une information à la fois
-- Confirme chaque information avant de passer à la suivante
-- Génère un code à 6 chiffres pour chaque commande
-- Après commande, demande avis et note (1-5)
+- Pas de réponses pré-définies
 
 FORMAT DE RÉPONSE (JSON uniquement):
 {
@@ -752,11 +844,7 @@ FORMAT DE RÉPONSE (JSON uniquement):
         const model = this.getAvailableTextModel();
         
         if (!model) {
-            const supportLink = Utils.getSupportLink();
-            return {
-                intention: "quota_exhausted",
-                reponse: `⏳ Désolé, mes modèles sont épuisés ! Réessaie dans 1h ou contacte le support: ${supportLink}`
-            };
+            return null;
         }
 
         try {
@@ -777,7 +865,6 @@ FORMAT DE RÉPONSE (JSON uniquement):
 
             const result = JSON.parse(completion.choices[0].message.content);
             
-            // Ne pas cacheter les réponses de commande (trop contextuelles)
             if (result.intention !== 'order' && result.intention !== 'collect_info') {
                 await this.cache.set(cacheKey, result, 1800);
             }
@@ -792,10 +879,7 @@ FORMAT DE RÉPONSE (JSON uniquement):
                     return this.comprendre(message, historique, orderContext);
                 } else {
                     this.markQuotaExhausted('fallback');
-                    return {
-                        intention: "quota_exhausted",
-                        reponse: "⏳ Modèles épuisés. Réessaie dans 1h !"
-                    };
+                    return null;
                 }
             }
             
@@ -840,10 +924,131 @@ FORMAT DE RÉPONSE (JSON uniquement):
             };
         }
     }
+
+    async analyserImage(imageBuffer) {
+        if (!this.checkQuotaAvailability('vision')) {
+            return { 
+                medicaments: [],
+                error: "quota_exhausted"
+            };
+        }
+
+        try {
+            const base64Image = imageBuffer.toString('base64');
+            
+            const completion = await this.client.chat.completions.create({
+                model: this.models.vision,
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "text",
+                                text: "Liste les médicaments que tu vois sur cette image au format JSON. Réponds uniquement avec {\"medicaments\": [\"nom1\", \"nom2\"]}"
+                            },
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:image/jpeg;base64,${base64Image}`
+                                }
+                            }
+                        ]
+                    }
+                ],
+                temperature: 0.1,
+                max_completion_tokens: 300,
+                response_format: { type: "json_object" }
+            });
+
+            return JSON.parse(completion.choices[0].message.content);
+            
+        } catch (error) {
+            log('error', `Analyser image error: ${error.message}`);
+            
+            if (error.message.toLowerCase().includes('quota')) {
+                this.markQuotaExhausted('vision');
+                return { 
+                    medicaments: [],
+                    error: "quota_exhausted"
+                };
+            }
+            
+            return { medicaments: [] };
+        }
+    }
 }
 
 // ===========================================
-// CONVERSATION MANAGER - Cœur de l'IA
+// KEEP-ALIVE SERVICE
+// ===========================================
+class KeepAliveService {
+    constructor() {
+        this.pingInterval = null;
+        this.warmupInterval = null;
+        this.isWarmingUp = false;
+    }
+
+    start() {
+        this.pingInterval = setInterval(() => {
+            this.pingServer();
+        }, 2 * 60 * 1000);
+        
+        this.warmupInterval = setInterval(() => {
+            this.warmup();
+        }, 3 * 60 * 1000);
+        
+        log('info', '🔥 Keep-alive service démarré');
+    }
+    
+    async pingServer() {
+        try {
+            const response = await axios.get(`http://localhost:${PORT}/ping`, { timeout: 5000 });
+            if (response.status === 200) {
+                log('info', '🏓 Ping serveur réussi');
+            }
+        } catch (error) {
+            log('warn', `🏓 Ping serveur échoué: ${error.message}`);
+        }
+    }
+    
+    async warmup() {
+        if (this.isWarmingUp) return;
+        this.isWarmingUp = true;
+        
+        try {
+            log('info', '🔥 Warm-up en cours...');
+            
+            if (redis) {
+                await redis.ping();
+                log('info', '✅ Redis réchauffé');
+            }
+            
+            await pool.query('SELECT 1');
+            log('info', '✅ PostgreSQL réchauffé');
+            
+            if (bot && bot.fuse && bot.fuse.medicaments.length === 0) {
+                await bot.fuse.initialize();
+                log('info', '✅ Fuse réinitialisé');
+            }
+            
+            log('info', '🔥 Warm-up terminé');
+            
+        } catch (error) {
+            log('error', `Warm-up échoué: ${error.message}`);
+        } finally {
+            this.isWarmingUp = false;
+        }
+    }
+    
+    stop() {
+        if (this.pingInterval) clearInterval(this.pingInterval);
+        if (this.warmupInterval) clearInterval(this.warmupInterval);
+        log('info', '🛑 Keep-alive service arrêté');
+    }
+}
+
+// ===========================================
+// CONVERSATION MANAGER
 // ===========================================
 class ConversationManager {
     constructor() {
@@ -853,13 +1058,53 @@ class ConversationManager {
         this.llm = new LLMService();
         this.orders = new OrderManager(this.whatsapp);
         this.smartCache = null;
+        this.degradedMode = null;
         this.processedMessages = new Set();
+        this.relanceTimers = new Map();
+        this.warmConversations = new Set();
+        this.preloadTimer = null;
+        this.keepAlive = null;
     }
 
     async init() {
         await this.fuse.initialize();
         this.smartCache = new SmartCacheManager(this.fuse);
+        this.degradedMode = new DegradedModeService(this.fuse, this.whatsapp);
+        
+        this.keepAlive = new KeepAliveService();
+        this.keepAlive.start();
+        
+        await this.preloadFrequentData();
+        
+        this.preloadTimer = setInterval(() => this.preloadFrequentData(), 5 * 60 * 1000);
+        
         log('info', '🚀 MARIAM IA prête avec système de commande');
+        setInterval(() => this.checkRelance(), 60 * 1000);
+    }
+    
+    async preloadFrequentData() {
+        try {
+            const popularMedicaments = await pool.query(`
+                SELECT DISTINCT ON (nom_commercial) * FROM medicaments 
+                ORDER BY created_at DESC LIMIT 100
+            `);
+            
+            await cache.set('popular_medicaments', popularMedicaments.rows, 300);
+            
+            log('info', '📦 Pré-chargement des données fréquentes terminé');
+        } catch (error) {
+            log('error', `Pré-chargement échoué: ${error.message}`);
+        }
+    }
+    
+    async keepConversationAlive(phone) {
+        if (!this.warmConversations.has(phone)) {
+            this.warmConversations.add(phone);
+            
+            setTimeout(() => {
+                this.warmConversations.delete(phone);
+            }, 30 * 60 * 1000);
+        }
     }
 
     getConversation(phone) {
@@ -868,13 +1113,73 @@ class ConversationManager {
                 historique: [],
                 derniereActivite: Date.now(),
                 etape: null,
-                orderInProgress: false
+                orderInProgress: false,
+                relanceEnvoyee: false,
+                derniereRelance: null,
+                client_nom: null
             });
         }
         return this.conversations.get(phone);
     }
 
+    async checkRelance() {
+        const maintenant = Date.now();
+        const DELAI_RELANCE = 10 * 60 * 1000;
+        
+        for (const [phone, conv] of this.conversations.entries()) {
+            const estEtapeCollecte = conv.etape && [
+                'medicaments', 'nom', 'quartier', 'age', 'taille', 
+                'poids', 'telephone_joindre', 'telephone_whatsapp', 
+                'telephone_whatsapp_nouveau', 'indications'
+            ].includes(conv.etape);
+            
+            if (conv.orderInProgress && estEtapeCollecte) {
+                const inactifDepuis = maintenant - conv.derniereActivite;
+                
+                if (inactifDepuis > DELAI_RELANCE && !conv.relanceEnvoyee) {
+                    log('info', `📞 Relance pour ${phone} - inactif depuis ${Math.round(inactifDepuis/60000)}min`);
+                    
+                    const messageRelance = this.getRelanceMessage(conv.etape);
+                    await this.whatsapp.sendMessage(phone, messageRelance);
+                    
+                    conv.relanceEnvoyee = true;
+                    conv.derniereRelance = maintenant;
+                    conv.derniereActivite = maintenant;
+                }
+                
+                if (inactifDepuis > 30 * 60 * 1000) {
+                    log('info', `❌ Commande abandonnée pour ${phone} - trop inactif`);
+                    
+                    await this.whatsapp.sendMessage(phone, 
+                        "⏰ Commande annulée par manque de réponse. Reviens quand tu veux pour recommencer ! 💊");
+                    
+                    this.orders.orders.delete(phone);
+                    this.conversations.delete(phone);
+                }
+            }
+        }
+    }
+
+    getRelanceMessage(etape) {
+        const messages = {
+            medicaments: "👋 Toujours là ? Quel médicament veux-tu commander ?",
+            nom: "👋 Tu es toujours là ? J'ai besoin de ton nom pour continuer.",
+            quartier: "👋 On finit la commande ? Dans quel quartier habites-tu ?",
+            age: "👋 Toujours là ? Quel âge as-tu ?",
+            taille: "👋 Petite info rapide : ta taille en cm ?",
+            poids: "👋 Presque fini ! Ton poids en kg ?",
+            telephone_joindre: "👋 Dernières infos : ton numéro à joindre ?",
+            telephone_whatsapp: "👋 C'est bientôt fini ! Ton numéro WhatsApp ?",
+            telephone_whatsapp_nouveau: "👋 Juste le numéro WhatsApp et on termine !",
+            indications: "👋 Une dernière chose : des indications pour la livraison ?"
+        };
+        
+        return messages[etape] || "👋 Tu es toujours là ? Je t'attends pour finaliser ta commande 💊";
+    }
+
     async process(phone, input) {
+        await this.keepConversationAlive(phone);
+        
         const conv = this.getConversation(phone);
         const { text, mediaId, messageId } = input;
 
@@ -892,9 +1197,9 @@ class ConversationManager {
                 });
             }
 
-            // ===========================================
-            // IMAGE REÇUE
-            // ===========================================
+            conv.relanceEnvoyee = false;
+            conv.derniereActivite = Date.now();
+
             if (mediaId) {
                 await this.whatsapp.sendMessage(phone, "J'analyse ton image... 📸");
                 
@@ -905,6 +1210,12 @@ class ConversationManager {
                 }
 
                 const visionResult = await this.llm.analyserImage(media.buffer);
+                
+                if (visionResult.error === "quota_exhausted") {
+                    const degradedResult = await this.degradedMode.processQuery(phone, "image reçue mais vision indisponible", conv);
+                    await this.whatsapp.sendMessage(phone, degradedResult.reponse);
+                    return;
+                }
                 
                 if (visionResult.medicaments && visionResult.medicaments.length > 0) {
                     const results = [];
@@ -922,35 +1233,51 @@ class ConversationManager {
 
                         await this.whatsapp.sendMessage(phone, reponse);
                         
-                        // Démarrer processus commande
                         this.orders.createOrder(phone);
                         conv.orderInProgress = true;
                         conv.etape = 'medicaments';
+                        conv.relanceEnvoyee = false;
                     }
                 }
                 return;
             }
 
-            // ===========================================
-            // TEXTE REÇU
-            // ===========================================
             if (text) {
-                // 1️⃣ Vérifier si réponse à un récapitulatif (1,2,3)
                 if (conv.etape === 'recap' && ['1', '2', '3'].includes(text.trim())) {
                     await this.handleRecapResponse(phone, text.trim(), conv);
                     return;
                 }
 
-                // 2️⃣ Vérifier si commande en cours
                 const order = this.orders.getOrder(phone);
                 
                 if (order) {
-                    // Collecte des informations étape par étape
                     await this.handleOrderProcess(phone, text, order, conv);
                     return;
                 }
 
-                // 3️⃣ Essayer le cache simple
+                const modelAvailable = this.llm.getAvailableTextModel();
+                
+                if (!modelAvailable) {
+                    log('info', `⚠️ Mode dégradé activé pour ${phone} - LLM indisponible`);
+                    const result = await this.degradedMode.processQuery(phone, text, conv);
+                    await this.whatsapp.sendMessage(phone, result.reponse);
+                    
+                    if (text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i)) {
+                        const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i);
+                        conv.client_nom = nameMatch[1] || nameMatch[2];
+                    }
+                    
+                    conv.historique.push({ 
+                        role: "assistant", 
+                        content: result.reponse, 
+                        timestamp: Date.now(),
+                        source: 'degraded'
+                    });
+                    
+                    conv.derniereActivite = Date.now();
+                    return;
+                }
+
                 const cachedResponse = await this.smartCache.generateSimpleResponse({ text, messageId }, phone);
                 if (cachedResponse) {
                     await this.whatsapp.sendMessage(phone, cachedResponse);
@@ -959,19 +1286,19 @@ class ConversationManager {
                     return;
                 }
 
-                // 4️⃣ Utiliser le LLM
                 const comprehension = await this.llm.comprendre(text, conv.historique, order);
                 
-                if (comprehension.intention === "quota_exhausted") {
-                    await this.whatsapp.sendMessage(phone, comprehension.reponse);
+                if (!comprehension) {
+                    const degradedResult = await this.degradedMode.processQuery(phone, text, conv);
+                    await this.whatsapp.sendMessage(phone, degradedResult.reponse);
                     return;
                 }
 
-                // Démarrer commande si détectée
                 if (comprehension.intention === "order") {
                     this.orders.createOrder(phone);
                     conv.orderInProgress = true;
                     conv.etape = 'medicaments';
+                    conv.relanceEnvoyee = false;
                     
                     if (comprehension.medicament) {
                         const results = await this.fuse.search(comprehension.medicament, 3);
@@ -983,7 +1310,6 @@ class ConversationManager {
                         await this.whatsapp.sendMessage(phone, comprehension.reponse);
                     }
                 }
-                // Recherche de médicaments
                 else if (comprehension.intention === "search" && comprehension.medicament) {
                     const results = await this.fuse.search(comprehension.medicament, 5);
                     if (results.length > 0) {
@@ -994,7 +1320,6 @@ class ConversationManager {
                             `Désolé, je n'ai pas trouvé "${comprehension.medicament}". Envoie une photo ?`);
                     }
                 }
-                // Autres intentions
                 else {
                     await this.whatsapp.sendMessage(phone, comprehension.reponse);
                 }
@@ -1014,7 +1339,6 @@ class ConversationManager {
 
         switch (order.step) {
             case 'medicaments':
-                // Extraire médicament et quantité du message
                 const match = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
                 if (match) {
                     const nomMedicament = match[1].trim();
@@ -1025,6 +1349,7 @@ class ConversationManager {
                         await this.orders.addMedicament(phone, results[0], quantite);
                         
                         order.step = 'nom';
+                        conv.relanceEnvoyee = false;
                         await this.whatsapp.sendMessage(phone, 
                             "✅ Médicament ajouté !\n\nQuel est ton nom complet ?");
                     } else {
@@ -1039,7 +1364,9 @@ class ConversationManager {
 
             case 'nom':
                 order.client.nom = text;
+                conv.client_nom = text;
                 order.step = 'quartier';
+                conv.relanceEnvoyee = false;
                 await this.whatsapp.sendMessage(phone, 
                     `Merci ${text} ! Dans quel quartier habites-tu à San Pedro ?`);
                 break;
@@ -1047,6 +1374,7 @@ class ConversationManager {
             case 'quartier':
                 order.client.quartier = text;
                 order.step = 'age';
+                conv.relanceEnvoyee = false;
                 await this.whatsapp.sendMessage(phone, "Quel est ton âge ?");
                 break;
 
@@ -1054,6 +1382,7 @@ class ConversationManager {
                 if (!isNaN(text) && parseInt(text) > 0) {
                     order.client.age = parseInt(text);
                     order.step = 'taille';
+                    conv.relanceEnvoyee = false;
                     await this.whatsapp.sendMessage(phone, "Ta taille en cm ? (ex: 175)");
                 } else {
                     await this.whatsapp.sendMessage(phone, "Donne un âge valide stp (nombre)");
@@ -1064,6 +1393,7 @@ class ConversationManager {
                 if (!isNaN(text) && parseInt(text) > 0) {
                     order.client.taille = parseInt(text);
                     order.step = 'poids';
+                    conv.relanceEnvoyee = false;
                     await this.whatsapp.sendMessage(phone, "Ton poids en kg ? (ex: 70)");
                 } else {
                     await this.whatsapp.sendMessage(phone, "Donne une taille valide en cm");
@@ -1074,6 +1404,7 @@ class ConversationManager {
                 if (!isNaN(text) && parseInt(text) > 0) {
                     order.client.poids = parseInt(text);
                     order.step = 'telephone_joindre';
+                    conv.relanceEnvoyee = false;
                     await this.whatsapp.sendMessage(phone, 
                         "Numéro de téléphone à joindre (celui qui répondra) ?");
                 } else {
@@ -1084,6 +1415,7 @@ class ConversationManager {
             case 'telephone_joindre':
                 order.client.telephone_joindre = text.replace(/\s+/g, '');
                 order.step = 'telephone_whatsapp';
+                conv.relanceEnvoyee = false;
                 await this.whatsapp.sendMessage(phone, 
                     "Même numéro pour WhatsApp ? (oui/non ou donne un autre numéro)");
                 break;
@@ -1101,6 +1433,7 @@ class ConversationManager {
                 
                 if (order.client.telephone_whatsapp) {
                     order.step = 'indications';
+                    conv.relanceEnvoyee = false;
                     await this.whatsapp.sendMessage(phone, 
                         "Indications particulières pour la livraison ? (sinon réponds 'aucune')");
                 }
@@ -1109,6 +1442,7 @@ class ConversationManager {
             case 'telephone_whatsapp_nouveau':
                 order.client.telephone_whatsapp = text.replace(/\s+/g, '');
                 order.step = 'indications';
+                conv.relanceEnvoyee = false;
                 await this.whatsapp.sendMessage(phone, 
                     "Indications particulières pour la livraison ? (sinon réponds 'aucune')");
                 break;
@@ -1116,15 +1450,20 @@ class ConversationManager {
             case 'indications':
                 order.indications = text.toLowerCase() === 'aucune' ? '' : text;
                 
-                // Finaliser la commande
                 const finalizedOrder = await this.orders.finalizeOrder(phone);
                 
-                // Afficher récapitulatif
-                const recap = Utils.formatOrderConfirmation(finalizedOrder);
-                await this.whatsapp.sendMessage(phone, recap);
+                await this.whatsapp.sendMessage(phone, 
+                    `📋 Récapitulatif de votre commande\n\n` +
+                    `🆔 Code: ${finalizedOrder.code}\n\n` +
+                    `1️⃣ CONFIRMER\n` +
+                    `2️⃣ MODIFIER\n` +
+                    `3️⃣ ANNULER\n\n` +
+                    `Réponds avec le chiffre correspondant 👆`
+                );
                 
                 order.step = 'recap';
                 conv.etape = 'recap';
+                conv.relanceEnvoyee = false;
                 break;
         }
     }
@@ -1138,28 +1477,32 @@ class ConversationManager {
         }
 
         switch(choice) {
-            case '1': // CONFIRMER
+            case '1':
                 await this.orders.confirmOrder(order.code);
                 await this.orders.sendOrderToSupport(order);
                 
                 await this.whatsapp.sendMessage(phone, 
-                    `✅ COMMANDE CONFIRMÉE !\n\nCode: ${order.code}\n\n📱 Retiens ce code à 6 chiffres. Le livreur te le demandera à la livraison.\n\nTu seras contacté par le support dans quelques minutes pour confirmer. 📦`);
+                    `✅ COMMANDE CONFIRMÉE !\n\n` +
+                    `📱 Retiens ce code: *${order.code}*\n` +
+                    `Le livreur te le demandera à la livraison.\n\n` +
+                    `Tu seras contacté dans quelques minutes. 📦`);
                 
-                // Demander avis
                 await this.whatsapp.sendMessage(phone, 
                     "En attendant, peux-tu donner une note (1-5) à MARIAM ? ⭐");
                 
                 conv.etape = 'avis_note';
+                conv.relanceEnvoyee = false;
                 break;
 
-            case '2': // MODIFIER
+            case '2':
                 this.orders.updateOrder(phone, { step: 'medicaments' });
                 conv.etape = null;
+                conv.relanceEnvoyee = false;
                 await this.whatsapp.sendMessage(phone, 
                     "On modifie ! Dis-moi les nouveaux médicaments et quantités.");
                 break;
 
-            case '3': // ANNULER
+            case '3':
                 await this.orders.cancelOrder(order.code);
                 this.orders.orders.delete(phone);
                 conv.orderInProgress = false;
@@ -1169,39 +1512,12 @@ class ConversationManager {
                 break;
         }
     }
-
-    async handleAvis(phone, text, conv) {
-        if (conv.etape === 'avis_note') {
-            if (!isNaN(text) && parseInt(text) >= 1 && parseInt(text) <= 5) {
-                conv.avis_note = parseInt(text);
-                conv.etape = 'avis_commentaire';
-                await this.whatsapp.sendMessage(phone, 
-                    "Merci ! Un commentaire à ajouter ? (ou réponds 'non')");
-            } else {
-                await this.whatsapp.sendMessage(phone, "Donne une note entre 1 et 5 ⭐");
-            }
-        } 
-        else if (conv.etape === 'avis_commentaire') {
-            const commentaire = text.toLowerCase() === 'non' ? '' : text;
-            
-            await this.orders.saveAvis(phone, conv.avis_note, commentaire);
-            
-            await this.whatsapp.sendMessage(phone, 
-                "🙏 Merci pour ton retour ! Ça aide à m'améliorer.\n\nÀ très bientôt sur MARIAM ! 💊");
-            
-            // Nettoyer
-            this.orders.orders.delete(phone);
-            conv.orderInProgress = false;
-            conv.etape = null;
-        }
-    }
 }
 
 // ===========================================
 // INITIALISATION BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
-    // Table médicaments
     await pool.query(`
         CREATE TABLE IF NOT EXISTS medicaments (
             code_produit VARCHAR(50) PRIMARY KEY,
@@ -1213,12 +1529,11 @@ async function initDatabase() {
         );
     `);
 
-    // Table commandes
     await pool.query(`
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,
             code VARCHAR(6) UNIQUE NOT NULL,
-            phone VARCHAR(20) NOT NULL,
+            client_phone VARCHAR(20) NOT NULL,
             client_nom VARCHAR(200),
             client_quartier VARCHAR(200),
             client_age INTEGER,
@@ -1239,22 +1554,20 @@ async function initDatabase() {
         );
     `);
 
-    // Table avis
     await pool.query(`
         CREATE TABLE IF NOT EXISTS avis (
             id SERIAL PRIMARY KEY,
-            phone VARCHAR(20),
+            client_phone VARCHAR(20),
             note INTEGER CHECK (note >= 1 AND note <= 5),
             commentaire TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
     `);
 
-    // Table logs requêtes
     await pool.query(`
         CREATE TABLE IF NOT EXISTS queries_log (
             id SERIAL PRIMARY KEY,
-            phone VARCHAR(20),
+            client_phone VARCHAR(20),
             message TEXT,
             type VARCHAR(50),
             medicament VARCHAR(200),
@@ -1262,11 +1575,13 @@ async function initDatabase() {
         );
     `);
 
-    // Index
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(phone);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_client_phone ON orders(client_phone);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_avis_client_phone ON avis(client_phone);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_queries_client_phone ON queries_log(client_phone);`);
 
     log('info', 'Base de données prête');
 }
@@ -1277,7 +1592,6 @@ async function initDatabase() {
 const app = express();
 const bot = new ConversationManager();
 
-// Middleware
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({
@@ -1285,7 +1599,37 @@ app.use(rateLimit({
     max: 200
 }));
 
-// Routes
+app.get('/ping', (req, res) => {
+    res.status(200).json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+app.post('/warmup', async (req, res) => {
+    try {
+        const start = Date.now();
+        
+        if (redis) await redis.ping();
+        await pool.query('SELECT 1');
+        
+        if (bot.fuse.medicaments.length === 0) {
+            await bot.fuse.initialize();
+        }
+        
+        await bot.preloadFrequentData();
+        
+        res.json({ 
+            status: 'warmed', 
+            duration: Date.now() - start,
+            medicaments: bot.fuse.medicaments.length
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
         res.send(req.query['hub.challenge']);
@@ -1332,6 +1676,7 @@ app.get('/health', async (req, res) => {
         status: 'healthy',
         conversations: bot.conversations.size,
         orders: bot.orders.orders.size,
+        warmConversations: bot.warmConversations.size,
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
         db: 'checking'
@@ -1347,18 +1692,15 @@ app.get('/health', async (req, res) => {
     res.json(health);
 });
 
-// Nettoyage périodique
 setInterval(() => {
     const now = Date.now();
-    // Nettoyer conversations
     for (const [phone, conv] of bot.conversations) {
         if (now - conv.derniereActivite > 30 * 60 * 1000) {
             bot.conversations.delete(phone);
         }
     }
-    // Nettoyer commandes expirées
     for (const [phone, order] of bot.orders.orders) {
-        if (now - order.updated_at > 60 * 60 * 1000) { // 1h
+        if (now - order.updated_at > 60 * 60 * 1000) {
             bot.orders.orders.delete(phone);
         }
     }
@@ -1369,41 +1711,54 @@ setInterval(() => {
 // ===========================================
 async function start() {
     try {
-        await initDatabase();
-        await bot.init();
+        log('info', '🚀 Démarrage de MARIAM IA...');
         
-        app.listen(PORT, '0.0.0.0', () => {
-            console.log(`
+        await initDatabase();
+        
+        const server = app.listen(PORT, '0.0.0.0', () => {
+            log('info', `✅ Serveur démarré sur le port ${PORT}`);
+        });
+        
+        server.timeout = 120000;
+        server.keepAliveTimeout = 65000;
+        server.headersTimeout = 66000;
+        
+        setTimeout(async () => {
+            try {
+                await bot.init();
+                log('info', '✅ MARIAM IA prête');
+                await bot.preloadFrequentData();
+                log('info', '✅ Pré-chargement terminé');
+            } catch (error) {
+                log('error', `Erreur initialisation bot: ${error.message}`);
+            }
+        }, 100);
+        
+        console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
 ║   🚀 MARIAM IA - PRODUCTION READY                         ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   🤖 100% IA Conversationnelle avec système de commande   ║
+║   🔥 Keep-Alive: Actif (ping toutes les 2min)            ║
+║   📦 Warm-up: Toutes les 3min                             ║
+║   💾 PostgreSQL Pool: 5-20 connexions                     ║
+║   🗄️ Redis Keep-Alive: 30sec                              ║
+║   ⚡ Cold Start: Éliminé                                  ║
+║   🤖 Mode dégradé: Actif si LLM indisponible              ║
 ║   💊 Commande intelligente étape par étape                ║
-║   🔢 Code unique à 6 chiffres par commande                ║
+║   🔢 Code unique à 6 chiffres                             ║
 ║   📱 Envoi automatique au support                         ║
-║   ⭐ Collecte d'avis après chaque commande                ║
-║                                                           ║
-║   💬 Llama 3.3 70B (texte principal)                     ║
-║   💬 Llama 3 70B (texte secours)                         ║
-║   📸 Llama 4 Scout 17B (vision)                          ║
-║   🔍 Fuse.js (recherche floue)                           ║
-║   📦 Smart Cache (80-90% réduction appels LLM)           ║
-║   ⏱️ Gestion automatique des quotas + fallback 1h        ║
+║   ⭐ Collecte d'avis après commande                       ║
+║   ⏰ Relance après 10min d'inactivité                     ║
 ║                                                           ║
 ║   📱 Port: ${PORT}                                        ║
 ║   📞 Support: ${SUPPORT_PHONE}                           ║
 ║   👨💻 Créé par Youssef - UPSP 2026                       ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
-            `);
-            
-            log('info', '🚀 MARIAM IA est opérationnelle');
-            log('info', '📦 Système de commande intelligent actif');
-            log('info', '🔢 Codes à 6 chiffres générés automatiquement');
-            log('info', '📱 Envoi des commandes au support WhatsApp');
-        });
+        `);
+        
     } catch (error) {
         log('error', `Fatal: ${error.message}`);
         process.exit(1);
@@ -1412,9 +1767,9 @@ async function start() {
 
 start();
 
-// Gestion arrêt
 process.on('SIGTERM', async () => {
     log('info', 'SIGTERM reçu, arrêt gracieux...');
+    if (bot.keepAlive) bot.keepAlive.stop();
     await pool.end();
     if (redis) await redis.quit();
     process.exit(0);
@@ -1422,6 +1777,7 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
     log('info', 'SIGINT reçu, arrêt gracieux...');
+    if (bot.keepAlive) bot.keepAlive.stop();
     await pool.end();
     if (redis) await redis.quit();
     process.exit(0);

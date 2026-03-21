@@ -1,6 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version complète avec système de commande, relance, mode dégradé et keep-alive
+// Version complète avec système de commande, relance, keep-alive et mode dégradé
 // ===========================================
 
 require('dotenv').config();
@@ -69,7 +69,7 @@ try {
     redis.on('error', (err) => log('error', `Redis: ${err.message}`));
     redis.on('connect', () => log('info', 'Redis connecté'));
     
-    // Keep-Alive Redis
+    // Redis keep-alive toutes les 30 secondes
     setInterval(async () => {
         try {
             await redis.ping();
@@ -222,7 +222,7 @@ class WhatsAppService {
         this.lastTyping = new NodeCache({ stdTTL: 10 });
         this.apiClient = axios.create({
             baseURL: 'https://graph.facebook.com/v18.0',
-            timeout: 15000,
+            timeout: 10000,
             headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
         });
     }
@@ -739,6 +739,75 @@ class DegradedModeService {
 }
 
 // ===========================================
+// KEEP-ALIVE & WARM-UP SERVICE
+// ===========================================
+class KeepAliveService {
+    constructor() {
+        this.pingInterval = null;
+        this.warmupInterval = null;
+        this.isWarmingUp = false;
+    }
+
+    start() {
+        this.pingInterval = setInterval(() => {
+            this.pingServer();
+        }, 2 * 60 * 1000);
+        
+        this.warmupInterval = setInterval(() => {
+            this.warmup();
+        }, 3 * 60 * 1000);
+        
+        log('info', '🔥 Keep-alive service démarré');
+    }
+    
+    async pingServer() {
+        try {
+            const response = await axios.get(`http://localhost:${PORT}/ping`, { timeout: 5000 });
+            if (response.status === 200) {
+                log('info', '🏓 Ping serveur réussi');
+            }
+        } catch (error) {
+            log('warn', `🏓 Ping serveur échoué: ${error.message}`);
+        }
+    }
+    
+    async warmup() {
+        if (this.isWarmingUp) return;
+        this.isWarmingUp = true;
+        
+        try {
+            log('info', '🔥 Warm-up en cours...');
+            
+            if (redis) {
+                await redis.ping();
+                log('info', '✅ Redis réchauffé');
+            }
+            
+            await pool.query('SELECT 1');
+            log('info', '✅ PostgreSQL réchauffé');
+            
+            if (bot && bot.fuse && bot.fuse.medicaments.length === 0) {
+                await bot.fuse.initialize();
+                log('info', '✅ Fuse réinitialisé');
+            }
+            
+            log('info', '🔥 Warm-up terminé');
+            
+        } catch (error) {
+            log('error', `Warm-up échoué: ${error.message}`);
+        } finally {
+            this.isWarmingUp = false;
+        }
+    }
+    
+    stop() {
+        if (this.pingInterval) clearInterval(this.pingInterval);
+        if (this.warmupInterval) clearInterval(this.warmupInterval);
+        log('info', '🛑 Keep-alive service arrêté');
+    }
+}
+
+// ===========================================
 // LLM SERVICE
 // ===========================================
 class LLMService {
@@ -844,7 +913,10 @@ FORMAT DE RÉPONSE (JSON uniquement):
         const model = this.getAvailableTextModel();
         
         if (!model) {
-            return null;
+            return {
+                intention: "quota_exhausted",
+                reponse: null
+            };
         }
 
         try {
@@ -879,7 +951,10 @@ FORMAT DE RÉPONSE (JSON uniquement):
                     return this.comprendre(message, historique, orderContext);
                 } else {
                     this.markQuotaExhausted('fallback');
-                    return null;
+                    return {
+                        intention: "quota_exhausted",
+                        reponse: null
+                    };
                 }
             }
             
@@ -979,75 +1054,6 @@ FORMAT DE RÉPONSE (JSON uniquement):
 }
 
 // ===========================================
-// KEEP-ALIVE SERVICE
-// ===========================================
-class KeepAliveService {
-    constructor() {
-        this.pingInterval = null;
-        this.warmupInterval = null;
-        this.isWarmingUp = false;
-    }
-
-    start() {
-        this.pingInterval = setInterval(() => {
-            this.pingServer();
-        }, 2 * 60 * 1000);
-        
-        this.warmupInterval = setInterval(() => {
-            this.warmup();
-        }, 3 * 60 * 1000);
-        
-        log('info', '🔥 Keep-alive service démarré');
-    }
-    
-    async pingServer() {
-        try {
-            const response = await axios.get(`http://localhost:${PORT}/ping`, { timeout: 5000 });
-            if (response.status === 200) {
-                log('info', '🏓 Ping serveur réussi');
-            }
-        } catch (error) {
-            log('warn', `🏓 Ping serveur échoué: ${error.message}`);
-        }
-    }
-    
-    async warmup() {
-        if (this.isWarmingUp) return;
-        this.isWarmingUp = true;
-        
-        try {
-            log('info', '🔥 Warm-up en cours...');
-            
-            if (redis) {
-                await redis.ping();
-                log('info', '✅ Redis réchauffé');
-            }
-            
-            await pool.query('SELECT 1');
-            log('info', '✅ PostgreSQL réchauffé');
-            
-            if (bot && bot.fuse && bot.fuse.medicaments.length === 0) {
-                await bot.fuse.initialize();
-                log('info', '✅ Fuse réinitialisé');
-            }
-            
-            log('info', '🔥 Warm-up terminé');
-            
-        } catch (error) {
-            log('error', `Warm-up échoué: ${error.message}`);
-        } finally {
-            this.isWarmingUp = false;
-        }
-    }
-    
-    stop() {
-        if (this.pingInterval) clearInterval(this.pingInterval);
-        if (this.warmupInterval) clearInterval(this.warmupInterval);
-        log('info', '🛑 Keep-alive service arrêté');
-    }
-}
-
-// ===========================================
 // CONVERSATION MANAGER
 // ===========================================
 class ConversationManager {
@@ -1063,7 +1069,6 @@ class ConversationManager {
         this.relanceTimers = new Map();
         this.warmConversations = new Set();
         this.preloadTimer = null;
-        this.keepAlive = null;
     }
 
     async init() {
@@ -1075,7 +1080,6 @@ class ConversationManager {
         this.keepAlive.start();
         
         await this.preloadFrequentData();
-        
         this.preloadTimer = setInterval(() => this.preloadFrequentData(), 5 * 60 * 1000);
         
         log('info', '🚀 MARIAM IA prête avec système de commande');
@@ -1090,7 +1094,6 @@ class ConversationManager {
             `);
             
             await cache.set('popular_medicaments', popularMedicaments.rows, 300);
-            
             log('info', '📦 Pré-chargement des données fréquentes terminé');
         } catch (error) {
             log('error', `Pré-chargement échoué: ${error.message}`);
@@ -1100,7 +1103,6 @@ class ConversationManager {
     async keepConversationAlive(phone) {
         if (!this.warmConversations.has(phone)) {
             this.warmConversations.add(phone);
-            
             setTimeout(() => {
                 this.warmConversations.delete(phone);
             }, 30 * 60 * 1000);
@@ -1200,6 +1202,31 @@ class ConversationManager {
             conv.relanceEnvoyee = false;
             conv.derniereActivite = Date.now();
 
+            const modelAvailable = this.llm.getAvailableTextModel();
+            
+            if (!modelAvailable && !conv.orderInProgress && !conv.etape) {
+                log('info', `⚠️ Mode dégradé activé pour ${phone} - LLM indisponible`);
+                
+                const result = await this.degradedMode.processQuery(phone, text, conv);
+                
+                await this.whatsapp.sendMessage(phone, result.reponse);
+                
+                if (text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i)) {
+                    const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i);
+                    conv.client_nom = nameMatch[1] || nameMatch[2];
+                }
+                
+                conv.historique.push({ 
+                    role: "assistant", 
+                    content: result.reponse, 
+                    timestamp: Date.now(),
+                    source: 'degraded'
+                });
+                
+                conv.derniereActivite = Date.now();
+                return;
+            }
+
             if (mediaId) {
                 await this.whatsapp.sendMessage(phone, "J'analyse ton image... 📸");
                 
@@ -1212,8 +1239,8 @@ class ConversationManager {
                 const visionResult = await this.llm.analyserImage(media.buffer);
                 
                 if (visionResult.error === "quota_exhausted") {
-                    const degradedResult = await this.degradedMode.processQuery(phone, "image reçue mais vision indisponible", conv);
-                    await this.whatsapp.sendMessage(phone, degradedResult.reponse);
+                    const result = await this.degradedMode.processQuery(phone, "image reçue", conv);
+                    await this.whatsapp.sendMessage(phone, result.reponse);
                     return;
                 }
                 
@@ -1255,29 +1282,6 @@ class ConversationManager {
                     return;
                 }
 
-                const modelAvailable = this.llm.getAvailableTextModel();
-                
-                if (!modelAvailable) {
-                    log('info', `⚠️ Mode dégradé activé pour ${phone} - LLM indisponible`);
-                    const result = await this.degradedMode.processQuery(phone, text, conv);
-                    await this.whatsapp.sendMessage(phone, result.reponse);
-                    
-                    if (text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i)) {
-                        const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i);
-                        conv.client_nom = nameMatch[1] || nameMatch[2];
-                    }
-                    
-                    conv.historique.push({ 
-                        role: "assistant", 
-                        content: result.reponse, 
-                        timestamp: Date.now(),
-                        source: 'degraded'
-                    });
-                    
-                    conv.derniereActivite = Date.now();
-                    return;
-                }
-
                 const cachedResponse = await this.smartCache.generateSimpleResponse({ text, messageId }, phone);
                 if (cachedResponse) {
                     await this.whatsapp.sendMessage(phone, cachedResponse);
@@ -1288,9 +1292,11 @@ class ConversationManager {
 
                 const comprehension = await this.llm.comprendre(text, conv.historique, order);
                 
-                if (!comprehension) {
-                    const degradedResult = await this.degradedMode.processQuery(phone, text, conv);
-                    await this.whatsapp.sendMessage(phone, degradedResult.reponse);
+                if (!comprehension.reponse && comprehension.intention === "quota_exhausted") {
+                    const result = await this.degradedMode.processQuery(phone, text, conv);
+                    await this.whatsapp.sendMessage(phone, result.reponse);
+                    conv.historique.push({ role: "assistant", content: result.reponse, timestamp: Date.now() });
+                    conv.derniereActivite = Date.now();
                     return;
                 }
 
@@ -1607,29 +1613,6 @@ app.get('/ping', (req, res) => {
     });
 });
 
-app.post('/warmup', async (req, res) => {
-    try {
-        const start = Date.now();
-        
-        if (redis) await redis.ping();
-        await pool.query('SELECT 1');
-        
-        if (bot.fuse.medicaments.length === 0) {
-            await bot.fuse.initialize();
-        }
-        
-        await bot.preloadFrequentData();
-        
-        res.json({ 
-            status: 'warmed', 
-            duration: Date.now() - start,
-            medicaments: bot.fuse.medicaments.length
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
 app.get('/webhook', (req, res) => {
     if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
         res.send(req.query['hub.challenge']);
@@ -1676,7 +1659,6 @@ app.get('/health', async (req, res) => {
         status: 'healthy',
         conversations: bot.conversations.size,
         orders: bot.orders.orders.size,
-        warmConversations: bot.warmConversations.size,
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
         db: 'checking'
@@ -1690,6 +1672,29 @@ app.get('/health', async (req, res) => {
     }
 
     res.json(health);
+});
+
+app.post('/warmup', async (req, res) => {
+    try {
+        const start = Date.now();
+        
+        if (redis) await redis.ping();
+        await pool.query('SELECT 1');
+        
+        if (bot.fuse.medicaments.length === 0) {
+            await bot.fuse.initialize();
+        }
+        
+        await bot.preloadFrequentData();
+        
+        res.json({ 
+            status: 'warmed', 
+            duration: Date.now() - start,
+            medicaments: bot.fuse.medicaments.length
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 setInterval(() => {
@@ -1740,17 +1745,21 @@ async function start() {
 ║   🚀 MARIAM IA - PRODUCTION READY                         ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   🔥 Keep-Alive: Actif (ping toutes les 2min)            ║
-║   📦 Warm-up: Toutes les 3min                             ║
-║   💾 PostgreSQL Pool: 5-20 connexions                     ║
-║   🗄️ Redis Keep-Alive: 30sec                              ║
-║   ⚡ Cold Start: Éliminé                                  ║
-║   🤖 Mode dégradé: Actif si LLM indisponible              ║
+║   🤖 IA Conversationnelle avec système de commande        ║
 ║   💊 Commande intelligente étape par étape                ║
 ║   🔢 Code unique à 6 chiffres                             ║
 ║   📱 Envoi automatique au support                         ║
 ║   ⭐ Collecte d'avis après commande                       ║
 ║   ⏰ Relance après 10min d'inactivité                     ║
+║   🔥 Keep-Alive actif (ping toutes les 2min)             ║
+║   📦 Warm-up toutes les 3min                              ║
+║   ⚡ Mode dégradé quand LLM indisponible                  ║
+║                                                           ║
+║   💬 Llama 3.3 70B (texte principal)                     ║
+║   💬 Llama 3 70B (texte secours)                         ║
+║   📸 Llama 4 Scout 17B (vision)                          ║
+║   🔍 Fuse.js (recherche floue)                           ║
+║   📦 Smart Cache (80-90% réduction appels LLM)           ║
 ║                                                           ║
 ║   📱 Port: ${PORT}                                        ║
 ║   📞 Support: ${SUPPORT_PHONE}                           ║
@@ -1769,16 +1778,16 @@ start();
 
 process.on('SIGTERM', async () => {
     log('info', 'SIGTERM reçu, arrêt gracieux...');
-    if (bot.keepAlive) bot.keepAlive.stop();
     await pool.end();
     if (redis) await redis.quit();
+    if (bot.keepAlive) bot.keepAlive.stop();
     process.exit(0);
 });
 
 process.on('SIGINT', async () => {
     log('info', 'SIGINT reçu, arrêt gracieux...');
-    if (bot.keepAlive) bot.keepAlive.stop();
     await pool.end();
     if (redis) await redis.quit();
+    if (bot.keepAlive) bot.keepAlive.stop();
     process.exit(0);
 });

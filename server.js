@@ -15,7 +15,6 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const sharp = require('sharp');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const crypto = require('crypto');
 
 // ===========================================
@@ -618,8 +617,6 @@ class DegradedModeService {
     }
 
     async processQuery(phone, text, conv) {
-        const normalizedText = Utils.normalizeText(text);
-        
         // 1️⃣ Vérifier si c'est une commande (contient médicament + quantité)
         const orderMatch = text.match(/(.+?)\s*[xX*]\s*(\d+)/);
         
@@ -992,8 +989,6 @@ class ConversationManager {
         this.smartCache = null;
         this.degradedMode = null;
         this.processedMessages = new Set();
-        
-        this.relanceTimers = new Map();
     }
 
     async init() {
@@ -1156,7 +1151,6 @@ class ConversationManager {
                     
                     await this.whatsapp.sendMessage(phone, result.reponse);
                     
-                    // Sauvegarder le nom du client s'il a été donné
                     if (text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i)) {
                         const nameMatch = text.match(/mon nom est\s+(.+)|je m'appelle\s+(.+)/i);
                         conv.client_nom = nameMatch[1] || nameMatch[2];
@@ -1413,6 +1407,33 @@ class ConversationManager {
 // INITIALISATION BASE DE DONNÉES
 // ===========================================
 async function initDatabase() {
+    // Vérifier et recréer la table orders si nécessaire
+    try {
+        const tableExists = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'orders'
+            );
+        `);
+        
+        if (tableExists.rows[0].exists) {
+            const columnExists = await pool.query(`
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_name = 'orders' AND column_name = 'code'
+                );
+            `);
+            
+            if (!columnExists.rows[0].exists) {
+                await pool.query(`DROP TABLE IF EXISTS orders CASCADE;`);
+                log('info', 'Ancienne table orders supprimée');
+            }
+        }
+    } catch (error) {
+        log('info', 'Vérification table orders');
+    }
+
+    // Table medicaments
     await pool.query(`
         CREATE TABLE IF NOT EXISTS medicaments (
             code_produit VARCHAR(50) PRIMARY KEY,
@@ -1424,6 +1445,7 @@ async function initDatabase() {
         );
     `);
 
+    // Table orders
     await pool.query(`
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,
@@ -1449,6 +1471,7 @@ async function initDatabase() {
         );
     `);
 
+    // Table avis
     await pool.query(`
         CREATE TABLE IF NOT EXISTS avis (
             id SERIAL PRIMARY KEY,
@@ -1459,6 +1482,7 @@ async function initDatabase() {
         );
     `);
 
+    // Table logs
     await pool.query(`
         CREATE TABLE IF NOT EXISTS queries_log (
             id SERIAL PRIMARY KEY,
@@ -1470,6 +1494,7 @@ async function initDatabase() {
         );
     `);
 
+    // Index
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_nom ON medicaments(nom_commercial);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_medicaments_dci ON medicaments(dci);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_orders_client_phone ON orders(client_phone);`);

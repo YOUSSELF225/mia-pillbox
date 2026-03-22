@@ -1,5 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
+// Version Finale - Mars 2026
 // ===========================================
 
 require('dotenv').config();
@@ -49,7 +50,6 @@ const logger = winston.createLogger({
 
 function log(level, message) {
     logger.log(level, message);
-    console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
 // ===========================================
@@ -117,20 +117,12 @@ class Utils {
 
     static getDeliveryPrice() {
         const hour = new Date().getHours();
-        const isNight = hour >= 0 && hour < 7;
+        const isNight = hour >= 23 || hour < 7;
         return {
             price: isNight ? DELIVERY_CONFIG.PRICES.NIGHT : DELIVERY_CONFIG.PRICES.DAY,
             period: isNight ? 'nuit' : 'jour',
             time: DELIVERY_CONFIG.DELIVERY_TIME
         };
-    }
-
-    static getSupportLink() {
-        let phone = SUPPORT_PHONE.replace(/\D/g, '');
-        if (!phone.startsWith('225')) {
-            phone = '225' + phone;
-        }
-        return `https://wa.me/${phone}`;
     }
 
     static getOrderLink() {
@@ -149,8 +141,8 @@ class Utils {
         let message = "";
         
         if (medicaments && medicaments.length > 0) {
-            medicaments.forEach((med, idx) => {
-                message += `${idx+1}. ${med.nom_commercial} : ${med.prix}F\n`;
+            medicaments.slice(0, 10).forEach((med, idx) => {
+                message += `${idx+1}. ${med.nom_commercial} : ${med.prix.toLocaleString()}F\n`;
             });
         }
         
@@ -180,7 +172,7 @@ class Utils {
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    max: 10,
+    max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
 });
@@ -302,7 +294,7 @@ class FuseService {
                 return;
             }
 
-            const result = await pool.query("SELECT * FROM medicaments");
+            const result = await pool.query("SELECT * FROM medicaments ORDER BY nom_commercial");
             this.medicaments = result.rows;
 
             this.fuse = new Fuse(this.medicaments, {
@@ -321,7 +313,7 @@ class FuseService {
         }
     }
 
-    async search(query, limit = 5) {
+    async search(query, limit = 10) {
         if (!query || query.length < 2) return [];
         
         const cacheKey = `search:${Utils.normalizeText(query)}`;
@@ -360,20 +352,19 @@ class LLMService {
 
     getSystemPrompt() {
         const delivery = Utils.getDeliveryPrice();
-        const supportLink = Utils.getSupportLink();
+        const orderLink = Utils.getOrderLink();
         const creatorMessage = Utils.getCreatorMessage();
         
         return `Tu es MARIAM, une IA santé à San Pedro, Côte d'Ivoire.
 
 STYLE PAYPARROT :
-- Messages courts et clairs (max 3-4 lignes)
+- Messages courts et clairs
 - Emojis discrets (💊 🚚 📲)
-- Options avec tirets
 - Structure: accueil → info → question
 
 CONTEXTE :
 - Livraison: ${delivery.price}F (${delivery.period}), délai: ${delivery.time}min
-- Support: ${supportLink}
+- Lien commande: ${orderLink}
 - Créateur: ${creatorMessage}
 
 FORMAT DE REPONSE (JSON uniquement) :
@@ -383,7 +374,11 @@ FORMAT DE REPONSE (JSON uniquement) :
     "reponse": "ta réponse style PayParrot"
 }
 
-Pour la question "qui t'as créée", réponds avec le message exact du créateur.`;
+RÈGLES IMPORTANTES :
+- Pour "qui es-tu" → dis ton nom MARIAM
+- Pour "à quoi tu sers" → explique ton rôle
+- Pour "comment commander" → donne le lien
+- Reste naturelle et amicale`;
     }
 
     async _handleRateLimit(error) {
@@ -459,27 +454,35 @@ Pour la question "qui t'as créée", réponds avec le message exact du créateur
     _fallbackComprendre(message) {
         const msg = message.toLowerCase();
         
-        if (msg.match(/salut|bonjour|hi|hello|yo/) && message.length < 15) {
+        if (msg.match(/qui es-tu|qui est tu|qui êtes vous|c'est quoi toi|présente-toi/)) {
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: "Salut ! Je suis MARIAM. Comment puis-je t'aider aujourd'hui ? 💊\n\nCherche un médicament ? Demande-moi !"
+                reponse: "Je suis MARIAM ! Ton IA santé à San Pedro 💊\n\nJe t'aide à trouver des médicaments, je te donne les prix, et je te livre rapidement !\n\nQu'est-ce qu'il te faut aujourd'hui ?"
             };
         }
         
-        if (msg.match(/qui t'as crée|qui t'a crée|ton créateur|yousself|qui t'a fait|qui est ton papa|ton père|youssef/)) {
+        if (msg.match(/à quoi tu sers|tu sers à quoi|ton rôle|utilité|tu fais quoi/)) {
+            return {
+                intention: "purpose",
+                medicament: null,
+                reponse: "Mon rôle c'est de t'aider à trouver tes médicaments facilement ! 💊\n\n🔍 Recherche par nom\n💰 Prix transparents\n🚚 Livraison rapide à San Pedro\n\nDonne-moi le nom d'un médicament et je le cherche pour toi !"
+            };
+        }
+        
+        if (msg.match(/salut|bonsoir|bonjour|hi|hello|yo|coucou/)) {
+            return {
+                intention: "greet",
+                medicament: null,
+                reponse: "Salut ! Je suis MARIAM 💊\n\nTu cherches un médicament ? Donne-moi le nom, je te trouve les prix et la livraison !"
+            };
+        }
+        
+        if (msg.match(/qui t'as crée|qui t'a crée|ton créateur|yousself|qui t'a fait/)) {
             return {
                 intention: "creator",
                 medicament: null,
                 reponse: Utils.getCreatorMessage()
-            };
-        }
-        
-        if (msg.match(/à quoi tu sers|tu fais quoi|utilité|ton rôle/)) {
-            return {
-                intention: "purpose",
-                medicament: null,
-                reponse: "Je t'aide à trouver des médicaments à San Pedro ! 💊\n\n- Recherche par nom\n- Prix transparents\n- Livraison rapide\n\nBesoin d'un médicament ? Donne-moi le nom !"
             };
         }
         
@@ -488,7 +491,7 @@ Pour la question "qui t'as créée", réponds avec le message exact du créateur
             return {
                 intention: "delivery",
                 medicament: null,
-                reponse: `Livraison à San Pedro uniquement :\n\n- Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n- Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n- Délai : ${DELIVERY_CONFIG.DELIVERY_TIME} min 🚚`
+                reponse: `Livraison à San Pedro uniquement :\n\n- Jour (7h-23h) : ${DELIVERY_CONFIG.PRICES.DAY}F\n- Nuit (23h-7h) : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n- Délai : ${DELIVERY_CONFIG.DELIVERY_TIME} min 🚚`
             };
         }
         
@@ -497,17 +500,25 @@ Pour la question "qui t'as créée", réponds avec le message exact du créateur
             return {
                 intention: "support",
                 medicament: null,
-                reponse: `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}\n\nRéponse rapide !`
+                reponse: `Pour commander, c'est simple ! 📲\n\n1. Dis-moi le médicament que tu veux\n2. Je te donne les prix\n3. Clique sur le lien :\n${orderLink}\n\nLe support te répondra rapidement !`
             };
         }
         
-        const words = message.split(' ');
-        const potentialMed = words.find(w => w.length > 3);
+        const words = message.split(/[\s,]+/);
+        const potentialMeds = words.filter(w => w.length > 3 && !w.match(/et|le|la|les|de|du|des|pour|dans|avec/i));
+        
+        if (potentialMeds.length > 0) {
+            return {
+                intention: "search",
+                medicament: message,
+                reponse: `Je cherche "${message}" pour toi ! 🔍`
+            };
+        }
         
         return {
-            intention: "search",
-            medicament: potentialMed || null,
-            reponse: "Je cherche ça pour toi ! 🔍\n\nDonne-moi le nom exact du médicament ou envoie une photo de l'emballage 📸"
+            intention: "unknown",
+            medicament: null,
+            reponse: "Je n'ai pas bien compris. Dis-moi le nom d'un médicament ou demande-moi de l'aide ! 💊"
         };
     }
 
@@ -524,7 +535,7 @@ Pour la question "qui t'as créée", réponds avec le message exact du créateur
                             content: [
                                 {
                                     type: "text",
-                                    text: "Liste les médicaments que tu vois sur cette image au format JSON. Réponds uniquement avec {\"medicaments\": [\"nom1\", \"nom2\"]}"
+                                    text: "Liste les médicaments que tu vois sur cette image. Réponds uniquement avec {\"medicaments\": [\"nom1\", \"nom2\"]}"
                                 },
                                 {
                                     type: "image_url",
@@ -549,33 +560,6 @@ Pour la question "qui t'as créée", réponds avec le message exact du créateur
             return { medicaments: [] };
         }
     }
-
-    async integrerResultats(resultats, question, historique) {
-        try {
-            const result = await this._executeWithRetry(async () => {
-                const completion = await this.client.chat.completions.create({
-                    model: this.models.text,
-                    messages: [
-                        { role: "system", content: this.getSystemPrompt() },
-                        { 
-                            role: "user", 
-                            content: `Résultats de recherche: ${JSON.stringify(resultats)}\nQuestion: "${question}"\nHistorique: ${JSON.stringify(historique.slice(-3))}\n\nGénère une réponse naturelle style PayParrot.` 
-                        }
-                    ],
-                    temperature: 0.7,
-                    max_completion_tokens: 200,
-                    response_format: { type: "json_object" }
-                });
-                return JSON.parse(completion.choices[0].message.content);
-            });
-            
-            return result;
-            
-        } catch (error) {
-            log('error', `Intégration error: ${error.message}`);
-            return { reponse: Utils.formatOrderMessage(resultats) };
-        }
-    }
 }
 
 // ===========================================
@@ -587,7 +571,6 @@ class ConversationManager {
         this.whatsapp = new WhatsAppService();
         this.fuse = new FuseService();
         this.llm = new LLMService();
-        this.processedMessages = new Set();
     }
 
     async init() {
@@ -600,7 +583,6 @@ class ConversationManager {
             this.conversations.set(phone, {
                 historique: [],
                 derniereActivite: Date.now(),
-                firstMessage: true,
                 welcomeSent: false
             });
         }
@@ -611,18 +593,17 @@ class ConversationManager {
         const conv = this.getConversation(phone);
         const { text, mediaId, messageId } = input;
 
-        if (this.processedMessages.has(messageId)) return;
-        this.processedMessages.add(messageId);
+        if (processedMessages.has(messageId)) return;
+        processedMessages.set(messageId, true);
 
         try {
             await this.whatsapp.sendTyping(phone);
 
-            if (conv.firstMessage && !conv.welcomeSent && !text && !mediaId) {
-                conv.firstMessage = false;
+            // Envoyer message de bienvenue une seule fois
+            if (!conv.welcomeSent && !text && !mediaId) {
                 conv.welcomeSent = true;
                 const welcomeMsg = Utils.getWelcomeMessage();
                 await this.whatsapp.sendMessage(phone, welcomeMsg);
-                
                 conv.historique.push({
                     role: "assistant",
                     content: welcomeMsg,
@@ -630,11 +611,6 @@ class ConversationManager {
                 });
                 conv.derniereActivite = Date.now();
                 return;
-            }
-
-            if (conv.firstMessage) {
-                conv.firstMessage = false;
-                conv.welcomeSent = true;
             }
 
             if (text) {
@@ -660,33 +636,37 @@ class ConversationManager {
                 const visionResult = await this.llm.analyserImage(media.buffer);
                 
                 if (visionResult.medicaments && visionResult.medicaments.length > 0) {
-                    const results = [];
+                    const allResults = [];
                     for (const med of visionResult.medicaments) {
-                        const searchResults = await this.fuse.search(med, 1);
-                        if (searchResults.length > 0) {
-                            results.push(searchResults[0]);
+                        const results = await this.fuse.search(med, 3);
+                        allResults.push(...results);
+                    }
+                    
+                    const uniqueResults = [];
+                    const seen = new Set();
+                    for (const med of allResults) {
+                        if (!seen.has(med.code_produit)) {
+                            seen.add(med.code_produit);
+                            uniqueResults.push(med);
                         }
                     }
 
-                    if (results.length > 0) {
+                    if (uniqueResults.length > 0) {
                         const reponse = "Médicaments détectés ! 📸\n\n" + 
-                            Utils.formatOrderMessage(results);
-                        
+                            Utils.formatOrderMessage(uniqueResults);
                         await this.whatsapp.sendMessage(phone, reponse);
-                        
                         conv.historique.push({
                             role: "assistant",
                             content: reponse,
                             timestamp: Date.now()
                         });
                     } else {
-                        const firstMed = visionResult.medicaments[0];
                         await this.whatsapp.sendMessage(phone, 
-                            Utils.formatNotFoundMessage(firstMed));
+                            Utils.formatNotFoundMessage(visionResult.medicaments[0]));
                     }
                 } else {
                     await this.whatsapp.sendMessage(phone, 
-                        "Je ne vois pas de médicament clairement sur cette image. Envoie le nom par texte stp !");
+                        "Je ne vois pas de médicament clairement. Envoie le nom par texte stp !");
                 }
                 
                 conv.derniereActivite = Date.now();
@@ -697,15 +677,54 @@ class ConversationManager {
             // CAS 2: TEXTE REÇU
             // ===========================================
             if (text) {
+                // Détecter les recherches multiples (séparées par "et", ",", "&")
+                const multipleMatch = text.match(/(.+?)\s+(et|,|&)\s+(.+)/i);
+                let searchTerms = [];
+                
+                if (multipleMatch) {
+                    const words = text.split(/[\s,]+/);
+                    searchTerms = words.filter(w => w.length > 3 && !w.match(/et|le|la|les|de|du|des|pour|dans|avec/i));
+                }
+                
+                if (searchTerms.length > 1) {
+                    let allResults = [];
+                    for (const term of searchTerms) {
+                        const results = await this.fuse.search(term, 3);
+                        allResults.push(...results);
+                    }
+                    
+                    const uniqueResults = [];
+                    const seen = new Set();
+                    for (const med of allResults) {
+                        if (!seen.has(med.code_produit)) {
+                            seen.add(med.code_produit);
+                            uniqueResults.push(med);
+                        }
+                    }
+                    
+                    if (uniqueResults.length > 0) {
+                        const reponse = "J'ai trouvé ces médicaments ! 💊\n\n" + 
+                            Utils.formatOrderMessage(uniqueResults);
+                        await this.whatsapp.sendMessage(phone, reponse);
+                        conv.historique.push({
+                            role: "assistant",
+                            content: reponse,
+                            timestamp: Date.now()
+                        });
+                        conv.derniereActivite = Date.now();
+                        return;
+                    }
+                }
+                
+                // Recherche simple ou autre intention
                 const comprehension = await this.llm.comprendre(text, conv.historique);
                 
                 if (comprehension.intention === "search" && comprehension.medicament) {
-                    const results = await this.fuse.search(comprehension.medicament, 5);
+                    const results = await this.fuse.search(comprehension.medicament, 10);
                     
                     if (results.length > 0) {
                         const reponse = Utils.formatOrderMessage(results);
                         await this.whatsapp.sendMessage(phone, reponse);
-                        
                         conv.historique.push({
                             role: "assistant",
                             content: reponse,
@@ -714,7 +733,6 @@ class ConversationManager {
                     } else {
                         const reponse = Utils.formatNotFoundMessage(comprehension.medicament);
                         await this.whatsapp.sendMessage(phone, reponse);
-                        
                         conv.historique.push({
                             role: "assistant",
                             content: reponse,
@@ -722,52 +740,12 @@ class ConversationManager {
                         });
                     }
                 } 
-                else if (comprehension.intention === "delivery") {
-                    const delivery = Utils.getDeliveryPrice();
-                    const reponse = `Livraison à San Pedro uniquement :\n\n- Jour : ${DELIVERY_CONFIG.PRICES.DAY}F\n- Nuit : ${DELIVERY_CONFIG.PRICES.NIGHT}F\n- Délai : ${DELIVERY_CONFIG.DELIVERY_TIME} min 🚚`;
-                    await this.whatsapp.sendMessage(phone, reponse);
-                    
-                    conv.historique.push({
-                        role: "assistant",
-                        content: reponse,
-                        timestamp: Date.now()
-                    });
-                }
-                else if (comprehension.intention === "support" || 
-                         text.toLowerCase().match(/commander|comment commander|support/)) {
-                    const orderLink = Utils.getOrderLink();
-                    const reponse = `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}\n\nRéponse rapide !`;
-                    await this.whatsapp.sendMessage(phone, reponse);
-                    
-                    conv.historique.push({
-                        role: "assistant",
-                        content: reponse,
-                        timestamp: Date.now()
-                    });
-                }
-                else if (comprehension.intention === "creator") {
-                    const reponse = Utils.getCreatorMessage();
-                    await this.whatsapp.sendMessage(phone, reponse);
-                    
-                    conv.historique.push({
-                        role: "assistant",
-                        content: reponse,
-                        timestamp: Date.now()
-                    });
-                }
                 else {
                     let reponse = comprehension.reponse;
-                    
                     if (!reponse || reponse.trim() === "") {
-                        reponse = "Je n'ai pas bien compris. Peux-tu reformuler ? 💊";
+                        reponse = "Je n'ai pas bien compris. Dis-moi le nom d'un médicament ! 💊";
                     }
-                    
-                    if ((reponse.includes("Je suis MARIAM") || reponse.includes("créée par")) && conv.welcomeSent) {
-                        reponse = "Comment puis-je t'aider ? 💊\n\nCherche un médicament ? Donne-moi le nom !";
-                    }
-                    
                     await this.whatsapp.sendMessage(phone, reponse);
-                    
                     conv.historique.push({
                         role: "assistant",
                         content: reponse,
@@ -908,10 +886,10 @@ async function start() {
             console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
-║   🚀 MARIAM IA - PRODUCTION                              ║
+║   🚀 MARIAM IA - PRODUCTION READY                        ║
 ║   📍 San Pedro, Côte d'Ivoire                             ║
 ║                                                           ║
-║   🤖 100% IA Conversationnelle                            ║
+║   🤖 IA Conversationnelle                                 ║
 ║   💬 Llama 3.3 70B (texte)                               ║
 ║   📸 Llama 4 Scout 17B (vision)                          ║
 ║   🔍 Fuse.js (recherche floue)                           ║

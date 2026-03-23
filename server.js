@@ -374,9 +374,9 @@ TON RÔLE : Aider les gens à trouver des médicaments.
 
 RÈGLES IMPORTANTES :
 - Quand on te demande "comment utiliser", réponds avec les 3 façons
-- Quand on te dit "salut", présente-toi et dis les 3 façons
-- Quand on te demande ton nom, dis "Je suis MARIAM" et rappelle les 3 façons
-- Quand on te demande ce que tu fais, dis que tu cherches des médicaments par texte ou image
+- Quand on te dit "salut", réponds avec une réponse courte sans répéter toute la présentation
+- Quand on te demande ton nom, dis "Je m'appelle MARIAM" et rappelle les 3 façons
+- Ne répète jamais la présentation complète après le premier message
 
 CONTEXTE :
 - Livraison: ${delivery.price}F (${delivery.period}), délai: ${delivery.time}min
@@ -387,7 +387,7 @@ FORMAT DE REPONSE (JSON uniquement) :
 {
     "intention": "greet|search|support|delivery|creator|purpose|unknown",
     "medicament": "nom extrait ou null",
-    "reponse": "ta réponse style PayParrot"
+    "reponse": "ta réponse style PayParrot - courte et utile"
 }`;
     }
 
@@ -468,7 +468,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: "Salut ! Je suis MARIAM, ton IA santé à San Pedro 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance\n\nJe te donne le prix et la disponibilité !"
+                reponse: "Salut ! Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo"
             };
         }
         
@@ -484,7 +484,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: "Je m'appelle MARIAM ! 💊\n\nJe t'aide à trouver tes médicaments à San Pedro :\n- Par texte : donne-moi le nom\n- Par image : envoie une photo\n- Par ordonnance : je lis pour toi\n\nQu'est-ce qu'il te faut ?"
+                reponse: "Je m'appelle MARIAM ! 💊\n\nJe t'aide à trouver tes médicaments à San Pedro.\n\n📝 Envoie le nom\n📸 Envoie une photo\n📋 Envoie une ordonnance"
             };
         }
         
@@ -492,7 +492,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "purpose",
                 medicament: null,
-                reponse: "Je cherche tes médicaments et je te donne les prix ! 💊\n\n3 façons de m'utiliser :\n📝 Envoie le nom\n📸 Envoie une photo du produit\n📋 Envoie une photo de l'ordonnance\n\nEssaie !"
+                reponse: "Je cherche tes médicaments et je te donne les prix ! 💊\n\n3 façons :\n📝 Envoie le nom\n📸 Envoie une photo\n📋 Envoie une ordonnance"
             };
         }
         
@@ -546,7 +546,7 @@ FORMAT DE REPONSE (JSON uniquement) :
         return {
             intention: "unknown",
             medicament: null,
-            reponse: "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance\n\nJe te donne le prix et la disponibilité !"
+            reponse: "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance"
         };
     }
 
@@ -656,6 +656,7 @@ class ConversationManager {
         try {
             await this.whatsapp.sendTyping(phone);
 
+            // Premier message : TOUJOURS la bienvenue
             if (conv.firstMessage && !conv.welcomeSent) {
                 conv.firstMessage = false;
                 conv.welcomeSent = true;
@@ -669,6 +670,7 @@ class ConversationManager {
                     timestamp: Date.now()
                 });
                 
+                // Si l'utilisateur a envoyé du texte avec son premier message
                 if (text) {
                     conv.historique.push({
                         role: "user",
@@ -684,6 +686,7 @@ class ConversationManager {
                 return;
             }
 
+            // Après la bienvenue
             if (text) {
                 conv.historique.push({
                     role: "user",
@@ -706,6 +709,18 @@ class ConversationManager {
 
     async processUserMessage(phone, text, conv) {
         const comprehension = await this.llm.comprendre(text, conv.historique);
+        
+        // Si c'est une intention "greet" après la bienvenue, réponse courte
+        if (comprehension.intention === "greet" && conv.welcomeSent) {
+            const reponse = "Salut ! Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo";
+            await this.whatsapp.sendMessage(phone, reponse);
+            conv.historique.push({
+                role: "assistant",
+                content: reponse,
+                timestamp: Date.now()
+            });
+            return;
+        }
         
         if (comprehension.intention === "search" && comprehension.medicament) {
             let medicamentsToSearch = [];
@@ -795,7 +810,11 @@ class ConversationManager {
             let reponse = comprehension.reponse;
             
             if (!reponse || reponse.trim() === "") {
-                reponse = "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance";
+                reponse = "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo";
+            }
+            
+            if (reponse.includes("Je suis MARIAM") && conv.welcomeSent) {
+                reponse = "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo";
             }
             
             await this.whatsapp.sendMessage(phone, reponse);

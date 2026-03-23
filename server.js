@@ -1,5 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
+// Version: 4.0 - Optimisée pour scale
 // ===========================================
 
 require('dotenv').config();
@@ -14,6 +15,8 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const sharp = require('sharp');
+const helmet = require('helmet');
+const morgan = require('morgan');
 
 // ===========================================
 // CONFIGURATION
@@ -32,24 +35,36 @@ const DELIVERY_CONFIG = {
     DELIVERY_TIME: 45
 };
 
+// Configuration timeouts
+const TIMEOUTS = {
+    WHATSAPP: 10000,
+    MEDIA: 15000,
+    GROQ: 30000,
+    REDIS: 5000
+};
+
 // ===========================================
 // LOGGER
 // ===========================================
 const logger = winston.createLogger({
-    level: 'info',
+    level: process.env.LOG_LEVEL || 'info',
     format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
         winston.format.printf(info => `${info.timestamp} [${info.level.toUpperCase()}] ${info.message}`)
     ),
     transports: [
         new winston.transports.Console(),
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
         new winston.transports.File({ filename: 'combined.log' })
     ]
 });
 
-function log(level, message) {
-    logger.log(level, message);
-    console.log(`[${new Date().toISOString()}] ${message}`);
+function log(level, message, meta = {}) {
+    const logMessage = meta && Object.keys(meta).length ? `${message} ${JSON.stringify(meta)}` : message;
+    logger.log(level, logMessage);
+    if (process.env.NODE_ENV !== 'production') {
+        console.log(`[${new Date().toISOString()}] ${logMessage}`);
+    }
 }
 
 // ===========================================
@@ -61,6 +76,7 @@ try {
         retryStrategy: (times) => Math.min(times * 100, 5000),
         maxRetriesPerRequest: 3,
         enableOfflineQueue: false,
+        connectTimeout: TIMEOUTS.REDIS
     });
     redis.on('error', (err) => log('error', `Redis: ${err.message}`));
     redis.on('connect', () => log('info', 'Redis connecté'));
@@ -72,7 +88,7 @@ try {
 // Cache hybride
 class HybridCache {
     constructor() {
-        this.localCache = new NodeCache({ stdTTL: 3600 });
+        this.localCache = new NodeCache({ stdTTL: 3600, checkperiod: 120, maxKeys: 10000 });
     }
 
     async get(key) {
@@ -96,10 +112,20 @@ class HybridCache {
             this.localCache.set(key, value, ttl);
         }
     }
+
+    async del(key) {
+        if (redis) {
+            try {
+                await redis.del(key);
+            } catch {}
+        }
+        this.localCache.del(key);
+    }
 }
 
 const cache = new HybridCache();
-const processedMessages = new NodeCache({ stdTTL: 600 });
+const processedMessages = new NodeCache({ stdTTL: 600, checkperiod: 120 });
+const userRateLimits = new NodeCache({ stdTTL: 60 });
 
 // ===========================================
 // UTILS
@@ -180,7 +206,7 @@ class Utils {
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    max: 10,
+    max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
 });
@@ -206,11 +232,11 @@ class WhatsAppService {
                 text: { body: safeText }
             }, {
                 headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                timeout: 10000
+                timeout: TIMEOUTS.WHATSAPP
             });
             return true;
         } catch (error) {
-            log('error', `WhatsApp send error: ${error.message}`);
+            log('error', `WhatsApp send error: ${error.message}`, { to });
             return false;
         }
     }
@@ -226,7 +252,7 @@ class WhatsAppService {
                     typing: { action: 'typing', duration_ms: 3000 }
                 }, {
                     headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                    timeout: 5000
+                    timeout: TIMEOUTS.WHATSAPP / 2
                 });
                 this.lastTyping.set(to, Date.now());
             }
@@ -237,13 +263,13 @@ class WhatsAppService {
         try {
             const mediaResponse = await axios.get(
                 `https://graph.facebook.com/v18.0/${mediaId}`,
-                { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }, timeout: 10000 }
+                { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }, timeout: TIMEOUTS.MEDIA }
             );
             const imageUrl = mediaResponse.data.url;
             const fileResponse = await axios.get(imageUrl, {
                 responseType: 'arraybuffer',
                 headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                timeout: 15000
+                timeout: TIMEOUTS.MEDIA
             });
 
             let buffer = Buffer.from(fileResponse.data);
@@ -257,7 +283,7 @@ class WhatsAppService {
             
             return { success: true, buffer };
         } catch (error) {
-            log('error', `Media download error: ${error.message}`);
+            log('error', `Media download error: ${error.message}`, { mediaId });
             return { success: false };
         }
     }
@@ -270,7 +296,7 @@ class WhatsAppService {
                 message_id: messageId
             }, {
                 headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-                timeout: 5000
+                timeout: TIMEOUTS.WHATSAPP / 2
             });
         } catch (error) {}
     }
@@ -373,10 +399,10 @@ TON RÔLE : Aider les gens à trouver des médicaments.
 3. Par ordonnance : l'utilisateur envoie une photo de l'ordonnance
 
 RÈGLES IMPORTANTES :
-- Quand on te demande "comment utiliser", réponds avec les 3 façons
-- Quand on te dit "salut", réponds avec une réponse courte sans répéter toute la présentation
-- Quand on te demande ton nom, dis "Je m'appelle MARIAM" et rappelle les 3 façons
-- Ne répète jamais la présentation complète après le premier message
+- Sois concise et utile
+- Utilise des emojis discrets (💊 🚚 📸)
+- Ne répète pas la présentation complète après le premier message
+- Réponds naturellement comme une IA santé
 
 CONTEXTE :
 - Livraison: ${delivery.price}F (${delivery.period}), délai: ${delivery.time}min
@@ -387,7 +413,7 @@ FORMAT DE REPONSE (JSON uniquement) :
 {
     "intention": "greet|search|support|delivery|creator|purpose|unknown",
     "medicament": "nom extrait ou null",
-    "reponse": "ta réponse style PayParrot - courte et utile"
+    "reponse": "ta réponse courte et naturelle"
 }`;
     }
 
@@ -468,7 +494,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: "Salut ! Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo"
+                reponse: "Salut ! Tu cherches un médicament ? Donne-moi le nom 💊"
             };
         }
         
@@ -476,7 +502,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "purpose",
                 medicament: null,
-                reponse: "Avec MARIAM c'est simple ! 💊\n\n📝 Écris le nom du médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance\n\nJe reconnais le médicament et je te donne le prix !"
+                reponse: "Avec MARIAM c'est simple ! 💊\n\n📝 Écris le nom du médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance"
             };
         }
         
@@ -484,7 +510,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "greet",
                 medicament: null,
-                reponse: "Je m'appelle MARIAM ! 💊\n\nJe t'aide à trouver tes médicaments à San Pedro.\n\n📝 Envoie le nom\n📸 Envoie une photo\n📋 Envoie une ordonnance"
+                reponse: "Je m'appelle MARIAM ! 💊\n\nJe t'aide à trouver tes médicaments à San Pedro. Donne-moi le nom de ce que tu cherches !"
             };
         }
         
@@ -492,7 +518,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "purpose",
                 medicament: null,
-                reponse: "Je cherche tes médicaments et je te donne les prix ! 💊\n\n3 façons :\n📝 Envoie le nom\n📸 Envoie une photo\n📋 Envoie une ordonnance"
+                reponse: "Je cherche tes médicaments et je te donne les prix ! 💊\n\nDonne-moi le nom de ce que tu veux."
             };
         }
         
@@ -518,7 +544,7 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "support",
                 medicament: null,
-                reponse: `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}\n\nDis-leur le médicament que tu veux !`
+                reponse: `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}`
             };
         }
         
@@ -539,19 +565,21 @@ FORMAT DE REPONSE (JSON uniquement) :
             return {
                 intention: "search",
                 medicament: medicaments.join(','),
-                reponse: `Je cherche ${medicaments.join(', ')} pour toi ! 🔍\n\nUn instant...`
+                reponse: `Je cherche ${medicaments.join(', ')} pour toi ! 🔍`
             };
         }
         
         return {
             intention: "unknown",
             medicament: null,
-            reponse: "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo du médicament\n📋 Envoie une photo de l'ordonnance"
+            reponse: "Donne-moi le nom d'un médicament, je te donne le prix et la disponibilité ! 💊\n\nExemple : Doliprane, Ibuprofène..."
         };
     }
 
     async analyserImage(imageBuffer) {
         try {
+            log('info', `Analyse d'image - Taille: ${imageBuffer.length} bytes`);
+            
             const result = await this._executeWithRetry(async () => {
                 const base64Image = imageBuffer.toString('base64');
                 
@@ -563,7 +591,10 @@ FORMAT DE REPONSE (JSON uniquement) :
                             content: [
                                 {
                                     type: "text",
-                                    text: "Liste les médicaments que tu vois sur cette image au format JSON. Réponds uniquement avec {\"medicaments\": [\"nom1\", \"nom2\"]}"
+                                    text: `Analyse cette image et liste TOUS les médicaments que tu vois.
+Si c'est une ordonnance, extrais les noms des médicaments.
+Réponds UNIQUEMENT au format JSON : {"medicaments": ["nom1", "nom2"]}
+Si tu ne vois aucun médicament, réponds : {"medicaments": []}`
                                 },
                                 {
                                     type: "image_url",
@@ -575,10 +606,24 @@ FORMAT DE REPONSE (JSON uniquement) :
                         }
                     ],
                     temperature: 0.1,
-                    max_completion_tokens: 300,
+                    max_completion_tokens: 500,
                     response_format: { type: "json_object" }
                 });
-                return JSON.parse(completion.choices[0].message.content);
+                
+                const responseText = completion.choices[0].message.content;
+                log('info', `Vision response: ${responseText}`);
+                
+                try {
+                    const parsed = JSON.parse(responseText);
+                    if (parsed.medicaments && Array.isArray(parsed.medicaments)) {
+                        log('info', `Médicaments détectés: ${parsed.medicaments.join(', ')}`);
+                        return parsed;
+                    }
+                    return { medicaments: [] };
+                } catch (parseError) {
+                    log('error', `JSON parse error: ${parseError.message}`);
+                    return { medicaments: [] };
+                }
             });
             
             return result;
@@ -586,33 +631,6 @@ FORMAT DE REPONSE (JSON uniquement) :
         } catch (error) {
             log('error', `Analyser image error: ${error.message}`);
             return { medicaments: [] };
-        }
-    }
-
-    async integrerResultats(resultats, question, historique) {
-        try {
-            const result = await this._executeWithRetry(async () => {
-                const completion = await this.client.chat.completions.create({
-                    model: this.models.text,
-                    messages: [
-                        { role: "system", content: this.getSystemPrompt() },
-                        { 
-                            role: "user", 
-                            content: `Résultats de recherche: ${JSON.stringify(resultats)}\nQuestion: "${question}"\nHistorique: ${JSON.stringify(historique.slice(-3))}\n\nGénère une réponse naturelle style PayParrot.` 
-                        }
-                    ],
-                    temperature: 0.7,
-                    max_completion_tokens: 200,
-                    response_format: { type: "json_object" }
-                });
-                return JSON.parse(completion.choices[0].message.content);
-            });
-            
-            return result;
-            
-        } catch (error) {
-            log('error', `Intégration error: ${error.message}`);
-            return { reponse: Utils.formatOrderMessage(resultats) };
         }
     }
 }
@@ -640,7 +658,8 @@ class ConversationManager {
                 historique: [],
                 derniereActivite: Date.now(),
                 firstMessage: true,
-                welcomeSent: false
+                welcomeSent: false,
+                messageCount: 0
             });
         }
         return this.conversations.get(phone);
@@ -652,11 +671,19 @@ class ConversationManager {
 
         if (this.processedMessages.has(messageId)) return;
         this.processedMessages.add(messageId);
+        
+        // Rate limiting par utilisateur (max 10 messages/minute)
+        const userLimit = userRateLimits.get(phone) || 0;
+        if (userLimit > 10) {
+            await this.whatsapp.sendMessage(phone, "Trop de messages ! Attends un peu avant d'envoyer un nouveau message ⏱️");
+            return;
+        }
+        userRateLimits.set(phone, userLimit + 1, 60);
 
         try {
             await this.whatsapp.sendTyping(phone);
 
-            // Premier message : TOUJOURS la bienvenue
+            // Premier message : UNIQUEMENT la bienvenue, pas de traitement
             if (conv.firstMessage && !conv.welcomeSent) {
                 conv.firstMessage = false;
                 conv.welcomeSent = true;
@@ -670,23 +697,19 @@ class ConversationManager {
                     timestamp: Date.now()
                 });
                 
-                // Si l'utilisateur a envoyé du texte avec son premier message
                 if (text) {
                     conv.historique.push({
                         role: "user",
                         content: text,
                         timestamp: Date.now()
                     });
-                    await this.processUserMessage(phone, text, conv);
-                } else if (mediaId) {
-                    await this.processImageMessage(phone, mediaId, conv);
                 }
                 
                 conv.derniereActivite = Date.now();
                 return;
             }
 
-            // Après la bienvenue
+            // Après la bienvenue, traiter normalement
             if (text) {
                 conv.historique.push({
                     role: "user",
@@ -699,6 +722,7 @@ class ConversationManager {
             }
 
             conv.derniereActivite = Date.now();
+            conv.messageCount++;
 
         } catch (error) {
             log('error', `Process error: ${error.message}`);
@@ -709,18 +733,6 @@ class ConversationManager {
 
     async processUserMessage(phone, text, conv) {
         const comprehension = await this.llm.comprendre(text, conv.historique);
-        
-        // Si c'est une intention "greet" après la bienvenue, réponse courte
-        if (comprehension.intention === "greet" && conv.welcomeSent) {
-            const reponse = "Salut ! Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo";
-            await this.whatsapp.sendMessage(phone, reponse);
-            conv.historique.push({
-                role: "assistant",
-                content: reponse,
-                timestamp: Date.now()
-            });
-            return;
-        }
         
         if (comprehension.intention === "search" && comprehension.medicament) {
             let medicamentsToSearch = [];
@@ -787,7 +799,7 @@ class ConversationManager {
         else if (comprehension.intention === "support" || 
                  text.toLowerCase().match(/commander|comment commander|support/)) {
             const orderLink = Utils.getOrderLink();
-            const reponse = `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}\n\nRéponse rapide !`;
+            const reponse = `Pour commander, contacte le support 📲\n\nClique ici : ${orderLink}`;
             await this.whatsapp.sendMessage(phone, reponse);
             
             conv.historique.push({
@@ -810,11 +822,7 @@ class ConversationManager {
             let reponse = comprehension.reponse;
             
             if (!reponse || reponse.trim() === "") {
-                reponse = "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo";
-            }
-            
-            if (reponse.includes("Je suis MARIAM") && conv.welcomeSent) {
-                reponse = "Comment puis-je t'aider ? 💊\n\n📝 Envoie le nom d'un médicament\n📸 Envoie une photo";
+                reponse = "Donne-moi le nom d'un médicament, je te donne le prix ! 💊";
             }
             
             await this.whatsapp.sendMessage(phone, reponse);
@@ -840,10 +848,14 @@ class ConversationManager {
         
         if (visionResult.medicaments && visionResult.medicaments.length > 0) {
             const results = [];
+            const notFound = [];
+            
             for (const med of visionResult.medicaments) {
                 const searchResults = await this.fuse.search(med, 1);
                 if (searchResults.length > 0) {
                     results.push(searchResults[0]);
+                } else {
+                    notFound.push(med);
                 }
             }
 
@@ -853,19 +865,33 @@ class ConversationManager {
                 
                 await this.whatsapp.sendMessage(phone, reponse);
                 
+                if (notFound.length > 0) {
+                    const notFoundMsg = `\n\n⚠️ Je n'ai pas trouvé dans ma base : ${notFound.join(', ')}`;
+                    await this.whatsapp.sendMessage(phone, notFoundMsg);
+                }
+                
                 conv.historique.push({
                     role: "assistant",
                     content: reponse,
                     timestamp: Date.now()
                 });
             } else {
-                const firstMed = visionResult.medicaments[0];
-                await this.whatsapp.sendMessage(phone, 
-                    Utils.formatNotFoundMessage(firstMed));
+                const reponse = Utils.formatNotFoundMessage(notFound.join(', '));
+                await this.whatsapp.sendMessage(phone, reponse);
+                
+                conv.historique.push({
+                    role: "assistant",
+                    content: reponse,
+                    timestamp: Date.now()
+                });
             }
         } else {
             await this.whatsapp.sendMessage(phone, 
-                "Je ne vois pas de médicament clairement sur cette image. Envoie le nom par texte stp !");
+                "Je ne vois pas de médicament clairement sur cette image. 📸\n\n" +
+                "Essaie de :\n" +
+                "📝 Envoyer le nom par texte\n" +
+                "📸 Prendre une photo plus nette\n\n" +
+                "Qu'est-ce que tu cherches ?");
         }
     }
 }
@@ -897,14 +923,23 @@ async function initDatabase() {
 const app = express();
 const bot = new ConversationManager();
 
-// Middleware
+// Middleware de sécurité et performance
+app.use(helmet({
+    contentSecurityPolicy: false,
+}));
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(morgan('combined', { stream: { write: (message) => log('info', message.trim()) } }));
+
+// Rate limiting global
 app.use(rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 200
+    max: 500,
+    message: { error: 'Trop de requêtes, réessaie plus tard' }
 }));
 
+// Logger des requêtes lentes
 app.use((req, res, next) => {
     const start = Date.now();
     res.on('finish', () => {
@@ -967,9 +1002,12 @@ app.get('/health', async (req, res) => {
     const health = {
         status: 'healthy',
         conversations: bot.conversations.size,
+        uptime: Math.floor(process.uptime()),
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
-        db: 'checking'
+        db: 'checking',
+        memory: process.memoryUsage().heapUsed / 1024 / 1024,
+        version: '4.0'
     };
 
     try {
@@ -977,6 +1015,7 @@ app.get('/health', async (req, res) => {
         health.db = 'ok';
     } catch {
         health.db = 'error';
+        health.status = 'degraded';
     }
 
     res.json(health);
@@ -986,21 +1025,43 @@ app.get('/keep-alive', (req, res) => {
     res.status(200).send('OK');
 });
 
+// Auto-ping toutes les 10 minutes
 setInterval(async () => {
     try {
         await axios.get(`http://localhost:${PORT}/health`, { timeout: 5000 });
     } catch (error) {}
 }, 10 * 60 * 1000);
 
+// Nettoyage périodique des conversations
 setInterval(() => {
     const now = Date.now();
+    let expiredCount = 0;
     for (const [phone, conv] of bot.conversations) {
         if (now - conv.derniereActivite > 30 * 60 * 1000) {
             bot.conversations.delete(phone);
-            log('info', `Conversation expirée: ${phone}`);
+            expiredCount++;
         }
     }
+    if (expiredCount > 0) {
+        log('info', `${expiredCount} conversations expirées nettoyées`);
+    }
 }, 5 * 60 * 1000);
+
+// Nettoyage du cache des messages traités
+setInterval(() => {
+    processedMessages.flushAll();
+    userRateLimits.flushAll();
+    log('debug', 'Cache nettoyé');
+}, 60 * 60 * 1000);
+
+// Gestion des erreurs non capturées
+process.on('uncaughtException', (error) => {
+    log('error', `Uncaught Exception: ${error.message}`, { stack: error.stack });
+});
+
+process.on('unhandledRejection', (reason) => {
+    log('error', `Unhandled Rejection: ${reason}`);
+});
 
 // ===========================================
 // DÉMARRAGE
@@ -1012,23 +1073,32 @@ async function start() {
         
         app.listen(PORT, '0.0.0.0', () => {
             console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║                                                           ║
-║   🚀 MARIAM IA - PRODUCTION                              ║
-║   📍 San Pedro, Côte d'Ivoire                             ║
-║                                                           ║
-║   🤖 100% IA Conversationnelle                            ║
-║   💬 Llama 3.3 70B (texte)                               ║
-║   📸 Llama 4 Scout 17B (vision)                          ║
-║   🔍 Fuse.js (recherche floue)                           ║
-║   🗄️ Redis + NodeCache                                    ║
-║   🗃️ PostgreSQL                                           ║
-║                                                           ║
-║   📱 Port: ${PORT}                                        ║
-║   📞 Support: ${SUPPORT_PHONE}                           ║
-║   👨💻 Créé par Yousself - UPSP 2026                      ║
-║                                                           ║
-╚═══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║   🚀 MARIAM IA - PRODUCTION READY v4.0                       ║
+║   📍 San Pedro, Côte d'Ivoire                                 ║
+║                                                               ║
+║   🤖 100% IA Conversationnelle                                ║
+║   💬 Llama 3.3 70B (texte)                                   ║
+║   📸 Llama 4 Scout 17B (vision)                              ║
+║   🔍 Fuse.js (recherche floue)                               ║
+║   🗄️ Redis + NodeCache                                        ║
+║   🗃️ PostgreSQL                                               ║
+║                                                               ║
+║   📱 Port: ${PORT}                                            ║
+║   📞 Support: ${SUPPORT_PHONE}                               ║
+║   👨💻 Créé par Yousself - UPSP 2026                          ║
+║                                                               ║
+║   ⚡ Optimisations:                                           ║
+║   - Rate limiting par utilisateur                            ║
+║   - Cache hybride Redis/Memory                               ║
+║   - Auto-scaling des conversations                           ║
+║   - Keep-alive pour Render free                              ║
+║   - Fallback sans LLM                                        ║
+║   - Support images et ordonnances                            ║
+║   - Gestion rate limit Groq                                  ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
             `);
         });
     } catch (error) {

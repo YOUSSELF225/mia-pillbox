@@ -1,6 +1,6 @@
 // MARIAM IA - PRODUCTION READY
 // San Pedro, Côte d'Ivoire
-// Version: 4.0 - Optimisée pour scale
+// Version: 5.0 - Stable avec corrections des messages fantômes
 // ===========================================
 
 require('dotenv').config();
@@ -62,9 +62,6 @@ const logger = winston.createLogger({
 function log(level, message, meta = {}) {
     const logMessage = meta && Object.keys(meta).length ? `${message} ${JSON.stringify(meta)}` : message;
     logger.log(level, logMessage);
-    if (process.env.NODE_ENV !== 'production') {
-        console.log(`[${new Date().toISOString()}] ${logMessage}`);
-    }
 }
 
 // ===========================================
@@ -223,7 +220,7 @@ class WhatsAppService {
 
     async sendMessage(to, text) {
         try {
-            if (!text) text = Utils.getWelcomeMessage();
+            if (!text) return false;
             const safeText = text.substring(0, 4096);
             await axios.post(WHATSAPP_API_URL, {
                 messaging_product: 'whatsapp',
@@ -669,7 +666,11 @@ class ConversationManager {
         const conv = this.getConversation(phone);
         const { text, mediaId, messageId } = input;
 
-        if (this.processedMessages.has(messageId)) return;
+        // Vérification STRICTE des doublons
+        if (this.processedMessages.has(messageId)) {
+            log('info', `Message déjà traité: ${messageId}`);
+            return;
+        }
         this.processedMessages.add(messageId);
         
         // Rate limiting par utilisateur (max 10 messages/minute)
@@ -683,10 +684,17 @@ class ConversationManager {
         try {
             await this.whatsapp.sendTyping(phone);
 
-            // Premier message : UNIQUEMENT la bienvenue, pas de traitement
+            // Premier message : UNIQUEMENT la bienvenue si l'utilisateur a envoyé un message
             if (conv.firstMessage && !conv.welcomeSent) {
                 conv.firstMessage = false;
                 conv.welcomeSent = true;
+                
+                // NE PAS ENVOYER DE BIENVENUE SANS MESSAGE UTILISATEUR
+                if (!text && !mediaId) {
+                    log('info', `Premier contact sans message - pas de bienvenue envoyée`);
+                    conv.derniereActivite = Date.now();
+                    return;
+                }
                 
                 const welcomeMsg = Utils.getWelcomeMessage();
                 await this.whatsapp.sendMessage(phone, welcomeMsg);
@@ -697,12 +705,16 @@ class ConversationManager {
                     timestamp: Date.now()
                 });
                 
+                // Si l'utilisateur a envoyé un message avec la bienvenue, on traite APRÈS
                 if (text) {
                     conv.historique.push({
                         role: "user",
                         content: text,
                         timestamp: Date.now()
                     });
+                    await this.processUserMessage(phone, text, conv);
+                } else if (mediaId) {
+                    await this.processImageMessage(phone, mediaId, conv);
                 }
                 
                 conv.derniereActivite = Date.now();
@@ -962,36 +974,61 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
+    // Répondre immédiatement
     res.sendStatus(200);
     
     setImmediate(async () => {
         try {
             const entry = req.body.entry?.[0];
             const changes = entry?.changes?.[0];
-            const msg = changes?.value?.messages?.[0];
+            const value = changes?.value;
             
+            // Vérifier si c'est un message
+            if (!value) return;
+            
+            // Vérifier les messages entrants
+            const messages = value.messages;
+            if (!messages || !Array.isArray(messages) || messages.length === 0) return;
+            
+            // Prendre le premier message
+            const msg = messages[0];
             if (!msg) return;
-            if (processedMessages.has(msg.id)) return;
-            processedMessages.set(msg.id, true);
-
-            await bot.whatsapp.markAsRead(msg.id);
+            
+            // Ignorer les status
+            if (msg.type === 'status') return;
+            
+            // Vérifier que l'ID n'a pas déjà été traité
+            const messageId = msg.id;
+            if (processedMessages.has(messageId)) {
+                log('info', `Message déjà traité (webhook): ${messageId}`);
+                return;
+            }
+            
+            // Marquer comme lu
+            await bot.whatsapp.markAsRead(messageId);
             
             const phone = msg.from;
             
-            if (msg.type === 'text') {
+            // Traiter selon le type
+            if (msg.type === 'text' && msg.text && msg.text.body) {
+                log('info', `Message texte reçu de ${phone}: ${msg.text.body.substring(0, 50)}`);
                 await bot.process(phone, { 
                     text: msg.text.body, 
-                    messageId: msg.id 
+                    messageId: messageId 
                 });
-            } else if (msg.type === 'image') {
+            } 
+            else if (msg.type === 'image' && msg.image && msg.image.id) {
+                log('info', `Image reçue de ${phone}`);
                 await bot.process(phone, { 
                     mediaId: msg.image.id, 
-                    messageId: msg.id 
+                    messageId: messageId 
                 });
-            } else if (msg.type === 'audio') {
+            }
+            else if (msg.type === 'audio') {
                 await bot.whatsapp.sendMessage(phone, 
                     "Désolé, je ne traite pas les audios. Envoie-moi du texte ou une image stp ! 📸");
             }
+            
         } catch (error) {
             log('error', `Webhook background error: ${error.message}`);
         }
@@ -1006,8 +1043,8 @@ app.get('/health', async (req, res) => {
         timestamp: new Date().toISOString(),
         redis: redis ? 'ok' : 'fallback',
         db: 'checking',
-        memory: process.memoryUsage().heapUsed / 1024 / 1024,
-        version: '4.0'
+        memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024 * 100) / 100,
+        version: '5.0'
     };
 
     try {
@@ -1075,7 +1112,7 @@ async function start() {
             console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║   🚀 MARIAM IA - PRODUCTION READY v4.0                       ║
+║   🚀 MARIAM IA - PRODUCTION READY v5.0                       ║
 ║   📍 San Pedro, Côte d'Ivoire                                 ║
 ║                                                               ║
 ║   🤖 100% IA Conversationnelle                                ║
@@ -1090,13 +1127,14 @@ async function start() {
 ║   👨💻 Créé par Yousself - UPSP 2026                          ║
 ║                                                               ║
 ║   ⚡ Optimisations:                                           ║
-║   - Rate limiting par utilisateur                            ║
-║   - Cache hybride Redis/Memory                               ║
-║   - Auto-scaling des conversations                           ║
-║   - Keep-alive pour Render free                              ║
-║   - Fallback sans LLM                                        ║
-║   - Support images et ordonnances                            ║
-║   - Gestion rate limit Groq                                  ║
+║   ✓ Plus de messages fantômes                                ║
+║   ✓ Rate limiting par utilisateur                            ║
+║   ✓ Cache hybride Redis/Memory                               ║
+║   ✓ Auto-scaling des conversations                           ║
+║   ✓ Keep-alive pour Render free                              ║
+║   ✓ Fallback sans LLM                                        ║
+║   ✓ Support images et ordonnances                            ║
+║   ✓ Gestion rate limit Groq                                  ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
             `);
